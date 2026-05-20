@@ -37,6 +37,10 @@ export async function processMermaid(host: HTMLElement): Promise<void> {
       wrap.innerHTML = svg;
       if (sourceLine) wrap.setAttribute('data-source-line', sourceLine);
       wrap.dataset.rendered = '1';
+      // Cache source so the morphdom pre-substitution in Preview.svelte
+      // can detect 'unchanged' mermaid blocks across keystrokes and reuse
+      // the rendered SVG instead of re-rendering (which causes flicker).
+      wrap.dataset.mermaidSrc = code;
       pre.replaceWith(wrap);
     } catch (e) {
       const err = document.createElement('pre');

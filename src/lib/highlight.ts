@@ -49,6 +49,10 @@ export async function applyStarryNight(host: HTMLElement | null): Promise<void> 
     try {
       const tree = starryNight.highlight(text, scope);
       const dom = toDom(tree, { fragment: true });
+      // Stash the un-highlighted source on the element so the morphdom
+      // diff in Preview.svelte can detect 'text unchanged' and skip the
+      // re-highlight pass on subsequent keystrokes (flicker mitigation).
+      block.dataset.snSource = text;
       block.textContent = '';
       block.appendChild(dom as Node);
       block.dataset.snHighlighted = 'true';

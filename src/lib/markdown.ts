@@ -1,4 +1,5 @@
 import MarkdownIt from 'markdown-it';
+import GithubAlerts from 'markdown-it-github-alerts';
 
 // html: true enables native <details>/<summary>/<kbd>/etc. — GitHub-style collapsible blocks
 // work via the browser's built-in <details> behaviour once the raw HTML passes through.
@@ -10,6 +11,15 @@ const md = new MarkdownIt({
   typographer: false,
 });
 
+// GitHub-flavored callouts: > [!NOTE] / [!TIP] / [!IMPORTANT] / [!WARNING] / [!CAUTION].
+// The plugin rewrites `blockquote_open` → `alert_open` (tag=div, meta.title/type/icon)
+// and emits `<div class="markdown-alert markdown-alert-${type}"><p class="markdown-alert-title">…`.
+md.use(GithubAlerts);
+
+// Tokens whose rendered open-tag should carry `data-source-line` so the preview
+// can map preview clicks back to editor line numbers (and reveal can find them).
+// `alert_open` is added because the github-alerts plugin renames blockquote_open
+// to alert_open before our rule runs — without it, callouts lose their source line.
 const BLOCK_OPEN_TYPES = new Set([
   'paragraph_open',
   'heading_open',
@@ -22,6 +32,7 @@ const BLOCK_OPEN_TYPES = new Set([
   'code_block',
   'hr',
   'html_block',
+  'alert_open',
 ]);
 
 md.core.ruler.push('source_line_map', (state) => {
@@ -32,6 +43,16 @@ md.core.ruler.push('source_line_map', (state) => {
     tok.attrJoin('data-source-line', String(line));
   }
 });
+
+// NOTE: do NOT wrap html_block in a <div data-source-line> wrapper — multi-line
+// HTML constructs (most importantly `<details>...</details>`) span SEPARATE
+// html_block tokens (one for the opening tag block, one for the closing tag).
+// Wrapping each in its own <div> splits the construct in half and the browser
+// auto-balances by closing <details> at the wrong place, so the inner markdown
+// renders OUTSIDE the collapsible. Inner markdown (headings, paragraphs) still
+// carries its own data-source-line, which is enough for reveal-navigation and
+// outline tracking — expandDetailsAncestors() walks UP from those to the
+// enclosing <details>.
 
 export function parseMarkdown(src: string): string {
   return md.render(src);

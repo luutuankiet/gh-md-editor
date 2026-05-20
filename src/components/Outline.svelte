@@ -5,10 +5,12 @@
     nodes,
     activeLine = 0,
     onJump,
+    onHelp,
   }: {
     nodes: OutlineNode[];
     activeLine?: number;
     onJump: (line: number) => void;
+    onHelp?: () => void;
   } = $props();
 
   let folded = $state(new Set<number>());
@@ -52,6 +54,9 @@
     } else if (e.key === '+' || e.key === '=') {
       unfoldAll();
       e.preventDefault();
+    } else if (e.key === '?' && onHelp) {
+      onHelp();
+      e.preventDefault();
     }
   }
 
@@ -80,6 +85,9 @@
 <div class="outline-pane" bind:this={host} tabindex="0" role="tree" aria-label="Document outline">
   <header class="outline-header">
     <span class="title">Outline</span>
+    {#if onHelp}
+      <button onclick={() => onHelp?.()} title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+    {/if}
     <button onclick={foldAll} title="Fold all (−)" aria-label="Fold all">−</button>
     <button onclick={unfoldAll} title="Unfold all (+)" aria-label="Unfold all">+</button>
   </header>

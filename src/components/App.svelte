@@ -4,6 +4,7 @@
   import Preview from './Preview.svelte';
   import Splitter from './Splitter.svelte';
   import Outline from './Outline.svelte';
+  import ShortcutsDialog from './ShortcutsDialog.svelte';
   import { parseMarkdown, extractOutline, type OutlineNode } from '../lib/markdown';
   import { loadDoc, saveDocDebounced } from '../lib/persistence';
   import { revealPreview, revealEditor } from '../lib/reveal';
@@ -12,19 +13,19 @@
   let doc = $state(loadDoc() || sampleDoc());
   let html = $state(untrack(() => parseMarkdown(doc)));
   let splitPct = $state(50);
-  // outlineSplitterPct is the splitter's position from the LEFT of the shell, as a %.
-  // The outline pane sits to the RIGHT of the splitter, so its width = 100 - outlineSplitterPct.
-  // Dragging the splitter LEFT → outlineSplitterPct decreases → outline grows.
+  // outlineSplitterPct = splitter position from LEFT of shell, %. Outline pane is
+  // RIGHT of splitter, so its width = 100 - outlineSplitterPct.
   let outlineSplitterPct = $state(80);
   let editorView: EditorView | null = $state(null);
   let previewHost: HTMLElement | null = $state(null);
+  let showShortcuts = $state(false);
 
   let outline = $derived<OutlineNode[]>(extractOutline(doc));
   let activeHeadingLine = $state(0);
   let editorTopLine = $state(1);
 
-  // Breadcrumb = the path of headings (root -> deepest) whose .line <= editorTopLine.
-  // At each level we pick the LAST heading (closest to topLine) and recurse into its children.
+  // Path of headings (root -> deepest) whose .line <= editorTopLine.
+  // At each level pick the LAST heading (closest to topLine) and recurse.
   function computeBreadcrumb(roots: OutlineNode[], topLine: number): OutlineNode[] {
     const out: OutlineNode[] = [];
     let level = roots;
@@ -40,8 +41,8 @@
     return out;
   }
 
-  // Hide breadcrumb at very top of document — the first heading is already visible, no point
-  // showing it duplicated. Once user scrolls past line 1, breadcrumb becomes useful context.
+  // Hide sticky-header stack at the very top of the document — the first
+  // heading is already visible, no point duplicating it.
   let editorBreadcrumb = $derived<OutlineNode[]>(
     editorTopLine > 1 ? computeBreadcrumb(outline, editorTopLine) : []
   );
@@ -67,10 +68,12 @@
     saveDocDebounced(doc);
   });
 
-  // Track which heading is currently scrolled to in the preview pane.
-  // previewHost = the <div.preview-wrap> scrolling container (fixed in v0.2.1 —
-  // was previously the inner <article> which doesn't scroll, so scroll events
-  // never fired and the active heading was stuck on the first one).
+  // Track which heading is currently visible at the top of the preview pane.
+  // CRITICAL bug fix in v0.4.0: skip elements whose `offsetParent === null` —
+  // those are inside closed <details> (display:none). Their getBoundingClientRect()
+  // returns zeros, which the previous code interpreted as 'above threshold' and
+  // set as active, causing the outline highlight to wrongly jump to headings
+  // inside collapsed sections while the user had actually scrolled past them.
   $effect(() => {
     if (!previewHost) return;
     const ph = previewHost;
@@ -97,6 +100,11 @@
       for (const el of all) {
         const ln = Number(el.dataset.sourceLine);
         if (!Number.isFinite(ln) || !flatSet.has(ln)) continue;
+        // Skip headings inside closed <details>. offsetParent is null when
+        // an ancestor has display:none, which is exactly what closed <details>
+        // does to its non-summary children. Their bounding rect would be (0,0)
+        // and falsely satisfy top <= threshold.
+        if (el.offsetParent === null) continue;
         const top = el.getBoundingClientRect().top;
         if (top <= threshold) active = ln;
         else break;
@@ -154,35 +162,50 @@
       '',
       '## Features',
       '',
-      '- **Bold** and *italic* and `inline code`',
-      '- Lists, tables, blockquotes',
-      '- Mermaid diagrams (done)',
-      '- Reveal-counterpart commands (done)',
-      '- Outline sidebar on the **right** with preview-viewport tracking (done)',
-      '- Per-pane search (Phase 4)',
+      '- **Bold**, *italic*, `inline code` — each rendered in a distinct colour in the editor pane',
+      '- Sticky-scroll header stack at the top of the editor (VS Code style)',
+      '- GitHub-style alerts (Note / Tip / Important / Warning / Caution)',
+      '- Mermaid diagrams + starry-night syntax highlighting in fenced code blocks',
+      '- Reveal counterpart: right-click on EITHER side to flash the matching block on the other',
+      '- Outline sidebar tracks the heading at the top of the preview viewport',
+      '- Press `?` (outline focused) or click the `?` button in the outline header for shortcuts',
       '',
-      '## Outline sidebar',
+      '> [!NOTE]',
+      '> Useful information that users should know, even when skimming.',
       '',
-      'The **right** panel tracks the heading currently visible at the top of the preview.',
-      'Click any row to jump both panes there — the full row is the click target, and if the row has children it also toggles fold/unfold.',
-      'Press `−` / `+` while the outline is focused to fold or unfold the whole tree.',
+      '> [!TIP]',
+      '> Helpful advice for doing things better or more easily.',
       '',
-      '### Heading hierarchy',
+      '> [!IMPORTANT]',
+      '> Key information users need to know to achieve their goal.',
       '',
-      'Levels render with `H1` through `H8`. Markdown standard caps at H6, but the outline extractor sweeps the source for deeper levels.',
+      '> [!WARNING]',
+      '> Urgent info that needs immediate user attention to avoid problems.',
       '',
-      '#### Deep nesting works',
+      '> [!CAUTION]',
+      '> Advises about risks or negative outcomes of certain actions.',
       '',
-      'Text wraps inside the main pane, but the outline never wraps — horizontal scroll only.',
+      '## Collapsible section (regression test)',
       '',
-      '##### Five levels deep',
+      '<details>',
+      '<summary>Click to expand — try right-clicking the editor on a line inside</summary>',
       '',
-      '###### Six levels deep',
+      '### Hidden heading 1',
       '',
-      '## Reveal counterpart',
+      'Paragraph inside the collapsed block. Right-clicking a corresponding line in the editor',
+      'now auto-expands the section and flashes the block. The outline highlight no longer',
+      'jumps to these hidden headings when the user has scrolled past them.',
       '',
-      '- **Editor → Preview:** `Cmd` / `Ctrl` + click any line in the editor. The matching preview block flashes and scrolls into view.',
-      '- **Preview → Editor:** right-click or double-click any preview block to jump the editor caret there.',
+      '### Hidden heading 2',
+      '',
+      'Another paragraph inside the details.',
+      '',
+      '</details>',
+      '',
+      '## Auto-pairs',
+      '',
+      'Select any text and type `` ` ``, `*`, `_`, `~`, `(`, `[`, `{`, `"` or `\'` to wrap',
+      'the selection. `Cmd/Ctrl + Shift + →` expands the selection to the enclosing syntax node.',
       '',
       '## Code',
       '',
@@ -197,8 +220,8 @@
       '```mermaid',
       'graph LR',
       '  A[Edit] --> B[Parse]',
-      '  B --> C[Render]',
-      '  C --> D[Reveal]',
+      '  B --> C[Morph DOM]',
+      '  C --> D[Render]',
       '  D --> A',
       '```',
       '',
@@ -206,27 +229,11 @@
       '',
       '| Phase | Status |',
       '|---|---|',
-      '| 1: Skeleton | done |',
-      '| 2: Reveal + Mermaid | done |',
-      '| 3: Outline (right side, viewport-follow, full-row click) | done |',
+      '| MVP | done |',
+      '| Outline | done |',
+      '| Sticky scroll, alerts, autopairs, morph-diff flicker fix | this turn |',
       '',
-      '> Edit me. Refresh the page. Your changes persist.',
-      '',
-      '## Long-section stress test',
-      '',
-      'Below are intentionally many short paragraphs so you can scroll deep into the preview and watch the outline highlight follow your viewport down through the lower headings (regression test for the v0.2.1 fix to the scroll listener target).',
-      '',
-      'Paragraph one for the long-section test. Paragraph one for the long-section test. Paragraph one for the long-section test. Paragraph one for the long-section test.',
-      '',
-      'Paragraph two for the long-section test. Paragraph two for the long-section test. Paragraph two for the long-section test. Paragraph two for the long-section test.',
-      '',
-      'Paragraph three for the long-section test. Paragraph three for the long-section test. Paragraph three for the long-section test. Paragraph three for the long-section test.',
-      '',
-      'Paragraph four for the long-section test. Paragraph four for the long-section test. Paragraph four for the long-section test. Paragraph four for the long-section test.',
-      '',
-      '## Final heading',
-      '',
-      'When you scroll the preview all the way to here, the outline should highlight **Final heading** on the right.',
+      '> Edit me. Your changes persist in localStorage.',
       '',
     ].join('\n');
   }
@@ -236,15 +243,15 @@
   <div class="editor-preview">
     <div class="pane editor-pane" style="flex-basis: {splitPct}%;">
       {#if editorBreadcrumb.length > 0}
-        <div class="editor-breadcrumb">
+        <div class="sticky-headers" aria-hidden="false">
           {#each editorBreadcrumb as item, i (item.line)}
-            {#if i > 0}<span class="separator" aria-hidden="true">›</span>{/if}
             <button
               type="button"
-              class="crumb level-{item.level}"
+              class="sticky-header level-{item.level}"
+              style="top: {i * 22}px; z-index: {20 - i}"
               onclick={() => handleOutlineJump(item.line)}
               title={`Jump to line ${item.line}`}
-            >{item.text}</button>
+            >{'#'.repeat(item.level)} {item.text}</button>
           {/each}
         </div>
       {/if}
@@ -266,9 +273,16 @@
   </div>
   <Splitter bind:pct={outlineSplitterPct} />
   <div class="pane outline-host" style="flex-basis: {100 - outlineSplitterPct}%;">
-    <Outline nodes={outline} activeLine={activeHeadingLine} onJump={handleOutlineJump} />
+    <Outline
+      nodes={outline}
+      activeLine={activeHeadingLine}
+      onJump={handleOutlineJump}
+      onHelp={() => (showShortcuts = true)}
+    />
   </div>
 </main>
+
+<ShortcutsDialog bind:open={showShortcuts} />
 
 <style>
   .shell {
@@ -296,60 +310,67 @@
   .editor-pane {
     position: relative;
   }
-  .editor-breadcrumb {
+  /* Sticky-header stack: one absolute row per breadcrumb level, cascading 22px each.
+     Each row is translucent + blurred so the editor content underneath stays dimly
+     visible (VS Code parity). The wrapper is pointer-events:none so the EMPTY space
+     between rows passes clicks through to the editor; individual rows re-enable it. */
+  .sticky-headers {
     position: absolute;
     top: 0;
     left: 0;
     right: 0;
-    z-index: 5;
-    padding: 4px 12px;
-    background: rgba(246, 248, 250, 0.94);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-    border-bottom: 1px solid #d0d7de;
+    z-index: 10;
+    pointer-events: none;
+  }
+  .sticky-header {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 22px;
+    pointer-events: auto;
+    background: rgba(246, 248, 250, 0.86);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border-top: none;
+    border-left: none;
+    border-right: none;
+    border-bottom: 1px solid rgba(208, 215, 222, 0.5);
+    padding: 0 12px;
     display: flex;
-    gap: 2px;
     align-items: center;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    overflow-y: hidden;
-    font-size: 11px;
-    color: #57606a;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 13px;
+    line-height: 22px;
     white-space: nowrap;
-    height: 26px;
-    box-sizing: border-box;
-    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
-  }
-  .editor-breadcrumb .separator {
-    color: #afb8c1;
-    flex: 0 0 auto;
-    padding: 0 1px;
-  }
-  .editor-breadcrumb .crumb {
-    background: transparent;
-    border: none;
-    padding: 1px 5px;
-    font: inherit;
-    color: inherit;
+    overflow: hidden;
+    text-overflow: ellipsis;
     cursor: pointer;
-    border-radius: 3px;
-    white-space: nowrap;
-    flex: 0 0 auto;
+    text-align: left;
+    width: 100%;
+    box-sizing: border-box;
   }
-  .editor-breadcrumb .crumb:hover {
-    background: rgba(9, 105, 218, 0.08);
-    color: #0969da;
-  }
+  .sticky-header:hover { background: rgba(9, 105, 218, 0.10); }
+  .sticky-header.level-1 { color: #cf222e; font-weight: 700; }
+  .sticky-header.level-2 { color: #0550ae; font-weight: 700; }
+  .sticky-header.level-3 { color: #6639ba; font-weight: 600; }
+  .sticky-header.level-4 { color: #953800; font-weight: 600; }
+  .sticky-header.level-5 { color: #0a3069; font-weight: 500; }
+  .sticky-header.level-6,
+  .sticky-header.level-7,
+  .sticky-header.level-8 { color: #1f2328; font-weight: 500; }
   @media (prefers-color-scheme: dark) {
-    .editor-breadcrumb {
-      background: rgba(13, 17, 23, 0.94);
-      border-bottom-color: #30363d;
-      color: #8b949e;
+    .sticky-header {
+      background: rgba(13, 17, 23, 0.86);
+      border-bottom-color: rgba(48, 54, 61, 0.5);
     }
-    .editor-breadcrumb .separator { color: #484f58; }
-    .editor-breadcrumb .crumb:hover {
-      background: rgba(56, 139, 253, 0.12);
-      color: #58a6ff;
-    }
+    .sticky-header:hover { background: rgba(56, 139, 253, 0.12); }
+    .sticky-header.level-1 { color: #ff7b72; }
+    .sticky-header.level-2 { color: #79c0ff; }
+    .sticky-header.level-3 { color: #d2a8ff; }
+    .sticky-header.level-4 { color: #ffa657; }
+    .sticky-header.level-5 { color: #a5d6ff; }
+    .sticky-header.level-6,
+    .sticky-header.level-7,
+    .sticky-header.level-8 { color: #c9d1d9; }
   }
 </style>

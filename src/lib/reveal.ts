@@ -2,8 +2,25 @@ import type { EditorView } from '@codemirror/view';
 import { EditorView as EV } from '@codemirror/view';
 
 /**
+ * Walk up from `target` toward `host`, opening any closed <details> ancestors
+ * so the target becomes visible before we try to scroll/flash it.
+ * Without this, revealing a line whose preview counterpart lives inside a
+ * collapsed <details> would scroll-then-flash an element with zero height.
+ */
+function expandDetailsAncestors(target: HTMLElement, host: HTMLElement): void {
+  let p: HTMLElement | null = target;
+  while (p && p !== host) {
+    if (p.tagName === 'DETAILS' && !(p as HTMLDetailsElement).open) {
+      (p as HTMLDetailsElement).open = true;
+    }
+    p = p.parentElement;
+  }
+}
+
+/**
  * Scroll the preview pane so the block tied to editor line `line` is centred,
- * and pulse a flash highlight on it for 1.5s.
+ * and pulse a flash highlight on it for 1.5s. Expands ancestor <details> first
+ * so the target is actually visible before scroll.
  */
 export function revealPreview(host: HTMLElement, line: number): void {
   if (!host || !Number.isFinite(line)) return;
@@ -17,14 +34,23 @@ export function revealPreview(host: HTMLElement, line: number): void {
     else break;
   }
   if (!target) target = nodes[0];
-  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  // Restart the animation if a previous flash is still in flight
-  target.classList.remove('gmd-flash-highlight');
-  void target.offsetWidth; // force reflow
-  target.classList.add('gmd-flash-highlight');
-  window.setTimeout(() => {
-    target!.classList.remove('gmd-flash-highlight');
-  }, 1600);
+
+  // Expand any collapsed <details> wrapping the target so it's actually visible.
+  expandDetailsAncestors(target, host);
+
+  // Wait one frame for the <details> to layout before scrolling — otherwise
+  // scrollIntoView reads pre-expansion geometry and lands on the wrong y.
+  const t = target;
+  requestAnimationFrame(() => {
+    t.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    // Restart the animation if a previous flash is still in flight.
+    t.classList.remove('gmd-flash-highlight');
+    void t.offsetWidth; // force reflow
+    t.classList.add('gmd-flash-highlight');
+    window.setTimeout(() => {
+      t.classList.remove('gmd-flash-highlight');
+    }, 1600);
+  });
 }
 
 /**

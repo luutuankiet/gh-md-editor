@@ -35,3 +35,72 @@ export function parseMarkdown(src: string): string {
 }
 
 export { md };
+
+export interface OutlineNode {
+  level: number;
+  text: string;
+  line: number;
+  children: OutlineNode[];
+}
+
+/**
+ * Extracts H1-H8 headings from raw markdown source.
+ * Skips headings inside fenced code blocks (``` or ~~~).
+ * Strips common inline markdown from heading text for display.
+ * Returns a tree built by relative heading levels.
+ */
+export function extractOutline(src: string): OutlineNode[] {
+  const lines = src.split('\n');
+  const flat: { level: number; text: string; line: number }[] = [];
+  let inFence = false;
+  let fenceChar = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+
+    const fenceMatch = /^(\s{0,3})(```+|~~~+)/.exec(raw);
+    if (fenceMatch) {
+      const marker = fenceMatch[2];
+      if (!inFence) {
+        inFence = true;
+        fenceChar = marker[0];
+      } else if (marker[0] === fenceChar) {
+        inFence = false;
+        fenceChar = '';
+      }
+      continue;
+    }
+    if (inFence) continue;
+
+    const m = /^(#{1,8})\s+(.+?)\s*#*\s*$/.exec(raw);
+    if (!m) continue;
+
+    const level = m[1].length;
+    const text = m[2]
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/__([^_]+)__/g, '$1')
+      .replace(/\*([^*]+)\*/g, '$1')
+      .replace(/_([^_]+)_/g, '$1')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
+      .trim();
+
+    if (text) flat.push({ level, text, line: i + 1 });
+  }
+
+  return buildOutlineTree(flat);
+}
+
+function buildOutlineTree(flat: { level: number; text: string; line: number }[]): OutlineNode[] {
+  const roots: OutlineNode[] = [];
+  const stack: OutlineNode[] = [];
+  for (const f of flat) {
+    const node: OutlineNode = { ...f, children: [] };
+    while (stack.length && stack[stack.length - 1].level >= node.level) stack.pop();
+    if (stack.length) stack[stack.length - 1].children.push(node);
+    else roots.push(node);
+    stack.push(node);
+  }
+  return roots;
+}

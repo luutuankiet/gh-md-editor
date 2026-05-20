@@ -15,16 +15,19 @@
 
   interface Shortcut { pane: string; keys: string; description: string }
   const shortcuts: Shortcut[] = [
-    { pane: 'Editor', keys: 'Right-click', description: 'Flash matching block in preview (auto-expands collapsed <details>)' },
-    { pane: 'Editor', keys: 'Cmd/Ctrl + F', description: 'Find / replace (VS Code-style floating panel)' },
-    { pane: 'Editor', keys: 'Alt + Z', description: 'Toggle word wrap (persisted)' },
-    { pane: 'Editor', keys: 'Cmd/Ctrl + Shift + →', description: 'Expand selection to enclosing syntax node' },
+    { pane: 'Editor', keys: 'Right-click', description: 'Flash matching block in preview (auto-expands collapsed <details>, lands on the matching table row not the whole table)' },
+    { pane: 'Editor', keys: 'Cmd/Ctrl + F', description: 'Find / replace (CodeMirror panel, top-right). Scrollbar shows match ticks; word at cursor lights up implicitly in a fainter shade.' },
+    { pane: 'Editor', keys: 'Alt / Opt + Z', description: 'Toggle word wrap (persisted). Mac Opt+Z handled at the DOM event level so Firefox does not paste Ω.' },
+    { pane: 'Editor', keys: 'Cmd/Ctrl + Shift + →', description: 'Expand selection: token → expression → fence → ENCLOSING MARKDOWN SECTION → document.' },
     { pane: 'Editor', keys: '` * _ ~ ( [ { " \'', description: 'Wrap selection with the pair (markdown auto-pair)' },
     { pane: 'Editor', keys: 'Tab / Shift+Tab', description: 'Indent / outdent' },
+    { pane: 'Preview', keys: 'Cmd/Ctrl + F', description: 'Find in preview (overlay top-right). Scrollbar match ticks; Enter / Shift+Enter to step through; Esc to close.' },
+    { pane: 'Preview', keys: 'Left-click on a word', description: 'Implicit highlight — all matching occurrences light up faintly (different shade than explicit search), with scrollbar ticks.' },
     { pane: 'Preview', keys: 'Right-click', description: 'Jump editor caret to the clicked block' },
     { pane: 'Outline', keys: 'Click row', description: 'Jump both panes; toggle fold if the row has children' },
     { pane: 'Outline', keys: '−', description: 'Fold all (while outline pane is focused)' },
     { pane: 'Outline', keys: '+ / =', description: 'Unfold all (while outline pane is focused)' },
+    { pane: 'URL', keys: '?reset=1', description: 'Append to URL and reload to restore the v0.5.0 sample doc (wipes the current localStorage draft).' },
   ];
 </script>
 

@@ -24,6 +24,7 @@ This can be wired into `.github/workflows/deploy.yml` on tag push — see `.clau
 
 | Version | Date | Theme |
 |---|---|---|
+| [v0.5.0](./v0.5.0.md) | 2026-05-21 | Find in either pane (Cmd+F overlay + scrollbar match ticks + click-word implicit highlight). SQL fenced code finally highlights. Mod+Shift+→ clamps to heading sections. Table-row reveal flash. Mac Opt+Z fix. Sample doc rewritten as feature tour. `?reset=1` URL recovery. |
 | [v0.4.2](./v0.4.2.md) | 2026-05-20 | Stop the preview flicker (morphdom + paint containment + source-content keying for mermaid). Bundles sticky-scroll, alerts, autopairs, smart-select, shortcuts dialog, fork-me icon. |
 | v0.3.0 | 2026-05-20 | Outline on right, code-fence syntax both panes, GH `<details>`, sticky breadcrumb |
 | v0.2.0 | 2026-05-20 | Phase 3 outline sidebar (viewport-follow, fold/unfold) |

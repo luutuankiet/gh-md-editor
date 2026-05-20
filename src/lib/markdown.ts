@@ -28,6 +28,7 @@ const BLOCK_OPEN_TYPES = new Set([
   'bullet_list_open',
   'ordered_list_open',
   'table_open',
+  'tr_open',
   'fence',
   'code_block',
   'hr',

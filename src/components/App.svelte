@@ -122,8 +122,13 @@
     };
     schedule();
 
+    // Observe the article's DIRECT children (not the whole subtree). subtree:true
+    // used to fire hundreds of mutation records per morphdom diff (one per
+    // text-node tweak inside a code block or SVG); childList on the article is
+    // enough since every heading we care about is a top-level child.
+    const article = ph.querySelector<HTMLElement>('article.markdown-body') ?? ph;
     const mo = new MutationObserver(schedule);
-    mo.observe(ph, { childList: true, subtree: true });
+    mo.observe(article, { childList: true });
 
     return () => {
       clearTimeout(scheduleTimer);

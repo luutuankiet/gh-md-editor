@@ -39,8 +39,12 @@
     // Old DOM holds `<div .mermaid-block data-source-line=N data-mermaid-src=...>`
     // (post-render). The new HTML from markdown-it has `<pre data-source-line=N>
     // <code .language-mermaid>source</code></pre>`. Different tag = morphdom
-    // would replace, losing the rendered SVG. Splice the old div into the new
-    // tree at the same source-line so morphdom keeps it.
+    // would replace, losing the rendered SVG. We swap in a STUB div (same class,
+    // empty) so morphdom's onBeforeElUpdated sees matching tags and returns false
+    // — the live SVG is preserved. We deliberately don't `cloneNode(true)` the
+    // rendered SVG: that allocates hundreds of nodes per keystroke and inflates
+    // the morphdom walk even when the diff is a no-op, which manifests as
+    // visible flicker when the user types fast.
     const rendered = new Map<string, HTMLElement>();
     for (const m of oldHost.querySelectorAll<HTMLElement>('div.mermaid-block[data-source-line]')) {
       const sl = m.dataset.sourceLine;
@@ -57,15 +61,26 @@
       const newSrc = (code.textContent || '').trim();
       const oldSrc = old.dataset.mermaidSrc || '';
       if (oldSrc && oldSrc === newSrc) {
-        pre.replaceWith(old.cloneNode(true));
+        const stub = document.createElement('div');
+        stub.className = 'mermaid-block';
+        stub.setAttribute('data-source-line', sl);
+        stub.dataset.mermaidSrc = oldSrc;
+        pre.replaceWith(stub);
       }
       // If source changed, leave the new <pre> in place — mermaid will render it.
     }
   }
 
   let isFirstRender = true;
+  let lastHtml: string | null = null;
   $effect(() => {
     if (!localHost || html == null) return;
+
+    // Same html as last morph (e.g. effect re-fired without html actually
+    // changing) → bail. Saves a full morphdom walk + post-process scan and
+    // prevents the browser from spuriously repainting the article.
+    if (html === lastHtml) return;
+    lastHtml = html;
 
     if (isFirstRender || localHost.childElementCount === 0) {
       localHost.innerHTML = html;
@@ -79,6 +94,13 @@
     newRoot.innerHTML = html;
 
     preSubstituteMermaid(newRoot, localHost);
+
+    // Track whether morphdom actually inserted any unprocessed mermaid or
+    // code blocks. If not, skip the post-processors entirely — their
+    // querySelectorAll scans aren't free on large docs, and the dynamic
+    // import in highlightLazy queues a microtask paint per keystroke.
+    let mermaidPending = false;
+    let highlightPending = false;
 
     morphdom(localHost, newRoot, {
       childrenOnly: true,
@@ -108,12 +130,21 @@
         }
         return true;
       },
+      onNodeAdded: (node) => {
+        if (node.nodeType !== 1) return node;
+        const el = node as HTMLElement;
+        if (el.querySelector?.('pre > code.language-mermaid') || el.matches?.('code.language-mermaid')) {
+          mermaidPending = true;
+        }
+        if (el.querySelector?.('pre > code[class*="language-"]') || el.matches?.('code[class*="language-"]')) {
+          highlightPending = true;
+        }
+        return node;
+      },
     });
 
-    // Both are idempotent (skip data-rendered / data-sn-highlighted blocks),
-    // so they only fire on blocks that morphdom newly inserted.
-    void processMermaid(localHost);
-    void highlightLazy(localHost);
+    if (mermaidPending) void processMermaid(localHost);
+    if (highlightPending) void highlightLazy(localHost);
   });
 
   async function highlightLazy(target: HTMLElement) {
@@ -170,6 +201,10 @@
     box-sizing: border-box;
     padding: 24px 32px;
     max-width: 100%;
+    /* Isolate paint so morphdom mutations at the bottom of the article don't
+       force the browser to repaint the visible top of the scroll viewport.
+       This is the structural fix for the typing-flicker bug. */
+    contain: layout style paint;
   }
   :global(.markdown-body) {
     font-size: 14px;

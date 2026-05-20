@@ -36,38 +36,43 @@
   // ---------------------------------------------------------------------------
 
   function preSubstituteMermaid(newRoot: HTMLElement, oldHost: HTMLElement): void {
-    // Old DOM holds `<div .mermaid-block data-source-line=N data-mermaid-src=...>`
-    // (post-render). The new HTML from markdown-it has `<pre data-source-line=N>
-    // <code .language-mermaid>source</code></pre>`. Different tag = morphdom
-    // would replace, losing the rendered SVG. We swap in a STUB div (same class,
-    // empty) so morphdom's onBeforeElUpdated sees matching tags and returns false
-    // — the live SVG is preserved. We deliberately don't `cloneNode(true)` the
-    // rendered SVG: that allocates hundreds of nodes per keystroke and inflates
-    // the morphdom walk even when the diff is a no-op, which manifests as
-    // visible flicker when the user types fast.
-    const rendered = new Map<string, HTMLElement>();
-    for (const m of oldHost.querySelectorAll<HTMLElement>('div.mermaid-block[data-source-line]')) {
-      const sl = m.dataset.sourceLine;
-      if (sl) rendered.set(sl, m);
+    // Old DOM holds `<div .mermaid-block data-mermaid-src=...>` (post-render).
+    // The new HTML from markdown-it has `<pre data-source-line=N><code
+    // .language-mermaid>source</code></pre>`. Different tag = morphdom would
+    // replace, re-rendering the diagram and flickering its height. We swap in
+    // a STUB div (same class + same data-mermaid-src) so morphdom's
+    // onBeforeElUpdated sees matching tags and returns false — the live SVG
+    // is preserved. We don't `cloneNode(true)` the rendered SVG: that walks
+    // hundreds of nodes per keystroke and inflates morphdom's diff cost.
+    //
+    // KEY by source CONTENT, not source-line. Typing anywhere above the
+    // mermaid block shifts its data-source-line by N, so a source-line-keyed
+    // map would miss the match — the new <pre> would survive, morphdom would
+    // discard the rendered <div>, and mermaid would re-render every keystroke
+    // (the visible flicker the user reported). Source content is stable
+    // across edits-elsewhere; only edits INSIDE the mermaid block change it,
+    // which is the only case where re-rendering is actually correct.
+    const renderedBySrc = new Map<string, HTMLElement>();
+    for (const m of oldHost.querySelectorAll<HTMLElement>('div.mermaid-block')) {
+      const src = m.dataset.mermaidSrc;
+      if (src) renderedBySrc.set(src, m);
     }
-    if (rendered.size === 0) return;
-    for (const pre of Array.from(newRoot.querySelectorAll<HTMLElement>('pre[data-source-line]'))) {
+    if (renderedBySrc.size === 0) return;
+    for (const pre of Array.from(newRoot.querySelectorAll<HTMLElement>('pre'))) {
       const code = pre.querySelector<HTMLElement>('code.language-mermaid');
       if (!code) continue;
-      const sl = pre.getAttribute('data-source-line');
-      if (!sl) continue;
-      const old = rendered.get(sl);
-      if (!old) continue;
       const newSrc = (code.textContent || '').trim();
-      const oldSrc = old.dataset.mermaidSrc || '';
-      if (oldSrc && oldSrc === newSrc) {
-        const stub = document.createElement('div');
-        stub.className = 'mermaid-block';
-        stub.setAttribute('data-source-line', sl);
-        stub.dataset.mermaidSrc = oldSrc;
-        pre.replaceWith(stub);
-      }
-      // If source changed, leave the new <pre> in place — mermaid will render it.
+      if (!newSrc || !renderedBySrc.has(newSrc)) continue;
+      const sl = pre.getAttribute('data-source-line');
+      const stub = document.createElement('div');
+      stub.className = 'mermaid-block';
+      if (sl) stub.setAttribute('data-source-line', sl);
+      stub.dataset.mermaidSrc = newSrc;
+      pre.replaceWith(stub);
+      // Consume the entry so a second mermaid block with the same source
+      // doesn't double-substitute (morphdom can't pair two new stubs to one
+      // old element — it'd insert a fresh one anyway).
+      renderedBySrc.delete(newSrc);
     }
   }
 
@@ -104,6 +109,21 @@
 
     morphdom(localHost, newRoot, {
       childrenOnly: true,
+      // Key mermaid blocks by their source content so morphdom matches the
+      // old rendered <div> with the new stub even when the document around
+      // them shifted (source-line drift). Without this, morphdom falls back
+      // to positional matching and pairs the rendered <div> with whatever
+      // unrelated block now sits at the same index in newRoot — mismatch →
+      // discard → re-render → flicker.
+      getNodeKey: (node) => {
+        if (node.nodeType !== 1) return undefined;
+        const el = node as HTMLElement;
+        if (el.classList?.contains('mermaid-block')) {
+          const src = el.dataset?.mermaidSrc;
+          return src ? `mermaid:${src}` : undefined;
+        }
+        return undefined;
+      },
       onBeforeElUpdated: (fromEl, toEl) => {
         // Preserve <details open> across morphs — markdown source defaults to
         // closed, so without this every keystroke would slam open <details>

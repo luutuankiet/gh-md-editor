@@ -126,9 +126,21 @@
     // used to fire hundreds of mutation records per morphdom diff (one per
     // text-node tweak inside a code block or SVG); childList on the article is
     // enough since every heading we care about is a top-level child.
+    //
+    // We ALSO subtree-watch the `open` attribute on <details>: when the user
+    // expands a previously-collapsed section, headings inside flip from
+    // offsetParent === null to visible, so the active-heading calculation
+    // needs to re-run. attributeFilter:['open'] keeps the mutation traffic
+    // bounded — only user clicks on <summary> fire it; morphdom doesn't
+    // touch `open` because Preview.svelte's onBeforeElUpdated aligns it first.
     const article = ph.querySelector<HTMLElement>('article.markdown-body') ?? ph;
     const mo = new MutationObserver(schedule);
-    mo.observe(article, { childList: true });
+    mo.observe(article, {
+      childList: true,
+      attributes: true,
+      attributeFilter: ['open'],
+      subtree: true,
+    });
 
     return () => {
       clearTimeout(scheduleTimer);
@@ -246,7 +258,12 @@
 
 <main class="shell">
   <div class="editor-preview">
-    <div class="pane editor-pane" style="flex-basis: {splitPct}%;">
+    <div
+      class="pane editor-pane"
+      style="flex-basis: {splitPct}%;"
+      oncontextmenu={(e) => e.preventDefault()}
+      role="presentation"
+    >
       {#if editorBreadcrumb.length > 0}
         <div class="sticky-headers" aria-hidden="false">
           {#each editorBreadcrumb as item, i (item.line)}

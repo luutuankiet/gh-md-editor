@@ -127,9 +127,13 @@
         // preview pane which also uses right-click).
         EditorView.domEventHandlers({
           contextmenu: (event, vw) => {
-            const pos = vw.posAtCoords({ x: event.clientX, y: event.clientY });
-            if (pos == null) return false;
+            // ALWAYS suppress the native browser context menu on the editor
+            // — right-click is owned by reveal-counterpart. Without this, a
+            // right-click that lands outside the editor's content area (e.g.
+            // gutter, padding) still pops the OS menu and adds UI friction.
             event.preventDefault();
+            const pos = vw.posAtCoords({ x: event.clientX, y: event.clientY });
+            if (pos == null) return true;
             const line = vw.state.doc.lineAt(pos).number;
             onRevealRequest?.(line);
             return true;

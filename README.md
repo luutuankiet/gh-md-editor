@@ -35,3 +35,7 @@ npm run preview
 ```bash
 npm run check
 ```
+
+## Releases
+
+Narrative release notes live in [`releases/`](./releases/). Start with the [index](./releases/README.md) or jump to the latest: [v0.4.2](./releases/v0.4.2.md).

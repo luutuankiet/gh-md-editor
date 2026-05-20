@@ -21,6 +21,13 @@
     folded = next;
   }
 
+  function handleRowClick(node: OutlineNode) {
+    // Whole-row click = jump to section AND (if it has children) toggle fold.
+    // Matches the user's request to widen the click area beyond just the chevron.
+    onJump(node.line);
+    if (node.children.length) toggleFold(node.line);
+  }
+
   function foldAll() {
     const next = new Set<number>();
     const walk = (n: OutlineNode) => {
@@ -70,7 +77,7 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<aside class="outline-pane" bind:this={host} tabindex="0">
+<div class="outline-pane" bind:this={host} tabindex="0" role="tree" aria-label="Document outline">
   <header class="outline-header">
     <span class="title">Outline</span>
     <button onclick={foldAll} title="Fold all (−)" aria-label="Fold all">−</button>
@@ -87,7 +94,7 @@
       </ul>
     {/if}
   </div>
-</aside>
+</div>
 
 {#snippet branch(node: OutlineNode)}
   <li
@@ -95,26 +102,21 @@
     class:active={node.line === activeLine}
     class:ancestor={activeAncestors.has(node.line) && node.line !== activeLine}
   >
-    <div class="row">
+    <button
+      type="button"
+      class="row"
+      onclick={() => handleRowClick(node)}
+      title={node.children.length ? `Jump to line ${node.line} and toggle fold` : `Jump to line ${node.line}`}
+    >
       {#if node.children.length}
-        <button
-          class="fold-toggle"
-          onclick={() => toggleFold(node.line)}
-          aria-label={folded.has(node.line) ? 'Expand section' : 'Collapse section'}
-        >
+        <span class="fold-toggle" aria-hidden="true">
           {folded.has(node.line) ? '▸' : '▾'}
-        </button>
+        </span>
       {:else}
         <span class="fold-spacer" aria-hidden="true"></span>
       {/if}
-      <button
-        class="label"
-        onclick={() => onJump(node.line)}
-        title="Jump to line {node.line}"
-      >
-        {node.text}
-      </button>
-    </div>
+      <span class="label">{node.text}</span>
+    </button>
     {#if node.children.length && !folded.has(node.line)}
       <ul>
         {#each node.children as child (child.line)}
@@ -132,7 +134,7 @@
     display: flex;
     flex-direction: column;
     background: #f6f8fa;
-    border-right: 1px solid #d0d7de;
+    border-left: 1px solid #d0d7de;
     font-size: 12px;
     font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
     color: #1f2328;
@@ -185,54 +187,68 @@
     margin: 0;
   }
 
-  .outline-tree, .outline-node ul {
+  .outline-tree {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    min-width: 100%;       /* fill scroll container at minimum */
+    width: max-content;    /* grow beyond pane width for long headings */
+  }
+  .outline-node ul {
     list-style: none;
     padding: 0;
     margin: 0;
   }
+
   .outline-node .row {
+    /* Now a <button>: full-row click target. */
     display: flex;
     align-items: center;
     gap: 2px;
     white-space: nowrap;
-    padding: 2px 8px 2px 0;
-    min-width: max-content;
+    padding: 2px 12px 2px 0;
+    width: 100%;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+    line-height: 1.5;
+  }
+  .outline-node .row:hover {
+    background: rgba(9, 105, 218, 0.08);
+  }
+  .outline-node .row:focus-visible {
+    outline: 2px solid #0969da;
+    outline-offset: -2px;
   }
   .outline-node.active > .row {
-    background: rgba(9, 105, 218, 0.14);
+    background: rgba(9, 105, 218, 0.16);
+  }
+  .outline-node.active > .row:hover {
+    background: rgba(9, 105, 218, 0.22);
   }
   .outline-node.ancestor > .row .label {
     color: #0969da;
     font-weight: 500;
   }
   .outline-node .label {
-    background: transparent;
-    border: none;
-    padding: 1px 4px;
-    cursor: pointer;
     white-space: nowrap;
     text-align: left;
-    color: inherit;
-    font: inherit;
-    line-height: 1.5;
   }
-  .outline-node .label:hover { text-decoration: underline; }
   .fold-toggle {
     width: 14px;
     height: 14px;
-    border: none;
-    background: transparent;
-    cursor: pointer;
     font-size: 9px;
     line-height: 1;
     color: #57606a;
-    padding: 0;
     flex: 0 0 14px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
   }
-  .fold-toggle:hover { color: #1f2328; }
+  .outline-node .row:hover .fold-toggle { color: #1f2328; }
   .fold-spacer {
     display: inline-block;
     width: 14px;
@@ -252,7 +268,7 @@
   @media (prefers-color-scheme: dark) {
     .outline-pane {
       background: #161b22;
-      border-right-color: #30363d;
+      border-left-color: #30363d;
       color: #c9d1d9;
     }
     .outline-header { border-bottom-color: #30363d; }
@@ -263,10 +279,12 @@
       color: #c9d1d9;
     }
     .outline-header button:hover { background: #30363d; }
-    .outline-node.active > .row { background: rgba(56, 139, 253, 0.18); }
+    .outline-node .row:hover { background: rgba(56, 139, 253, 0.10); }
+    .outline-node.active > .row { background: rgba(56, 139, 253, 0.20); }
+    .outline-node.active > .row:hover { background: rgba(56, 139, 253, 0.26); }
     .outline-node.ancestor > .row .label { color: #58a6ff; }
     .fold-toggle { color: #8b949e; }
-    .fold-toggle:hover { color: #c9d1d9; }
+    .outline-node .row:hover .fold-toggle { color: #c9d1d9; }
     .outline-empty { color: #8b949e; }
   }
 </style>

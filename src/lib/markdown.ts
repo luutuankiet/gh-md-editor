@@ -1,7 +1,10 @@
 import MarkdownIt from 'markdown-it';
 
+// html: true enables native <details>/<summary>/<kbd>/etc. — GitHub-style collapsible blocks
+// work via the browser's built-in <details> behaviour once the raw HTML passes through.
+// Trade-off: arbitrary HTML can XSS, acceptable for this personal-use editor (author = reader).
 const md = new MarkdownIt({
-  html: false,
+  html: true,
   linkify: true,
   breaks: false,
   typographer: false,

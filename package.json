@@ -23,11 +23,14 @@
     "@codemirror/commands": "^6.7.0",
     "@codemirror/lang-markdown": "^6.3.0",
     "@codemirror/language": "^6.10.0",
+    "@codemirror/language-data": "^6.5.2",
     "@codemirror/search": "^6.5.6",
     "@codemirror/state": "^6.4.1",
     "@codemirror/view": "^6.34.0",
+    "@wooorm/starry-night": "^3.9.0",
     "codemirror": "^6.0.1",
     "github-markdown-css": "^5.7.0",
+    "hast-util-to-dom": "^4.0.1",
     "markdown-it": "^14.1.0",
     "mermaid": "^10.9.6"
   }

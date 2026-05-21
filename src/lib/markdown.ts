@@ -37,10 +37,21 @@ const BLOCK_OPEN_TYPES = new Set([
 ]);
 
 md.core.ruler.push('source_line_map', (state) => {
+  // v0.6.1: when normalizeAlerts() synthesized body lines for inline `> [!NOTE] body`
+  // patterns, the resulting parsed-source line numbers drift +N from the user's
+  // editor source. We subtract the number of insertions at-or-before each token's
+  // line so editor↔preview navigation maps back to the original line.
+  const insertions: number[] = ((state.env as any)?.alertInsertions ?? []) as number[];
   for (const tok of state.tokens) {
     if (!BLOCK_OPEN_TYPES.has(tok.type)) continue;
     if (!tok.map || tok.map.length < 1) continue;
-    const line = tok.map[0] + 1; // 1-indexed
+    const rawLine = tok.map[0] + 1; // 1-indexed in NORMALIZED source
+    let adjustment = 0;
+    for (const ins of insertions) {
+      if (ins <= rawLine) adjustment++;
+      else break; // insertions array is monotonically ascending
+    }
+    const line = rawLine - adjustment;
     tok.attrJoin('data-source-line', String(line));
   }
 });
@@ -55,8 +66,39 @@ md.core.ruler.push('source_line_map', (state) => {
 // outline tracking — expandDetailsAncestors() walks UP from those to the
 // enclosing <details>.
 
+// v0.6.1: markdown-it-github-alerts only recognizes `> [!NOTE]` when the marker
+// is on its own line followed by body on subsequent `> ` lines. If the user
+// writes `> [!NOTE] body` with body INLINE on the same line, the plugin still
+// recognizes the marker but the resulting alert body layout is broken (centered/
+// indented title-styling bleeds into the body). GitHub's native renderer is
+// lenient and handles inline body correctly; we mirror that by splitting the
+// marker and body into the canonical two-line form before parsing.
+//
+// Matches all 5 GitHub alert types case-insensitively. The split is tracked in
+// `insertions` so `source_line_map` can subtract them and keep editor↔preview
+// navigation aligned to the user's original line numbers.
+const ALERT_INLINE_PATTERN = /^(\s*>\s*\[!(?:NOTE|TIP|IMPORTANT|WARNING|CAUTION)\])\s+(\S.*)$/i;
+
+function normalizeAlerts(src: string): { normalized: string; insertions: number[] } {
+  const lines = src.split('\n');
+  const out: string[] = [];
+  const insertions: number[] = []; // 1-indexed lines in OUTPUT where a body line was synthesized
+  for (const line of lines) {
+    const m = ALERT_INLINE_PATTERN.exec(line);
+    if (m) {
+      out.push(m[1]);                 // marker on its own line
+      out.push(`> ${m[2]}`);          // body forced to next line
+      insertions.push(out.length);    // record synthesized body line (post-push, 1-indexed)
+    } else {
+      out.push(line);
+    }
+  }
+  return { normalized: out.join('\n'), insertions };
+}
+
 export function parseMarkdown(src: string): string {
-  return md.render(src);
+  const { normalized, insertions } = normalizeAlerts(src);
+  return md.render(normalized, { alertInsertions: insertions });
 }
 
 export { md };

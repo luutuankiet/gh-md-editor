@@ -88,7 +88,9 @@ export function resolveGitHubAsset(url: string, timeoutMs = RESOLVE_TIMEOUT_MS):
  * Idempotent post-render DOM walker. Call after each morphdom diff.
  * Finds <img src="https://github.com/user-attachments/..."> tags, then:
  *   - userscript installed: spinner → resolve → blob URL swap
- *   - userscript NOT installed: replace with "View attachment on GitHub" link
+ *   - userscript NOT installed: wrap in a shell with a sibling fallback link.
+ *     The original <img> stays in the DOM (hidden via CSS) so copied/exported
+ *     preview HTML preserves the canonical markup.
  * Already-processed nodes are skipped (data-gh-asset-processed attr).
  */
 export function processGitHubAssets(root: HTMLElement): void {
@@ -109,7 +111,7 @@ function processOne(img: HTMLImageElement, originalUrl: string): void {
   img.setAttribute(ORIGINAL_SRC_ATTR, originalUrl);
 
   if (!isUserscriptInstalled()) {
-    replaceWithFallback(img, originalUrl);
+    applyFallback(img, originalUrl);
     return;
   }
 
@@ -125,12 +127,31 @@ function processOne(img: HTMLImageElement, originalUrl: string): void {
       img.classList.add('gh-asset-resolved');
       img.title = '';
     } else {
-      replaceWithFallback(img, originalUrl);
+      applyFallback(img, originalUrl);
     }
   });
 }
 
-function replaceWithFallback(img: HTMLImageElement, originalUrl: string): void {
+/**
+ * Non-destructive fallback (v0.6.1). Wraps the <img> in
+ * <span class="gh-asset-shell gh-asset-shell-fallback"> and appends a sibling
+ * <a class="gh-asset-fallback"> link. The wrapper's CSS hides the <img>
+ * visually but keeps it in the DOM tree, so:
+ *   - copy/export of preview HTML preserves the canonical <img src="..."> markup
+ *   - image attrs (width/height/alt) stay attached to the original element
+ *   - a future re-render path can recover and resolve once the userscript installs
+ *
+ * Idempotent: if the img is already inside a gh-asset-shell, do nothing.
+ */
+function applyFallback(img: HTMLImageElement, originalUrl: string): void {
+  const existingShell = img.parentElement;
+  if (existingShell?.classList.contains('gh-asset-shell')) return;
+
+  const shell = document.createElement('span');
+  shell.className = 'gh-asset-shell gh-asset-shell-fallback';
+  shell.setAttribute(PROCESSED_ATTR, 'fallback');
+  shell.setAttribute(ORIGINAL_SRC_ATTR, originalUrl);
+
   const link = document.createElement('a');
   link.href = originalUrl;
   link.target = '_blank';
@@ -138,7 +159,9 @@ function replaceWithFallback(img: HTMLImageElement, originalUrl: string): void {
   link.className = 'gh-asset-fallback';
   link.textContent = 'View attachment on GitHub →';
   link.title = originalUrl;
-  link.setAttribute(PROCESSED_ATTR, 'fallback');
-  link.setAttribute(ORIGINAL_SRC_ATTR, originalUrl);
-  img.replaceWith(link);
+
+  // Insert shell at the img's position, move img into shell, append the link.
+  img.parentNode?.insertBefore(shell, img);
+  shell.appendChild(img);
+  shell.appendChild(link);
 }

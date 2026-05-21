@@ -298,4 +298,13 @@
       border-color: #79c0ff;
     }
   }
+  /* v0.6.1 — non-destructive fallback shell. Keeps original <img> in DOM tree */
+  /* so copying/exporting preview HTML preserves the canonical markup. CSS only */
+  /* hides the img visually; the link sibling is the user-facing affordance. */
+  :global(.gh-asset-shell) {
+    display: inline-block;
+  }
+  :global(.gh-asset-shell-fallback > img) {
+    display: none;
+  }
 </style>

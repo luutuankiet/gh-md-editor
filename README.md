@@ -2,6 +2,15 @@
 
 A browser-only GitHub-flavored markdown editor with a live side-by-side preview. Built for reading and editing PR-content markdown without leaving the browser.
 
+
+
+https://github.com/user-attachments/assets/71694022-c26e-4ef5-9ecc-28074059191a
+
+
+
+
+
+
 ## Features
 
 - **CodeMirror 6 editor** with markdown syntax tinting (distinct hues per heading level, strong/emphasis, monospace, links, quotes)

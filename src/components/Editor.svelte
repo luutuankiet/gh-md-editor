@@ -384,6 +384,36 @@
             onRevealRequest?.(line);
             return true;
           },
+          mousedown: (event, vw) => {
+            // v0.5.2: Alt/Opt+Left-click → add cursor at pointer position.
+            // CodeMirror 6's built-in Alt+click multi-cursor (gated on
+            // EditorState.allowMultipleSelections, enabled in v0.5.1) does NOT
+            // fire on Firefox/macOS — Firefox intercepts Option+click for its
+            // own purposes (word-select drag, accessibility shortcut). Bypass
+            // by handling mousedown at the DOM level and dispatching the
+            // cursor-add transaction ourselves. Works uniformly across
+            // Chromium / Firefox / WebKit on Mac + Linux + Windows.
+            //
+            // Modifier policy: ONLY plain Alt+Left-click. Reject if Shift/Ctrl/Meta
+            // also held — those are reserved for native CM6 chords (Shift+click =
+            // extend selection, Meta+click on macOS = native, etc).
+            if (event.button !== 0) return false;
+            if (!event.altKey || event.shiftKey || event.ctrlKey || event.metaKey) return false;
+            const pos = vw.posAtCoords({ x: event.clientX, y: event.clientY });
+            if (pos == null) return false;
+            event.preventDefault();
+            const existing = vw.state.selection;
+            const newCursor = EditorSelection.cursor(pos);
+            // Append the new range and make it primary (VS Code parity:
+            // typing happens at the most-recently-added cursor).
+            vw.dispatch({
+              selection: EditorSelection.create(
+                [...existing.ranges, newCursor],
+                existing.ranges.length,
+              ),
+            });
+            return true;
+          },
           keydown: (event, vw) => {
             if (event.altKey && !event.metaKey && !event.ctrlKey && event.code === 'KeyZ') {
               event.preventDefault();

@@ -24,6 +24,7 @@ This can be wired into `.github/workflows/deploy.yml` on tag push — see `.clau
 
 | Version | Date | Theme |
 |---|---|---|
+| [v0.5.2](./v0.5.2.md) | 2026-05-21 | hotfix | Alt+Left-click multi-cursor: explicit DOM-level mousedown handler for cross-browser parity (Mac Firefox fix). |
 | [v0.5.1](./v0.5.1.md) | 2026-05-21 | Preview sticky-header parity + multi-cursor (`Cmd+D` / `Alt+Click`). Section-grow ascend fix. Outline auto-expand. Trash-button storage clear. Scrollbar gutters bumped to 18 px. Shortcuts dialog highlights VS Code muscle-memory bindings. Mac `Ctrl+Shift+→` parity. |
 | [v0.5.0](./v0.5.0.md) | 2026-05-21 | Find in either pane (Cmd+F overlay + scrollbar match ticks + click-word implicit highlight). SQL fenced code finally highlights. Mod+Shift+→ clamps to heading sections. Table-row reveal flash. Mac Opt+Z fix. Sample doc rewritten as feature tour. `?reset=1` URL recovery. |
 | [v0.4.2](./v0.4.2.md) | 2026-05-20 | Stop the preview flicker (morphdom + paint containment + source-content keying for mermaid). Bundles sticky-scroll, alerts, autopairs, smart-select, shortcuts dialog, fork-me icon. |

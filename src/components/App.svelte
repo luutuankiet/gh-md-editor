@@ -5,6 +5,7 @@
   import Splitter from './Splitter.svelte';
   import Outline from './Outline.svelte';
   import ShortcutsDialog from './ShortcutsDialog.svelte';
+  import UserscriptStatus from './UserscriptStatus.svelte';
   import { parseMarkdown, extractOutline, type OutlineNode } from '../lib/markdown';
   import { loadDoc, saveDocDebounced, clearDoc } from '../lib/persistence';
   import { revealPreview, revealEditor } from '../lib/reveal';
@@ -439,6 +440,7 @@
 </main>
 
 <ShortcutsDialog bind:open={showShortcuts} />
+<UserscriptStatus />
 
 <style>
   .shell {

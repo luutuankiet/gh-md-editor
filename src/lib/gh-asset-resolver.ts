@@ -9,6 +9,45 @@
  * resolveGitHubAsset() returns null and the caller renders a fallback link.
  */
 
+import { writable, type Writable } from 'svelte/store';
+
+export type ResolverFailureReason =
+  | 'userscript-not-detected'
+  | 'resolve-null-or-timeout'
+  | 'http-error'
+  | 'network-error'
+  | 'timeout'
+  | 'non-asset-url'
+  | 'blob-create-failed';
+
+export type ResolverFailure = {
+  url: string;
+  reason: ResolverFailureReason;
+  status?: number;
+  at: number;
+};
+
+export type ResolverStats = {
+  userscriptDetected: boolean;
+  userscriptVersion: string | null;
+  pending: number;
+  resolved: number;
+  failed: number;
+  failures: ResolverFailure[];
+};
+
+// v0.6.3: writable store the UserscriptStatus.svelte component subscribes to.
+// Mutated from: heartbeat handler (detection), processOne (pending+/resolved+/failed+),
+// reprocessFallbackImages (clear stale failures on retry).
+export const resolverStats: Writable<ResolverStats> = writable({
+  userscriptDetected: false,
+  userscriptVersion: null,
+  pending: 0,
+  resolved: 0,
+  failed: 0,
+  failures: [],
+});
+
 const REQUEST_TYPE = 'gh-md-asset-resolve-request';
 const RESPONSE_TYPE = 'gh-md-asset-resolve-response';
 const HEARTBEAT_TYPE = 'gh-md-asset-resolver-alive';
@@ -46,11 +85,23 @@ if (typeof window !== 'undefined') {
       const wasInstalledBefore = isUserscriptInstalled();
       lastHeartbeatAt = Date.now();
       userscriptVersion = typeof data.version === 'string' ? data.version : 'unknown';
-      // v0.6.2: if detection arrived AFTER first render, any imgs locked into
-      // the fallback shell are stuck — walker won't re-evaluate without a
-      // morphdom diff. On first detection, unwrap them and retry.
       if (!wasInstalledBefore) {
+        // v0.6.3: first detection — log once and broadcast to status pill.
+        console.log('[gh-asset] heartbeat from userscript v' + userscriptVersion);
+        resolverStats.update((s) => ({
+          ...s,
+          userscriptDetected: true,
+          userscriptVersion,
+        }));
+        // v0.6.2: if detection arrived AFTER first render, any imgs locked
+        // into the fallback shell are stuck — walker won't re-evaluate
+        // without a morphdom diff. On first detection, unwrap them and retry.
         reprocessFallbackImages();
+      } else {
+        // Quiet keep-alive — refresh version in store but skip console spam.
+        resolverStats.update((s) =>
+          s.userscriptVersion === userscriptVersion ? s : { ...s, userscriptVersion },
+        );
       }
       return;
     }
@@ -117,7 +168,18 @@ function processOne(img: HTMLImageElement, originalUrl: string): void {
   img.setAttribute(PROCESSED_ATTR, 'true');
   img.setAttribute(ORIGINAL_SRC_ATTR, originalUrl);
 
+  console.log('[gh-asset] processing', originalUrl);
+
   if (!isUserscriptInstalled()) {
+    console.warn('[gh-asset] userscript not detected → fallback', originalUrl);
+    resolverStats.update((s) => ({
+      ...s,
+      failed: s.failed + 1,
+      failures: [
+        ...s.failures,
+        { url: originalUrl, reason: 'userscript-not-detected', at: Date.now() },
+      ],
+    }));
     applyFallback(img, originalUrl);
     return;
   }
@@ -126,14 +188,36 @@ function processOne(img: HTMLImageElement, originalUrl: string): void {
   img.classList.add('gh-asset-pending');
   img.title = 'Resolving GitHub attachment via userscript...';
 
+  console.log('[gh-asset] resolve→userscript', originalUrl);
+  resolverStats.update((s) => ({ ...s, pending: s.pending + 1 }));
+
   resolveGitHubAsset(originalUrl).then((blobUrl) => {
-    if (!img.isConnected) return;
+    if (!img.isConnected) {
+      resolverStats.update((s) => ({ ...s, pending: Math.max(0, s.pending - 1) }));
+      return;
+    }
     img.classList.remove('gh-asset-pending');
     if (blobUrl) {
+      console.log('[gh-asset] resolved ✓', originalUrl);
       img.setAttribute('src', blobUrl);
       img.classList.add('gh-asset-resolved');
       img.title = '';
+      resolverStats.update((s) => ({
+        ...s,
+        pending: Math.max(0, s.pending - 1),
+        resolved: s.resolved + 1,
+      }));
     } else {
+      console.warn('[gh-asset] resolve failed/null → fallback', originalUrl);
+      resolverStats.update((s) => ({
+        ...s,
+        pending: Math.max(0, s.pending - 1),
+        failed: s.failed + 1,
+        failures: [
+          ...s.failures,
+          { url: originalUrl, reason: 'resolve-null-or-timeout', at: Date.now() },
+        ],
+      }));
       applyFallback(img, originalUrl);
     }
   });
@@ -166,6 +250,23 @@ function reprocessFallbackImages(): void {
   reprocessing = true;
   try {
     const shells = document.querySelectorAll<HTMLElement>('.gh-asset-shell-fallback');
+    if (shells.length === 0) return;
+    console.log('[gh-asset] heartbeat-late: reprocessing', shells.length, 'fallback shells');
+    // v0.6.3: clear stale failure entries for URLs we're about to retry.
+    // processOne will re-count them on the new attempt.
+    const retryUrls = new Set<string>();
+    shells.forEach((shell) => {
+      const u = shell.getAttribute(ORIGINAL_SRC_ATTR);
+      if (u) retryUrls.add(u);
+    });
+    resolverStats.update((s) => {
+      const survivingFailures = s.failures.filter((f) => !retryUrls.has(f.url));
+      return {
+        ...s,
+        failed: survivingFailures.length,
+        failures: survivingFailures,
+      };
+    });
     for (const shell of shells) {
       const img = shell.querySelector<HTMLImageElement>('img');
       const originalUrl = shell.getAttribute(ORIGINAL_SRC_ATTR);

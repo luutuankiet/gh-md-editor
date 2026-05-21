@@ -20,6 +20,8 @@
     { pane: 'Editor', keys: 'Alt / Opt + Z', description: 'Toggle word wrap (persisted). Mac Opt+Z handled at the DOM event level so Firefox does not paste Ω.', highlight: true },
     { pane: 'Editor', keys: 'Cmd/Ctrl + D', description: 'Multi-cursor — spawn a caret at the next matching occurrence of the word or selection. Press repeatedly to keep adding cursors.', highlight: true },
     { pane: 'Editor', keys: 'Alt / Opt + Left-click', description: 'Multi-cursor — drop an additional caret at the click point. Combine with Cmd+D for free-form multi-cursor editing.', highlight: true },
+    { pane: 'Editor', keys: 'Cmd/Ctrl + = / -', description: 'Zoom editor pane font size (preview unaffected — heading hierarchy stays readable while you bump editor text). Persisted across reloads. Range 9–32 px.', highlight: true },
+    { pane: 'Editor', keys: 'Cmd/Ctrl + 0', description: 'Reset editor pane font size to default (13 px).', highlight: true },
     { pane: 'Editor', keys: 'Cmd/Ctrl + Shift + →', description: 'Expand selection: token → expression → fence → MARKDOWN SECTION → ENCLOSING PARENT SECTION → document. Mac Ctrl+Shift+→ also bound for muscle-memory parity.' },
     { pane: 'Editor', keys: '` * _ ~ ( [ { " \'', description: 'Wrap selection with the pair (markdown auto-pair)' },
     { pane: 'Editor', keys: 'Tab / Shift+Tab', description: 'Indent / outdent' },

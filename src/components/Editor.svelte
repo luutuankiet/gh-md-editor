@@ -123,6 +123,45 @@
     });
   }
 
+  // v0.6.6: editor-pane-only font size (Cmd+= / Cmd+- / Cmd+0) via Compartment-
+  // reconfigure of EditorView.theme. Persists across reloads. Preview pane is
+  // intentionally unaffected — the request was for per-pane control so heading
+  // hierarchy stays readable in the rendered side while you bump editor text.
+  const fontSizeCompartment = new Compartment();
+  const DEFAULT_FONT_SIZE = 13;
+  const MIN_FONT_SIZE = 9;
+  const MAX_FONT_SIZE = 32;
+  const FONT_SIZE_KEY = 'gmd:editor-font-size';
+  let currentFontSize = DEFAULT_FONT_SIZE;
+  try {
+    const stored = localStorage.getItem(FONT_SIZE_KEY);
+    if (stored) {
+      const n = parseInt(stored, 10);
+      if (!isNaN(n) && n >= MIN_FONT_SIZE && n <= MAX_FONT_SIZE) currentFontSize = n;
+    }
+  } catch { /* noop */ }
+
+  function makeFontSizeTheme(px: number) {
+    return EditorView.theme({
+      '.cm-content': { fontSize: px + 'px' },
+      '.cm-gutters': { fontSize: px + 'px' },
+    });
+  }
+
+  function applyFontSize(vw: EditorView, px: number) {
+    currentFontSize = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, px));
+    try { localStorage.setItem(FONT_SIZE_KEY, String(currentFontSize)); } catch { /* noop */ }
+    vw.dispatch({ effects: fontSizeCompartment.reconfigure(makeFontSizeTheme(currentFontSize)) });
+  }
+
+  function bumpFontSize(vw: EditorView, delta: number) {
+    applyFontSize(vw, currentFontSize + delta);
+  }
+
+  function resetFontSize(vw: EditorView) {
+    applyFontSize(vw, DEFAULT_FONT_SIZE);
+  }
+
   const PAIRS: Record<string, string> = {
     '`': '`', '*': '*', '_': '_', '~': '~',
     '(': ')', '[': ']', '{': '}',
@@ -369,6 +408,7 @@
         syntaxHighlighting(githubMarkdownHighlight),
         syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
         wrapCompartment.of(wrapEnabled ? EditorView.lineWrapping : []),
+        fontSizeCompartment.of(makeFontSizeTheme(currentFontSize)),
         markdownLang({ base: markdownLanguage, addKeymap: true, codeLanguages: MARKDOWN_CODE_LANGS }),
         markdownAutoPair,
         // Mac Opt+Z workaround (v0.5.0): Firefox on macOS emits the composed
@@ -420,6 +460,30 @@
               toggleWrap(vw);
               return true;
             }
+            // v0.6.6: editor-pane font-size shortcuts. Intercept at the DOM
+            // level BEFORE the browser's native Cmd+= / Cmd+- zoom fires.
+            // event.code is layout-independent ('Equal' / 'Minus' / 'Digit0'),
+            // so this works whether the user is on Mac (metaKey) or Win/Linux
+            // (ctrlKey). Shift is tolerated because most Mac keyboards send
+            // Shift+Cmd+= for the literal '+' key character.
+            const mod = event.metaKey || event.ctrlKey;
+            if (mod && !event.altKey) {
+              if (event.code === 'Equal') {
+                event.preventDefault();
+                bumpFontSize(vw, +1);
+                return true;
+              }
+              if (event.code === 'Minus') {
+                event.preventDefault();
+                bumpFontSize(vw, -1);
+                return true;
+              }
+              if (event.code === 'Digit0') {
+                event.preventDefault();
+                resetFontSize(vw);
+                return true;
+              }
+            }
             return false;
           },
         }),
@@ -429,6 +493,14 @@
             preventDefault: true,
             run: (vw) => { toggleWrap(vw); return true; },
           },
+          // v0.6.6: editor-pane font size. Belt-and-suspenders with the DOM
+          // keydown intercept above (DOM handler catches browser-zoom first;
+          // keymap entries here are the idiomatic CM6 fallback).
+          { key: 'Mod-=', preventDefault: true, run: (vw) => { bumpFontSize(vw, +1); return true; } },
+          { key: 'Mod-Equal', preventDefault: true, run: (vw) => { bumpFontSize(vw, +1); return true; } },
+          { key: 'Mod--', preventDefault: true, run: (vw) => { bumpFontSize(vw, -1); return true; } },
+          { key: 'Mod-Minus', preventDefault: true, run: (vw) => { bumpFontSize(vw, -1); return true; } },
+          { key: 'Mod-0', preventDefault: true, run: (vw) => { resetFontSize(vw); return true; } },
           { key: 'Mod-Shift-ArrowRight', preventDefault: true, run: selectParentOrSection },
           // v0.5.1: literal Ctrl variant for Mac users with VS Code muscle
           // memory who reach for Ctrl+Shift+→ rather than Cmd+Shift+→.
@@ -450,7 +522,7 @@
           }
         }),
         EditorView.theme({
-          '&': { height: '100%', fontSize: '13px' },
+          '&': { height: '100%' },
           '.cm-scroller': { fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace' },
           '.cm-panels': { backgroundColor: 'transparent', border: 'none' },
           '.cm-panels.cm-panels-top': { borderBottom: 'none' },

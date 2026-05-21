@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>gh-md-editor — userscript installer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #1f2328; line-height: 1.6; }
+    h1 { color: #0969da; margin-bottom: 4px; }
+    .lede { color: #6e7781; margin-top: 0; }
+    .card { border: 1px solid #d0d7de; border-radius: 8px; padding: 16px 24px; margin: 24px 0; }
+    .card.warn { border-color: #d4a72c; background: #fff8c5; }
+    .card.ok { border-color: #1a7f37; background: #dafbe1; }
+    a.btn { display: inline-block; background: #1f883d; color: #fff; padding: 10px 16px; border-radius: 6px; text-decoration: none; font-weight: 600; }
+    a.btn:hover { background: #1a7f37; }
+    a.btn.secondary { background: #d0d7de; color: #1f2328; }
+    code { background: #eaeef2; padding: 2px 6px; border-radius: 3px; font-family: ui-monospace, monospace; font-size: 0.92em; }
+    footer { color: #6e7781; font-size: 0.9em; margin-top: 40px; border-top: 1px solid #d0d7de; padding-top: 16px; }
+  </style>
+</head>
+<body>
+  <h1>Asset proxy userscript</h1>
+  <p class="lede">A 50-line Tampermonkey companion that lets gh-md-editor render private/org github.com/user-attachments images inline.</p>
+
+  <div class="card" id="detection"><strong>Status:</strong> <span id="status-text">detecting…</span></div>
+
+  <h2>1. Install Tampermonkey</h2>
+  <p>If you don't already have a userscript manager: <a class="btn secondary" href="https://www.tampermonkey.net/" target="_blank" rel="noopener">Get Tampermonkey →</a></p>
+
+  <h2>2. Install this userscript</h2>
+  <p>Tampermonkey auto-intercepts URLs ending in <code>.user.js</code> and shows its install dialog:</p>
+  <p><a class="btn" href="./userscript.user.js">Install asset proxy v0.6.0 →</a></p>
+
+  <h2>3. Reload the editor</h2>
+  <p>Reload the gh-md-editor tab. <code>github.com/user-attachments/...</code> images now resolve cookie-authenticated through your browser. No backend, no PAT.</p>
+
+  <h2>How it works</h2>
+  <p>The page sends a <code>postMessage</code> to the userscript with the URL. The userscript runs <code>GM.xmlHttpRequest</code> with cookies attached — GitHub redirects to a short-lived S3 presigned URL — downloads the bytes, creates a <code>blob:</code> URL, and posts it back. The page sets <code>&lt;img src=blob:...&gt;</code>. Bytes never leave your browser.</p>
+
+  <p>Source (read before installing): <a href="./userscript.user.js" target="_blank">public/userscript.user.js</a></p>
+
+  <footer>gh-md-editor v0.6.0 · <a href="../">Back to editor</a></footer>
+
+  <script>
+    (function () {
+      var statusEl = document.getElementById('status-text');
+      var cardEl = document.getElementById('detection');
+      var detected = false, attempts = 0;
+      function setStatus(t, c) { statusEl.textContent = t; cardEl.classList.remove('warn','ok'); if (c) cardEl.classList.add(c); }
+      window.addEventListener('message', function (e) {
+        if (e.source !== window) return;
+        var d = e.data;
+        if (d && d.type === 'gh-md-asset-resolver-alive') {
+          detected = true;
+          setStatus('userscript installed (v' + (d.version || '?') + ') — you are all set.', 'ok');
+        }
+      });
+      function probe() {
+        if (detected) return;
+        attempts++;
+        if (window.__ghMdAssetProxy) {
+          detected = true;
+          setStatus('userscript installed (v' + window.__ghMdAssetProxy + ') — you are all set.', 'ok');
+          return;
+        }
+        window.postMessage({ type: 'gh-md-asset-resolver-ping' }, '*');
+        if (attempts < 6) setTimeout(probe, 200);
+        else if (!detected) setStatus('userscript NOT installed — follow steps 1 & 2 above.', 'warn');
+      }
+      setTimeout(probe, 100);
+    })();
+  </script>
+</body>
+</html>

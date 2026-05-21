@@ -3,6 +3,7 @@
   import morphdom from 'morphdom';
   import { processMermaid } from '../lib/mermaid';
   import PreviewSearch from './PreviewSearch.svelte';
+  import { processGitHubAssets } from '../lib/gh-asset-resolver';
 
   let {
     html,
@@ -56,6 +57,7 @@
       isFirstRender = false;
       void processMermaid(localHost);
       void highlightLazy(localHost);
+      processGitHubAssets(localHost);
       return;
     }
 
@@ -111,6 +113,7 @@
 
     if (mermaidPending) void processMermaid(localHost);
     if (highlightPending) void highlightLazy(localHost);
+    processGitHubAssets(localHost);
   });
 
   async function highlightLazy(target: HTMLElement) {
@@ -259,5 +262,40 @@
     .sticky-header.level-6,
     .sticky-header.level-7,
     .sticky-header.level-8 { color: #c9d1d9; }
+  }
+  /* v0.6.0 — github user-attachments image proxy states */
+  :global(.gh-asset-pending) {
+    opacity: 0.7;
+    background: rgba(9, 105, 218, 0.05);
+    border: 1px dashed rgba(9, 105, 218, 0.3);
+    border-radius: 6px;
+    min-height: 40px;
+    padding: 4px;
+  }
+  :global(a.gh-asset-fallback) {
+    display: inline-block;
+    padding: 6px 12px;
+    background: rgba(208, 215, 222, 0.3);
+    border: 1px solid rgba(208, 215, 222, 0.8);
+    border-radius: 6px;
+    color: #0969da;
+    text-decoration: none;
+    font-size: 13px;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  }
+  :global(a.gh-asset-fallback:hover) {
+    background: rgba(9, 105, 218, 0.10);
+    border-color: #0969da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :global(a.gh-asset-fallback) {
+      background: rgba(56, 139, 253, 0.10);
+      border-color: rgba(56, 139, 253, 0.4);
+      color: #79c0ff;
+    }
+    :global(a.gh-asset-fallback:hover) {
+      background: rgba(56, 139, 253, 0.20);
+      border-color: #79c0ff;
+    }
   }
 </style>

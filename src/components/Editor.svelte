@@ -181,13 +181,67 @@
     }
     return { from: start, to: end };
   }
+  // v0.5.1 fix: ASCEND to enclosing shallower-level section. v0.5.0 fell
+  // back to selectParentSyntax once bounds matched, which walks SIDEWAYS
+  // to the next sibling block instead of UP to the parent section.
+  function findEnclosingSectionBounds(state: EditorState, currentBounds: {from: number; to: number}): {from: number; to: number} | null {
+    const tree = syntaxTree(state);
+    const headings: {from: number; level: number}[] = [];
+    tree.iterate({
+      enter: (node) => {
+        if (HEADING_NAMES.has(node.name)) {
+          headings.push({ from: node.from, level: headingLevel(node.name) });
+        }
+      },
+    });
+    if (headings.length === 0) return null;
+    let curIdx = -1;
+    for (let i = 0; i < headings.length; i++) {
+      if (headings[i].from === currentBounds.from) { curIdx = i; break; }
+    }
+    if (curIdx < 0) return null;
+    const curLevel = headings[curIdx].level;
+    let parentIdx = -1;
+    for (let i = curIdx - 1; i >= 0; i--) {
+      if (headings[i].level < curLevel) { parentIdx = i; break; }
+    }
+    if (parentIdx < 0) return null;
+    const start = headings[parentIdx].from;
+    const lvl = headings[parentIdx].level;
+    let end = state.doc.length;
+    for (let i = parentIdx + 1; i < headings.length; i++) {
+      if (headings[i].level <= lvl) { end = headings[i].from; break; }
+    }
+    return { from: start, to: end };
+  }
+
   function selectParentOrSection(vw: EditorView): boolean {
     const state = vw.state;
     const before = state.selection.main;
     const bounds = findSectionBounds(state, before.head);
+
+    // Selection already exactly equals the current section bounds:
+    // ASCEND to the enclosing shallower-level section.
     if (bounds && before.from === bounds.from && before.to === bounds.to) {
-      return selectParentSyntax(vw);
+      const parent = findEnclosingSectionBounds(state, bounds);
+      if (parent) {
+        vw.dispatch({
+          selection: EditorSelection.single(parent.from, parent.to),
+          scrollIntoView: true,
+        });
+        return true;
+      }
+      // No shallower heading → expand to whole document.
+      if (before.from > 0 || before.to < state.doc.length) {
+        vw.dispatch({
+          selection: EditorSelection.single(0, state.doc.length),
+          scrollIntoView: true,
+        });
+        return true;
+      }
+      return false;
     }
+
     selectParentSyntax(vw);
     const after = vw.state.selection.main;
     const grew = after.from !== before.from || after.to !== before.to;
@@ -300,6 +354,11 @@
         drawSelection(),
         indentOnInput(),
         bracketMatching(),
+        // v0.5.1: enable multi-cursor support. Cmd/Ctrl+D (selectNextOccurrence
+        // from searchKeymap) now actually spawns additional cursors at next
+        // match, and Alt/Opt+Left-click drops a cursor at the pointer position
+        // (drawSelection handles the click natively when this flag is true).
+        EditorState.allowMultipleSelections.of(true),
         highlightActiveLine(),
         highlightSelectionMatches({ minSelectionLength: 1, highlightWordAroundCursor: true }),
         search({ top: true }),
@@ -341,6 +400,9 @@
             run: (vw) => { toggleWrap(vw); return true; },
           },
           { key: 'Mod-Shift-ArrowRight', preventDefault: true, run: selectParentOrSection },
+          // v0.5.1: literal Ctrl variant for Mac users with VS Code muscle
+          // memory who reach for Ctrl+Shift+→ rather than Cmd+Shift+→.
+          { key: 'Ctrl-Shift-ArrowRight', preventDefault: true, run: selectParentOrSection },
           ...defaultKeymap,
           ...historyKeymap,
           ...searchKeymap,
@@ -493,19 +555,21 @@
     overflow: auto;
   }
 
+  /* v0.5.1: scrollbar gutter widened 12 -> 18px so highlight ticks read at a
+     glance — the previous 12px / 8px-tick combo was visible only when squinting. */
   .editor-tick-rail {
     position: absolute;
     top: 0;
     bottom: 0;
     right: 0;
-    width: 12px;
+    width: 18px;
     pointer-events: none;
     z-index: 5;
   }
   .editor-tick-rail .tick {
     position: absolute;
     right: 2px;
-    width: 8px;
+    width: 14px;
     height: 2px;
     border-radius: 1px;
   }
@@ -518,7 +582,7 @@
   .editor-tick-rail .tick.current {
     background: #ff6b00;
     height: 3px;
-    width: 10px;
+    width: 16px;
     right: 1px;
   }
 

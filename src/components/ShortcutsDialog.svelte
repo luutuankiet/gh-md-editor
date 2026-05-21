@@ -13,21 +13,24 @@
     open = false;
   }
 
-  interface Shortcut { pane: string; keys: string; description: string }
+  interface Shortcut { pane: string; keys: string; description: string; highlight?: boolean }
   const shortcuts: Shortcut[] = [
-    { pane: 'Editor', keys: 'Right-click', description: 'Flash matching block in preview (auto-expands collapsed <details>, lands on the matching table row not the whole table)' },
+    { pane: 'Editor', keys: 'Right-click', description: 'NOVEL FEATURE — flash matching block in preview (auto-expands collapsed <details>, lands on the matching table row not the whole table). Pairs with right-click in the preview going the other way: never lose your place when switching panes.' },
     { pane: 'Editor', keys: 'Cmd/Ctrl + F', description: 'Find / replace (CodeMirror panel, top-right). Scrollbar shows match ticks; word at cursor lights up implicitly in a fainter shade.' },
-    { pane: 'Editor', keys: 'Alt / Opt + Z', description: 'Toggle word wrap (persisted). Mac Opt+Z handled at the DOM event level so Firefox does not paste Ω.' },
-    { pane: 'Editor', keys: 'Cmd/Ctrl + Shift + →', description: 'Expand selection: token → expression → fence → ENCLOSING MARKDOWN SECTION → document.' },
+    { pane: 'Editor', keys: 'Alt / Opt + Z', description: 'Toggle word wrap (persisted). Mac Opt+Z handled at the DOM event level so Firefox does not paste Ω.', highlight: true },
+    { pane: 'Editor', keys: 'Cmd/Ctrl + D', description: 'Multi-cursor — spawn a caret at the next matching occurrence of the word or selection. Press repeatedly to keep adding cursors.', highlight: true },
+    { pane: 'Editor', keys: 'Alt / Opt + Left-click', description: 'Multi-cursor — drop an additional caret at the click point. Combine with Cmd+D for free-form multi-cursor editing.', highlight: true },
+    { pane: 'Editor', keys: 'Cmd/Ctrl + Shift + →', description: 'Expand selection: token → expression → fence → MARKDOWN SECTION → ENCLOSING PARENT SECTION → document. Mac Ctrl+Shift+→ also bound for muscle-memory parity.' },
     { pane: 'Editor', keys: '` * _ ~ ( [ { " \'', description: 'Wrap selection with the pair (markdown auto-pair)' },
     { pane: 'Editor', keys: 'Tab / Shift+Tab', description: 'Indent / outdent' },
-    { pane: 'Preview', keys: 'Cmd/Ctrl + F', description: 'Find in preview (overlay top-right). Scrollbar match ticks; Enter / Shift+Enter to step through; Esc to close.' },
+    { pane: 'Preview', keys: 'Cmd/Ctrl + F', description: 'Find in preview (overlay top-right). Scrollbar match ticks; Enter / Shift+Enter to step through; Esc to close.', highlight: true },
     { pane: 'Preview', keys: 'Left-click on a word', description: 'Implicit highlight — all matching occurrences light up faintly (different shade than explicit search), with scrollbar ticks.' },
-    { pane: 'Preview', keys: 'Right-click', description: 'Jump editor caret to the clicked block' },
-    { pane: 'Outline', keys: 'Click row', description: 'Jump both panes; toggle fold if the row has children' },
+    { pane: 'Preview', keys: 'Right-click', description: 'NOVEL FEATURE — jump editor caret to the clicked block. Pairs with editor right-click for the other direction.' },
+    { pane: 'Outline', keys: 'Click row', description: 'Jump both panes; toggle fold if the row has children. Auto-expands when scrolling moves the active heading into a collapsed branch.' },
+    { pane: 'Outline', keys: 'Trash icon', description: 'Clear stored draft and reload — restores the sample doc.' },
     { pane: 'Outline', keys: '−', description: 'Fold all (while outline pane is focused)' },
     { pane: 'Outline', keys: '+ / =', description: 'Unfold all (while outline pane is focused)' },
-    { pane: 'URL', keys: '?reset=1', description: 'Append to URL and reload to restore the v0.5.0 sample doc (wipes the current localStorage draft).' },
+    { pane: 'URL', keys: '?reset=1', description: 'Append to URL and reload to restore the sample doc (wipes the current localStorage draft).' },
   ];
 </script>
 
@@ -55,9 +58,12 @@
         </thead>
         <tbody>
           {#each shortcuts as s}
-            <tr>
+            <tr class:highlight={s.highlight}>
               <td class="pane-col">{s.pane}</td>
-              <td><kbd>{s.keys}</kbd></td>
+              <td>
+                <kbd>{s.keys}</kbd>
+                {#if s.highlight}<span class="muscle-badge" title="A VS Code muscle-memory binding">VS Code</span>{/if}
+              </td>
               <td>{s.description}</td>
             </tr>
           {/each}
@@ -162,6 +168,28 @@
     color: #1f2328;
     white-space: nowrap;
   }
+  /* v0.5.1: rows marked highlight=true are VS Code muscle-memory bindings.
+     Accent stripe on the left edge + soft background tint + inline badge. */
+  .shortcuts-dialog tr.highlight > td {
+    background: rgba(9, 105, 218, 0.06);
+  }
+  .shortcuts-dialog tr.highlight > td:first-child {
+    border-left: 3px solid #0969da;
+    padding-left: 13px;
+  }
+  .shortcuts-dialog .muscle-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    font-size: 10px;
+    line-height: 1.4;
+    font-weight: 600;
+    color: #ffffff;
+    background: linear-gradient(180deg, #0969da, #0a5dc2);
+    border-radius: 10px;
+    vertical-align: middle;
+    letter-spacing: 0.02em;
+  }
   .shortcuts-dialog footer {
     padding: 8px 16px;
     border-top: 1px solid #eaeef2;
@@ -186,6 +214,16 @@
       background: #21262d;
       border-color: #30363d;
       color: #c9d1d9;
+    }
+    .shortcuts-dialog tr.highlight > td {
+      background: rgba(56, 139, 253, 0.10);
+    }
+    .shortcuts-dialog tr.highlight > td:first-child {
+      border-left-color: #58a6ff;
+    }
+    .shortcuts-dialog .muscle-badge {
+      background: linear-gradient(180deg, #1f6feb, #1158c7);
+      color: #ffffff;
     }
     .shortcuts-dialog footer {
       background: #1c2128;

@@ -6,7 +6,7 @@
   import Outline from './Outline.svelte';
   import ShortcutsDialog from './ShortcutsDialog.svelte';
   import { parseMarkdown, extractOutline, type OutlineNode } from '../lib/markdown';
-  import { loadDoc, saveDocDebounced } from '../lib/persistence';
+  import { loadDoc, saveDocDebounced, clearDoc } from '../lib/persistence';
   import { revealPreview, revealEditor } from '../lib/reveal';
   import { EditorView } from '@codemirror/view';
 
@@ -23,6 +23,9 @@
   let outline = $derived<OutlineNode[]>(extractOutline(doc));
   let activeHeadingLine = $state(0);
   let editorTopLine = $state(1);
+  // v0.5.1: track preview scrollTop so we can hide the sticky stack when the
+  // user is at the very top (parity with editor's `topLine > 1` suppression).
+  let previewScrollTop = $state(0);
 
   // Path of headings (root -> deepest) whose .line <= editorTopLine.
   // At each level pick the LAST heading (closest to topLine) and recurse.
@@ -45,6 +48,15 @@
   // heading is already visible, no point duplicating it.
   let editorBreadcrumb = $derived<OutlineNode[]>(
     editorTopLine > 1 ? computeBreadcrumb(outline, editorTopLine) : []
+  );
+
+  // v0.5.1: preview pane gets the same sticky-header treatment. Drives off
+  // activeHeadingLine (already tracked via the existing scroll listener) and
+  // hides when scrolled near the top.
+  let previewBreadcrumb = $derived<OutlineNode[]>(
+    previewScrollTop > 20 && activeHeadingLine > 0
+      ? computeBreadcrumb(outline, activeHeadingLine)
+      : []
   );
 
   let parseTimer: ReturnType<typeof setTimeout> | null = null;
@@ -112,7 +124,10 @@
       activeHeadingLine = active || flatLines[0];
     };
 
-    const onScroll = () => requestAnimationFrame(compute);
+    const onScroll = () => {
+      previewScrollTop = ph.scrollTop;
+      requestAnimationFrame(compute);
+    };
     ph.addEventListener('scroll', onScroll, { passive: true });
 
     let scheduleTimer: ReturnType<typeof setTimeout>;
@@ -173,11 +188,10 @@
 
   function sampleDoc(): string {
     return [
-      '# gh-md-editor — a side-by-side markdown surface',
+      '# gh-md-editor — markdown that follows you',
       '',
-      'A GitHub-flavored markdown editor with a live preview that follows your cursor,',
-      'an outline that tracks what you are reading, and a few VS Code-style ergonomics',
-      'borrowed from the editor most of us already live in.',
+      'A side-by-side markdown editor with the one thing every other side-by-side',
+      'markdown editor refuses to do: **never lose your place when switching panes**.',
       '',
       '**Why this exists.** Writing markdown blind in a plain textarea is a guessing',
       'game (does that table align? is that actually a heading?). Writing in WYSIWYG',
@@ -186,8 +200,10 @@
       'oriented in long documents.',
       '',
       '**Drive it like VS Code.** `Cmd/Ctrl+F` finds in either pane, `Cmd/Ctrl+Shift+→`',
-      'grows the selection, right-click in either pane jumps the other. The full',
-      'shortcut sheet lives behind the `?` in the outline header (top-right).',
+      'grows the selection, **right-click in either pane jumps the other** (the novel',
+      'feature this editor exists for). `Cmd+D` spawns a cursor at the next match;',
+      '`Alt+Click` drops one wherever you point. Full shortcut sheet behind the `?`',
+      'in the outline header — the **VS Code** badges flag muscle-memory bindings.',
       '',
       '**What it is NOT.** No collaboration, no cloud sync, no account. Your draft',
       'lives in this browser localStorage. Refresh — still here. Close the laptop —',
@@ -198,24 +214,34 @@
       '',
       '## Try these first',
       '',
-      '1. Type something — the preview redraws as you type.',
-      '2. Right-click any line in the editor → preview flashes the matching block.',
-      '3. Press `Cmd/Ctrl+F` in either pane → search overlay opens.',
-      '4. Click any word in the preview → matching occurrences light up faintly, and on the scrollbar.',
-      '5. Press `Cmd/Ctrl+Shift+→` repeatedly → selection grows: word → fence → whole markdown section → document.',
+      '1. **Right-click any line in the editor** → preview flashes the matching block (auto-expanding `<details>` if needed). Then right-click any paragraph in the preview → editor caret jumps. THIS is the feature this app exists for.',
+      '2. Press `Cmd/Ctrl+F` in either pane → search overlay opens. The **preview** one is the VS Code muscle-memory port via the CSS Custom Highlight API.',
+      '3. Click any word in the preview → matching occurrences light up faintly, both inline and on the scrollbar (now an 18px gutter, visible from across the room).',
+      '4. Press `Cmd/Ctrl+Shift+→` repeatedly → selection grows: word → fence → MARKDOWN SECTION → ENCLOSING PARENT SECTION → document. Mac: `Ctrl+Shift+→` also bound.',
+      '5. Select a word and press `Cmd/Ctrl+D` repeatedly → spawn cursors at every next match. Type once, type everywhere.',
+      '6. Hold `Alt/Opt` and left-click anywhere → drop another cursor at the click point.',
+      '7. Click the trash icon in the outline header (top-right) → wipes localStorage and reloads, restoring this tour.',
       '',
-      '## Headings stack as you scroll',
+      '## Headings stack as you scroll — both panes',
       '',
       '> [!TIP]',
-      '> Scroll the editor pane down a few headings. The top of the editor stacks',
+      '> Scroll either pane down a few headings. The top of the pane stacks',
       '> `# → ## → ###` translucently so you always see where you are. Click any sticky',
-      '> row to jump back to that heading.',
+      '> row to jump back. **New in v0.5.1:** the preview pane gets the same treatment',
+      '> — sticky breadcrumb mirrors what the editor pane has always done.',
       '',
       '### A nested third-level heading',
       '',
       '#### A fourth, for the road',
       '',
       '…and back to the top of the section.',
+      '',
+      '## Outline tracks what you read — and auto-expands',
+      '',
+      'The outline on the right highlights the heading you are currently scrolled to.',
+      '**New in v0.5.1:** if that heading is inside a collapsed branch, the outline',
+      'walks ancestors and auto-expands them so the active row stays visible. No more',
+      'hunting collapsed parents to find where the highlight went.',
       '',
       '## Alerts, the GitHub way',
       '',
@@ -302,10 +328,12 @@
       '',
       '| Feature | Editor pane | Preview pane |',
       '|---|---|---|',
-      '| Right-click reveal | flashes the matching block on the other side | flashes the matching line in editor |',
+      '| Right-click reveal | flashes matching block on the other side | flashes matching line in editor |',
       '| Search overlay (Cmd+F) | floating panel top-right (CodeMirror) | floating panel top-right (custom) |',
-      '| Scrollbar match ticks | yellow for query, blue for word-at-cursor | same shades |',
-      '| Click a word | grows selection via `Mod+Shift+→` | implicit highlight (faint blue, both inline and on scrollbar) |',
+      '| Scrollbar match ticks | 18px gutter, yellow query / blue word-at-cursor | same shades, same gutter |',
+      '| Click a word | grows selection via `Cmd+Shift+→` | implicit highlight (inline + scrollbar) |',
+      '| Multi-cursor | `Cmd+D` at next match; `Alt+Click` at pointer | n/a — preview is read-only |',
+      '| Sticky breadcrumb | yes | yes (new in v0.5.1) |',
       '',
       'Right-click any row above. v0.5.0 added per-row reveal; before, you got the',
       'whole table flashed instead of just the line you pointed at.',
@@ -326,16 +354,21 @@
       '3. → statement',
       '4. → whole fenced block',
       '5. → the WHOLE `## Fenced code…` section',
-      '6. → the entire document',
+      '6. → the ENCLOSING parent section (`# gh-md-editor`)',
+      '7. → the entire document',
       '',
-      'Step 5 is the v0.5.0 fix. Before, the selection would walk SIDEWAYS into the',
-      'next block instead of clamping to the heading boundary.',
+      'Step 5 is the v0.5.0 fix (clamp to section). Step 6 is the v0.5.1 fix: after',
+      'clamping, the NEXT press ascends to the enclosing parent section instead of',
+      'walking sideways to the next sibling.',
+      '',
+      'Mac users: `Ctrl+Shift+→` works the same as `Cmd+Shift+→` — both bound.',
       '',
       '---',
       '',
       '> Your changes persist in localStorage. Refresh — they are still here. The',
       '> keyboard cheat-sheet lives behind the `?` in the outline header (top-right).',
-      '> `?reset=1` in the URL restores this sample doc at any time.',
+      '> The **trash icon** next to it wipes the draft and restores this tour at any',
+      '> time. `?reset=1` in the URL does the same thing.',
       '',
     ].join('\n');
   }
@@ -375,6 +408,8 @@
         {html}
         bind:host={previewHost}
         onRevealRequest={handlePreviewReveal}
+        breadcrumb={previewBreadcrumb}
+        onHeaderJump={handleOutlineJump}
       />
     </div>
   </div>
@@ -385,6 +420,7 @@
       activeLine={activeHeadingLine}
       onJump={handleOutlineJump}
       onHelp={() => (showShortcuts = true)}
+      onClear={clearDoc}
     />
   </div>
 </main>

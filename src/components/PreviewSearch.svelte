@@ -357,19 +357,20 @@
     border-color: #d0d7de;
   }
 
+  /* v0.5.1: 12 -> 18 to match editor pane. Tick widths scaled to match. */
   .preview-tick-rail {
     position: absolute;
     top: 0;
     bottom: 0;
     right: 0;
-    width: 12px;
+    width: 18px;
     pointer-events: none;
     z-index: 5;
   }
   .preview-tick-rail .tick {
     position: absolute;
     right: 2px;
-    width: 8px;
+    width: 14px;
     height: 2px;
     border-radius: 1px;
   }
@@ -382,7 +383,7 @@
   .preview-tick-rail .tick.current {
     background: #ff6b00;
     height: 3px;
-    width: 10px;
+    width: 16px;
     right: 1px;
   }
 

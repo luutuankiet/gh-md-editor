@@ -8,10 +8,14 @@
     html,
     host = $bindable<HTMLElement | null>(null),
     onRevealRequest,
+    breadcrumb = [],
+    onHeaderJump,
   }: {
     html: string;
     host?: HTMLElement | null;
     onRevealRequest?: (node: HTMLElement) => void;
+    breadcrumb?: Array<{ line: number; level: number; text: string }>;
+    onHeaderJump?: (line: number) => void;
   } = $props();
 
   let localHost: HTMLElement | null = $state(null);
@@ -144,6 +148,19 @@
 </script>
 
 <div class="preview-container" bind:this={containerEl}>
+  {#if breadcrumb.length > 0}
+    <div class="sticky-headers" aria-hidden="false">
+      {#each breadcrumb as item, i (item.line)}
+        <button
+          type="button"
+          class="sticky-header level-{item.level}"
+          style="top: {i * 22}px; z-index: {20 - i}"
+          onclick={() => onHeaderJump?.(item.line)}
+          title={`Jump to line ${item.line}`}
+        >{'#'.repeat(item.level)} {item.text}</button>
+      {/each}
+    </div>
+  {/if}
   <div class="preview-wrap" bind:this={scrollWrap}>
     <article
       class="markdown-body"
@@ -161,6 +178,55 @@
     width: 100%;
     overflow: hidden;
   }
+  /* v0.5.1: sticky-header stack mirrors the editor pane's. Lives at the top of
+     the preview container, abs-positioned over the scroll wrap. pointer-events:
+     none on the wrapper so empty space passes clicks through to the rendered
+     markdown underneath; rows re-enable pointer events. */
+  .sticky-headers {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 18px;
+    z-index: 10;
+    pointer-events: none;
+  }
+  .sticky-header {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 22px;
+    pointer-events: auto;
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border-top: none;
+    border-left: none;
+    border-right: none;
+    border-bottom: 1px solid rgba(208, 215, 222, 0.5);
+    padding: 0 16px;
+    display: flex;
+    align-items: center;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 13px;
+    line-height: 22px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: pointer;
+    text-align: left;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .sticky-header:hover { background: rgba(9, 105, 218, 0.10); }
+  .sticky-header.level-1 { color: #cf222e; font-weight: 700; }
+  .sticky-header.level-2 { color: #0550ae; font-weight: 700; }
+  .sticky-header.level-3 { color: #6639ba; font-weight: 600; }
+  .sticky-header.level-4 { color: #953800; font-weight: 600; }
+  .sticky-header.level-5 { color: #0a3069; font-weight: 500; }
+  .sticky-header.level-6,
+  .sticky-header.level-7,
+  .sticky-header.level-8 { color: #1f2328; font-weight: 500; }
+
   .preview-wrap {
     height: 100%;
     overflow-y: auto;
@@ -180,5 +246,18 @@
     .preview-wrap {
       background: #0d1117;
     }
+    .sticky-header {
+      background: rgba(13, 17, 23, 0.92);
+      border-bottom-color: rgba(48, 54, 61, 0.5);
+    }
+    .sticky-header:hover { background: rgba(56, 139, 253, 0.12); }
+    .sticky-header.level-1 { color: #ff7b72; }
+    .sticky-header.level-2 { color: #79c0ff; }
+    .sticky-header.level-3 { color: #d2a8ff; }
+    .sticky-header.level-4 { color: #ffa657; }
+    .sticky-header.level-5 { color: #a5d6ff; }
+    .sticky-header.level-6,
+    .sticky-header.level-7,
+    .sticky-header.level-8 { color: #c9d1d9; }
   }
 </style>

@@ -26,3 +26,23 @@ export function saveDocDebounced(content: string, delayMs = 500): void {
     saveTimer = null;
   }, delayMs);
 }
+
+// v0.5.1: explicit storage wipe + reload, bound to the trash button in the
+// outline header. A confirm() prevents accidental clicks (the muscle-memory
+// path from the GitHub trash icon is destructive). After confirmation the
+// sample doc reappears on reload via loadDoc()'s empty-string fallback.
+export function clearDoc(): void {
+  if (typeof window !== 'undefined') {
+    if (!window.confirm('Wipe the local draft and reload? (The sample doc will reappear.)')) {
+      return;
+    }
+  }
+  try {
+    localStorage.removeItem(KEY);
+  } catch {
+    // ignore
+  }
+  if (typeof window !== 'undefined') {
+    window.location.reload();
+  }
+}

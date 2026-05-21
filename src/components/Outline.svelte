@@ -6,11 +6,13 @@
     activeLine = 0,
     onJump,
     onHelp,
+    onClear,
   }: {
     nodes: OutlineNode[];
     activeLine?: number;
     onJump: (line: number) => void;
     onHelp?: () => void;
+    onClear?: () => void;
   } = $props();
 
   let folded = $state(new Set<number>());
@@ -78,6 +80,25 @@
   }
 
   let activeAncestors = $derived(findAncestors(nodes, activeLine));
+
+  // v0.5.1: when the active heading lands inside a collapsed branch, walk the
+  // ancestor chain and force-open every node containing the active line so the
+  // highlighted row becomes visible. Direct mutation of `folded` from an effect
+  // is intentional — trigger is derived state (activeLine via scroll), not a
+  // user click on this component.
+  $effect(() => {
+    if (activeLine === 0) return;
+    const ancestors = activeAncestors;
+    let mutated = false;
+    const next = new Set(folded);
+    for (const a of ancestors) {
+      if (a !== activeLine && next.has(a)) {
+        next.delete(a);
+        mutated = true;
+      }
+    }
+    if (mutated) folded = next;
+  });
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -102,6 +123,18 @@
     </a>
     <button onclick={foldAll} title="Fold all (−)" aria-label="Fold all">−</button>
     <button onclick={unfoldAll} title="Unfold all (+)" aria-label="Unfold all">+</button>
+    {#if onClear}
+      <button
+        class="clear-storage"
+        onclick={() => onClear?.()}
+        title="Clear stored draft and reload (restores the sample doc)"
+        aria-label="Clear stored draft"
+      >
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <path fill="currentColor" d="M11 1.75V3h2.25a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75ZM4.496 6.675l.66 6.6a.25.25 0 0 0 .249.225h5.19a.25.25 0 0 0 .249-.225l.66-6.6a.75.75 0 0 1 1.492.149l-.66 6.6A1.75 1.75 0 0 1 10.595 15h-5.19a1.75 1.75 0 0 1-1.74-1.575l-.66-6.6a.75.75 0 1 1 1.492-.15ZM6.5 1.75v1.25h3V1.75a.25.25 0 0 0-.25-.25h-2.5a.25.25 0 0 0-.25.25Z"/>
+        </svg>
+      </button>
+    {/if}
   </header>
   <div class="outline-scroll">
     {#if nodes.length === 0}

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         gh-md-editor GitHub Asset Proxy
 // @namespace    https://luutuankiet.github.io/gh-md-editor/
-// @version      0.6.1
+// @version      0.6.2
 // @description  Resolve private/org github.com/user-attachments image URLs cookie-authenticated and bridge them back to the gh-md-editor preview pane.
 // @match        https://luutuankiet.github.io/gh-md-editor/*
 // @match        http://127.0.0.1:5173/gh-md-editor/*
@@ -22,7 +22,7 @@
   const RESPONSE_TYPE = 'gh-md-asset-resolve-response';
   const HEARTBEAT_TYPE = 'gh-md-asset-resolver-alive';
   const PING_TYPE = 'gh-md-asset-resolver-ping';
-  const VERSION = '0.6.1';
+  const VERSION = '0.6.2';
 
   try { unsafeWindow[PROXY_FLAG] = VERSION; } catch (_) {
     try { window[PROXY_FLAG] = VERSION; } catch (_) {}

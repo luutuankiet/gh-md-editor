@@ -43,8 +43,15 @@ if (typeof window !== 'undefined') {
     if (!data || typeof data !== 'object') return;
 
     if (data.type === HEARTBEAT_TYPE) {
+      const wasInstalledBefore = isUserscriptInstalled();
       lastHeartbeatAt = Date.now();
       userscriptVersion = typeof data.version === 'string' ? data.version : 'unknown';
+      // v0.6.2: if detection arrived AFTER first render, any imgs locked into
+      // the fallback shell are stuck — walker won't re-evaluate without a
+      // morphdom diff. On first detection, unwrap them and retry.
+      if (!wasInstalledBefore) {
+        reprocessFallbackImages();
+      }
       return;
     }
 
@@ -143,6 +150,38 @@ function processOne(img: HTMLImageElement, originalUrl: string): void {
  *
  * Idempotent: if the img is already inside a gh-asset-shell, do nothing.
  */
+/**
+ * Re-evaluate imgs currently wrapped in a fallback shell. Called when the
+ * userscript heartbeat arrives AFTER the first render walker ran with no
+ * userscript detected. Unwrap the img, clear PROCESSED_ATTR, hand back to
+ * processOne which will now take the spinner/resolve path.
+ *
+ * Re-entry guard: heartbeat fires repeatedly; only the first one triggers
+ * unwrap, subsequent heartbeats find no fallback shells (idempotent).
+ */
+let reprocessing = false;
+function reprocessFallbackImages(): void {
+  if (typeof document === 'undefined') return;
+  if (reprocessing) return;
+  reprocessing = true;
+  try {
+    const shells = document.querySelectorAll<HTMLElement>('.gh-asset-shell-fallback');
+    for (const shell of shells) {
+      const img = shell.querySelector<HTMLImageElement>('img');
+      const originalUrl = shell.getAttribute(ORIGINAL_SRC_ATTR);
+      if (!img || !originalUrl) continue;
+      // Move img back out to shell's parent at shell's position; drop shell.
+      shell.parentNode?.insertBefore(img, shell);
+      shell.remove();
+      // Clear PROCESSED_ATTR so processOne can re-run from scratch.
+      img.removeAttribute(PROCESSED_ATTR);
+      processOne(img, originalUrl);
+    }
+  } finally {
+    reprocessing = false;
+  }
+}
+
 function applyFallback(img: HTMLImageElement, originalUrl: string): void {
   const existingShell = img.parentElement;
   if (existingShell?.classList.contains('gh-asset-shell')) return;

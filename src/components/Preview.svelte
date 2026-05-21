@@ -307,4 +307,14 @@
   :global(.gh-asset-shell-fallback > img) {
     display: none;
   }
+  /* v0.6.5 — aspect-ratio fix for imgs with explicit width/height attributes.
+     github-markdown-css sets max-width:100% on .markdown-body img but NOT
+     height:auto, so when the browser clamps width to container, the height
+     attribute stays at its literal value — producing a squashed render
+     (e.g. 600px wide × 953px tall on a 1024×953 source). GitHub's production
+     CSS includes this rule; the npm github-markdown-css package omits it.
+     Restoring it makes aspect ratio survive container clamping. */
+  :global(.markdown-body img) {
+    height: auto;
+  }
 </style>

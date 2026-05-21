@@ -77,7 +77,10 @@ let userscriptVersion: string | null = null;
 
 if (typeof window !== 'undefined') {
   window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
+    // v0.6.4: replaced `event.source !== window` filter (broken in TM sandbox
+    // — userscript's postMessage tags source as sandbox proxy, !== page window)
+    // with origin-string compare. Same cross-origin guarantee.
+    if (event.origin !== location.origin) return;
     const data = event.data;
     if (!data || typeof data !== 'object') return;
 
@@ -85,9 +88,11 @@ if (typeof window !== 'undefined') {
       const wasInstalledBefore = isUserscriptInstalled();
       lastHeartbeatAt = Date.now();
       userscriptVersion = typeof data.version === 'string' ? data.version : 'unknown';
+      // v0.6.4: log every heartbeat (not just first detection) so the channel
+      // is observable from the page side. ~3 heartbeats per page load total:
+      // userscript@load + DOMContentLoaded + PING-response — not noisy.
+      console.log('[gh-asset] heartbeat from userscript v' + userscriptVersion);
       if (!wasInstalledBefore) {
-        // v0.6.3: first detection — log once and broadcast to status pill.
-        console.log('[gh-asset] heartbeat from userscript v' + userscriptVersion);
         resolverStats.update((s) => ({
           ...s,
           userscriptDetected: true,
@@ -98,7 +103,7 @@ if (typeof window !== 'undefined') {
         // without a morphdom diff. On first detection, unwrap them and retry.
         reprocessFallbackImages();
       } else {
-        // Quiet keep-alive — refresh version in store but skip console spam.
+        // Quiet keep-alive — refresh version in store.
         resolverStats.update((s) =>
           s.userscriptVersion === userscriptVersion ? s : { ...s, userscriptVersion },
         );

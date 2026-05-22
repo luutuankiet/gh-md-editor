@@ -7,7 +7,7 @@ import { EditorView as EV } from '@codemirror/view';
  * Without this, revealing a line whose preview counterpart lives inside a
  * collapsed <details> would scroll-then-flash an element with zero height.
  */
-function expandDetailsAncestors(target: HTMLElement, host: HTMLElement): void {
+export function expandDetailsAncestors(target: HTMLElement, host: HTMLElement): void {
   let p: HTMLElement | null = target;
   while (p && p !== host) {
     if (p.tagName === 'DETAILS' && !(p as HTMLDetailsElement).open) {

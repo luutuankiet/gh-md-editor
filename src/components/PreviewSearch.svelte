@@ -1,10 +1,12 @@
 <script lang="ts">
-  // PreviewSearch.svelte — v0.5.0
+  // PreviewSearch.svelte — v0.5.0 (v0.6.7: auto-expand <details> on Enter-step)
   // Cmd+F search overlay for the preview pane, with:
   //   - explicit query highlight (CSS Custom Highlight API)
   //   - implicit click-word highlight in a different shade
   //   - scrollbar match indicator ticks (RHS gutter, abs-positioned)
   //   - prev/next navigation, Esc to close
+  //   - auto-expand collapsed <details> ancestors of the active match before scroll
+  import { expandDetailsAncestors } from '../lib/reveal';
 
   let {
     host,
@@ -240,11 +242,23 @@
 
   function scrollToMatch(idx: number) {
     const m = matches[idx];
-    if (!m || !scrollWrap) return;
-    const rect = m.range.getBoundingClientRect();
-    const wrapRect = scrollWrap.getBoundingClientRect();
-    const yInContent = rect.top - wrapRect.top + scrollWrap.scrollTop;
-    scrollWrap.scrollTo({ top: Math.max(0, yInContent - wrapRect.height / 3), behavior: 'smooth' });
+    if (!m || !scrollWrap || !host) return;
+    // Auto-expand collapsed <details> ancestors of the active match before
+    // scrolling. Range.startContainer is a Text node — use its parentElement
+    // as the walker starting point. Mirrors revealPreview()'s pattern in
+    // src/lib/reveal.ts (editor right-click reveal also expands ancestors).
+    const startEl = m.range.startContainer.parentElement;
+    if (startEl) expandDetailsAncestors(startEl, host);
+    // Wait one frame for <details> layout to settle, then measure + scroll,
+    // and refresh tick geometry since opening details grows scrollHeight.
+    requestAnimationFrame(() => {
+      if (!scrollWrap) return;
+      const rect = m.range.getBoundingClientRect();
+      const wrapRect = scrollWrap.getBoundingClientRect();
+      const yInContent = rect.top - wrapRect.top + scrollWrap.scrollTop;
+      scrollWrap.scrollTo({ top: Math.max(0, yInContent - wrapRect.height / 3), behavior: 'smooth' });
+      refresh();
+    });
   }
 
   function next() {

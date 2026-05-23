@@ -3,7 +3,7 @@
   import { EditorView, lineNumbers, drawSelection, highlightActiveLine, keymap } from '@codemirror/view';
   import { EditorState, EditorSelection, Compartment } from '@codemirror/state';
   import { history, historyKeymap, defaultKeymap, indentWithTab, selectParentSyntax } from '@codemirror/commands';
-  import { indentOnInput, bracketMatching, syntaxHighlighting, HighlightStyle, defaultHighlightStyle, syntaxTree, LanguageDescription } from '@codemirror/language';
+  import { indentOnInput, bracketMatching, syntaxTree, LanguageDescription } from '@codemirror/language';
   import { highlightSelectionMatches, searchKeymap, search, getSearchQuery } from '@codemirror/search';
   import { markdown as markdownLang, markdownLanguage } from '@codemirror/lang-markdown';
   import { languages as codeLanguages } from '@codemirror/language-data';
@@ -14,7 +14,9 @@
   import { yaml } from '@codemirror/lang-yaml';
   import { html as htmlLang } from '@codemirror/lang-html';
   import { css as cssLang } from '@codemirror/lang-css';
-  import { tags as t } from '@lezer/highlight';
+  import { editorThemeExtensions } from '../lib/editor-theme';
+  import type { EffectiveTheme, ThemeChoice } from '../lib/theme';
+  import ThemeToggle from './ThemeToggle.svelte';
 
   // v0.5.0: pre-resolved LanguageDescription entries for the common fenced-code
   // languages we expect in markdown drafts. language-data's lazy LanguageDescriptions
@@ -40,11 +42,17 @@
     view = $bindable<EditorView | null>(null),
     topLine = $bindable(1),
     onRevealRequest,
+    themeChoice = 'auto',
+    effectiveTheme = 'light',
+    onThemeToggle,
   }: {
     value?: string;
     view?: EditorView | null;
     topLine?: number;
     onRevealRequest?: (line: number) => void;
+    themeChoice?: ThemeChoice;
+    effectiveTheme?: EffectiveTheme;
+    onThemeToggle?: () => void;
   } = $props();
 
   let host: HTMLDivElement;
@@ -58,58 +66,11 @@
   let implicitTicks = $state<number[]>([]);
   let currentTickY = $state<number | null>(null);
 
-  const githubMarkdownHighlight = HighlightStyle.define([
-    // Markdown-level tags
-    { tag: t.heading1, color: '#cf222e', fontWeight: '700', fontSize: '1.18em' },
-    { tag: t.heading2, color: '#0550ae', fontWeight: '700', fontSize: '1.10em' },
-    { tag: t.heading3, color: '#6639ba', fontWeight: '600' },
-    { tag: t.heading4, color: '#953800', fontWeight: '600' },
-    { tag: t.heading5, color: '#0a3069', fontWeight: '500' },
-    { tag: t.heading6, color: '#3b2300', fontWeight: '500' },
-    { tag: t.strong, color: '#1f2328', fontWeight: '700' },
-    { tag: t.emphasis, color: '#1f2328', fontStyle: 'italic' },
-    { tag: t.monospace, color: '#953800', backgroundColor: 'rgba(175,184,193,0.20)' },
-    { tag: t.link, color: '#0969da', textDecoration: 'underline' },
-    { tag: t.url, color: '#0969da' },
-    { tag: t.meta, color: '#6e7681' },
-    { tag: t.quote, color: '#6e7681', fontStyle: 'italic' },
-    { tag: t.list, color: '#1f2328' },
-    // Nested-language tags (SQL, TypeScript, Python, etc. inside fenced code).
-    // Without these, fence contents render uniformly black because our markdown
-    // style only covers markdown tags. GitHub palette mapping below.
-    { tag: t.keyword, color: '#cf222e', fontWeight: '600' },
-    { tag: t.controlKeyword, color: '#cf222e', fontWeight: '600' },
-    { tag: t.operatorKeyword, color: '#cf222e' },
-    { tag: t.definitionKeyword, color: '#cf222e', fontWeight: '600' },
-    { tag: t.modifier, color: '#cf222e' },
-    { tag: t.string, color: '#0a3069' },
-    { tag: t.special(t.string), color: '#0a3069' },
-    { tag: t.regexp, color: '#0a3069' },
-    { tag: t.number, color: '#0550ae' },
-    { tag: t.atom, color: '#0550ae' },
-    { tag: t.bool, color: '#0550ae' },
-    { tag: t.null, color: '#0550ae' },
-    { tag: t.comment, color: '#6e7681', fontStyle: 'italic' },
-    { tag: t.lineComment, color: '#6e7681', fontStyle: 'italic' },
-    { tag: t.blockComment, color: '#6e7681', fontStyle: 'italic' },
-    { tag: t.typeName, color: '#0550ae' },
-    { tag: t.className, color: '#0550ae', fontWeight: '500' },
-    { tag: t.variableName, color: '#1f2328' },
-    { tag: t.propertyName, color: '#6639ba' },
-    { tag: t.function(t.variableName), color: '#6639ba' },
-    { tag: t.function(t.propertyName), color: '#6639ba' },
-    { tag: t.definition(t.variableName), color: '#1f2328' },
-    { tag: t.standard(t.variableName), color: '#0550ae' },
-    { tag: t.attributeName, color: '#6639ba' },
-    { tag: t.attributeValue, color: '#0a3069' },
-    { tag: t.tagName, color: '#116329' },
-    { tag: t.namespace, color: '#0550ae' },
-    { tag: t.operator, color: '#cf222e' },
-    { tag: t.punctuation, color: '#1f2328' },
-    { tag: t.bracket, color: '#1f2328' },
-    { tag: t.escape, color: '#0550ae' },
-    { tag: t.invalid, color: '#cf222e', textDecoration: 'underline wavy' },
-  ]);
+  // v0.7.0: theme moved out to ../lib/editor-theme.ts and surfaced through a
+  // Compartment so per-pane light/dark toggle can hot-swap without rebuilding
+  // the state. Fixes the washed-out token colors that pre-v0.7 displayed when
+  // the OS was dark but the editor still ran its light-only highlight style.
+  const themeCompartment = new Compartment();
 
   const wrapCompartment = new Compartment();
   let wrapEnabled = true;
@@ -401,12 +362,11 @@
         highlightActiveLine(),
         highlightSelectionMatches({ minSelectionLength: 1, highlightWordAroundCursor: true }),
         search({ top: true }),
-        // Layer order: custom markdown style WINS for tags it covers (headings,
-        // strong, em, code, link). defaultHighlightStyle is the fallback for any
-        // tag NOT in our custom set — critical for nested languages (SQL, TS, etc.)
-        // whose grammars emit keyword/string/number tags we haven't styled.
-        syntaxHighlighting(githubMarkdownHighlight),
-        syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+        // Theme + highlight (Compartment, swappable on per-pane toggle). The
+        // returned Extension bundles the light/dark HighlightStyle plus the
+        // defaultHighlightStyle fallback (covers fenced-code nested grammars
+        // that emit tags our markdown style doesn't claim) plus editor chrome.
+        themeCompartment.of(editorThemeExtensions(effectiveTheme)),
         wrapCompartment.of(wrapEnabled ? EditorView.lineWrapping : []),
         fontSizeCompartment.of(makeFontSizeTheme(currentFontSize)),
         markdownLang({ base: markdownLanguage, addKeymap: true, codeLanguages: MARKDOWN_CODE_LANGS }),
@@ -526,16 +486,16 @@
           '.cm-scroller': { fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace' },
           '.cm-panels': { backgroundColor: 'transparent', border: 'none' },
           '.cm-panels.cm-panels-top': { borderBottom: 'none' },
+          // Layout-only rules for search panel — colors live in editor-theme.ts
+          // (light/dark variant), Compartment-swapped per pane theme.
           '.cm-panel.cm-search': {
             position: 'absolute',
             top: '8px',
             right: '24px',
             maxWidth: '460px',
             padding: '6px 8px',
-            background: 'rgba(255,255,255,0.96)',
             backdropFilter: 'blur(8px)',
             WebkitBackdropFilter: 'blur(8px)',
-            border: '1px solid #d0d7de',
             borderRadius: '6px',
             boxShadow: '0 4px 12px rgba(0,0,0,0.12)',
             display: 'flex',
@@ -549,10 +509,7 @@
             padding: '2px 6px',
             fontSize: '12px',
             minWidth: '180px',
-            border: '1px solid #d0d7de',
             borderRadius: '4px',
-            background: '#ffffff',
-            color: '#1f2328',
           },
           '.cm-panel.cm-search button[name]': {
             padding: '2px 8px',
@@ -562,10 +519,6 @@
             background: 'transparent',
             cursor: 'pointer',
             color: 'inherit',
-          },
-          '.cm-panel.cm-search button[name]:hover': {
-            background: 'rgba(9,105,218,0.10)',
-            borderColor: '#d0d7de',
           },
           '.cm-panel.cm-search label': {
             fontSize: '11px',
@@ -621,9 +574,20 @@
       });
     }
   });
+
+  // v0.7.0: hot-swap editor theme on per-pane toggle. The Compartment was
+  // configured at editor creation — reconfiguring it dispatches the new
+  // syntaxHighlighting + EditorView.theme bundle without rebuilding state.
+  $effect(() => {
+    const t = effectiveTheme;
+    if (!localView) return;
+    localView.dispatch({
+      effects: themeCompartment.reconfigure(editorThemeExtensions(t)),
+    });
+  });
 </script>
 
-<div class="editor-container">
+<div class="editor-container theme-{effectiveTheme}">
   <div class="editor-host" bind:this={host}></div>
   <div class="editor-tick-rail" aria-hidden="true">
     {#each implicitTicks as y, i (i + ':eimpl')}
@@ -636,6 +600,11 @@
       <span class="tick current" style="top: {currentTickY}px"></span>
     {/if}
   </div>
+  {#if onThemeToggle}
+    <div class="theme-toggle-slot">
+      <ThemeToggle choice={themeChoice} onclick={onThemeToggle} pane="Editor" />
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -688,20 +657,18 @@
     right: 1px;
   }
 
-  @media (prefers-color-scheme: dark) {
-    .editor-host :global(.cm-panel.cm-search) {
-      background: rgba(22, 27, 34, 0.96);
-      border-color: #30363d;
-      color: #c9d1d9;
-    }
-    .editor-host :global(.cm-panel.cm-search input.cm-textfield) {
-      background: #0d1117;
-      border-color: #30363d;
-      color: #c9d1d9;
-    }
-    .editor-host :global(.cm-panel.cm-search button[name]:hover) {
-      background: rgba(56, 139, 253, 0.16);
-      border-color: #30363d;
-    }
+  /* v0.7.0: search-panel theming moved to editor-theme.ts Compartment;
+     no more prefers-color-scheme @media here. Per-pane toggle won the
+     OS-pref override race. */
+
+  /* Theme toggle docked top-right of pane, above tick rail (z:5) and the
+     CM search panel (z:15 when open). The toggle is z:20 so it stays
+     reachable even with search open; gap from the right edge clears the
+     18px tick gutter. */
+  .theme-toggle-slot {
+    position: absolute;
+    top: 6px;
+    right: 24px;
+    z-index: 20;
   }
 </style>

@@ -1,9 +1,14 @@
 <script lang="ts">
-  import 'github-markdown-css/github-markdown.css';
+  // v0.7.0: the auto-switching `github-markdown.css` import is gone —
+  // ../lib/preview-theme.ts injects BOTH light + dark variants once, each
+  // scoped to `.markdown-body.theme-{light,dark}`. main.ts calls
+  // injectPreviewThemes() on bootstrap.
   import morphdom from 'morphdom';
   import { processMermaid } from '../lib/mermaid';
   import PreviewSearch from './PreviewSearch.svelte';
   import { processGitHubAssets } from '../lib/gh-asset-resolver';
+  import type { EffectiveTheme, ThemeChoice } from '../lib/theme';
+  import ThemeToggle from './ThemeToggle.svelte';
 
   let {
     html,
@@ -11,12 +16,18 @@
     onRevealRequest,
     breadcrumb = [],
     onHeaderJump,
+    themeChoice = 'auto',
+    effectiveTheme = 'light',
+    onThemeToggle,
   }: {
     html: string;
     host?: HTMLElement | null;
     onRevealRequest?: (node: HTMLElement) => void;
     breadcrumb?: Array<{ line: number; level: number; text: string }>;
     onHeaderJump?: (line: number) => void;
+    themeChoice?: ThemeChoice;
+    effectiveTheme?: EffectiveTheme;
+    onThemeToggle?: () => void;
   } = $props();
 
   let localHost: HTMLElement | null = $state(null);
@@ -150,7 +161,12 @@
   }
 </script>
 
-<div class="preview-container" bind:this={containerEl}>
+<div class="preview-container theme-{effectiveTheme}" bind:this={containerEl}>
+  {#if onThemeToggle}
+    <div class="theme-toggle-slot">
+      <ThemeToggle choice={themeChoice} onclick={onThemeToggle} pane="Preview" />
+    </div>
+  {/if}
   {#if breadcrumb.length > 0}
     <div class="sticky-headers" aria-hidden="false">
       {#each breadcrumb as item, i (item.line)}
@@ -166,7 +182,7 @@
   {/if}
   <div class="preview-wrap" bind:this={scrollWrap}>
     <article
-      class="markdown-body"
+      class="markdown-body theme-{effectiveTheme}"
       bind:this={localHost}
       oncontextmenu={handleContextMenu}
     ></article>
@@ -234,7 +250,7 @@
     height: 100%;
     overflow-y: auto;
     overflow-x: hidden;
-    background: var(--bg, #ffffff);
+    background: #ffffff;
   }
   .markdown-body {
     box-sizing: border-box;
@@ -245,23 +261,47 @@
   :global(.markdown-body) {
     font-size: 14px;
   }
-  @media (prefers-color-scheme: dark) {
-    .preview-wrap {
-      background: #0d1117;
-    }
-    .sticky-header {
-      background: rgba(13, 17, 23, 0.92);
-      border-bottom-color: rgba(48, 54, 61, 0.5);
-    }
-    .sticky-header:hover { background: rgba(56, 139, 253, 0.12); }
-    .sticky-header.level-1 { color: #ff7b72; }
-    .sticky-header.level-2 { color: #79c0ff; }
-    .sticky-header.level-3 { color: #d2a8ff; }
-    .sticky-header.level-4 { color: #ffa657; }
-    .sticky-header.level-5 { color: #a5d6ff; }
-    .sticky-header.level-6,
-    .sticky-header.level-7,
-    .sticky-header.level-8 { color: #c9d1d9; }
+
+  /* v0.7.0 — dark theme via class on .preview-container.theme-dark instead of
+     @media. Both light/dark github-markdown-css variants are pre-injected and
+     scoped to .markdown-body.theme-{light,dark} — see ../lib/preview-theme.ts. */
+  .preview-container.theme-dark .preview-wrap {
+    background: #0d1117;
+  }
+  .preview-container.theme-dark .sticky-header {
+    background: rgba(13, 17, 23, 0.92);
+    border-bottom-color: rgba(48, 54, 61, 0.5);
+  }
+  .preview-container.theme-dark .sticky-header:hover { background: rgba(56, 139, 253, 0.12); }
+  .preview-container.theme-dark .sticky-header.level-1 { color: #ff7b72; }
+  .preview-container.theme-dark .sticky-header.level-2 { color: #79c0ff; }
+  .preview-container.theme-dark .sticky-header.level-3 { color: #d2a8ff; }
+  .preview-container.theme-dark .sticky-header.level-4 { color: #ffa657; }
+  .preview-container.theme-dark .sticky-header.level-5 { color: #a5d6ff; }
+  .preview-container.theme-dark .sticky-header.level-6,
+  .preview-container.theme-dark .sticky-header.level-7,
+  .preview-container.theme-dark .sticky-header.level-8 { color: #c9d1d9; }
+
+  /* v0.7.0: GitHub-alert var overrides scoped to the preview's dark theme.
+     markdown-it-github-alerts ships a `.dark` class variant
+     (github-colors-dark-class.css, imported in main.ts); we re-bind those
+     same vars under `.preview-container.theme-dark` so alerts follow the
+     preview pane's toggle instead of the OS prefers-color-scheme. */
+  .preview-container.theme-dark {
+    --color-note: #2f81f7;
+    --color-tip: #3fb950;
+    --color-warning: #d29922;
+    --color-severe: #db6d28;
+    --color-caution: #f85149;
+    --color-important: #a371f7;
+  }
+
+  /* Toggle docks top-right of preview pane, above sticky-headers wrap (z:10). */
+  .theme-toggle-slot {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    z-index: 20;
   }
   /* v0.6.0 — github user-attachments image proxy states */
   :global(.gh-asset-pending) {
@@ -287,16 +327,17 @@
     background: rgba(9, 105, 218, 0.10);
     border-color: #0969da;
   }
-  @media (prefers-color-scheme: dark) {
-    :global(a.gh-asset-fallback) {
-      background: rgba(56, 139, 253, 0.10);
-      border-color: rgba(56, 139, 253, 0.4);
-      color: #79c0ff;
-    }
-    :global(a.gh-asset-fallback:hover) {
-      background: rgba(56, 139, 253, 0.20);
-      border-color: #79c0ff;
-    }
+  /* v0.7.0: dark gh-asset-fallback variant via class instead of @media. The
+     .theme-dark class is on the preview-container ancestor; :global() opens
+     the descendant fallback link which Svelte would otherwise scope-strip. */
+  :global(.theme-dark a.gh-asset-fallback) {
+    background: rgba(56, 139, 253, 0.10);
+    border-color: rgba(56, 139, 253, 0.4);
+    color: #79c0ff;
+  }
+  :global(.theme-dark a.gh-asset-fallback:hover) {
+    background: rgba(56, 139, 253, 0.20);
+    border-color: #79c0ff;
   }
   /* v0.6.1 — non-destructive fallback shell. Keeps original <img> in DOM tree */
   /* so copying/exporting preview HTML preserves the canonical markup. CSS only */

@@ -9,7 +9,42 @@
   import { parseMarkdown, extractOutline, type OutlineNode } from '../lib/markdown';
   import { loadDoc, saveDocDebounced, clearDoc } from '../lib/persistence';
   import { revealPreview, revealEditor } from '../lib/reveal';
+  import {
+    loadTheme, saveTheme, cycleTheme, systemPrefersDark, onSystemThemeChange,
+    type ThemeChoice, type EffectiveTheme,
+  } from '../lib/theme';
   import { EditorView } from '@codemirror/view';
+
+  // v0.7.0: per-pane theme. Each pane has its own ThemeChoice (light/dark/auto)
+  // persisted to localStorage under gmd:theme:{pane}. 'auto' tracks the OS
+  // prefers-color-scheme via a live MediaQueryList listener — systemDark below.
+  let editorChoice = $state<ThemeChoice>(loadTheme('editor'));
+  let previewChoice = $state<ThemeChoice>(loadTheme('preview'));
+  let outlineChoice = $state<ThemeChoice>(loadTheme('outline'));
+  let systemDark = $state(systemPrefersDark());
+  $effect(() => onSystemThemeChange((dark) => { systemDark = dark; }));
+
+  function resolve(c: ThemeChoice): EffectiveTheme {
+    if (c === 'light') return 'light';
+    if (c === 'dark') return 'dark';
+    return systemDark ? 'dark' : 'light';
+  }
+  let editorEffective = $derived<EffectiveTheme>(resolve(editorChoice));
+  let previewEffective = $derived<EffectiveTheme>(resolve(previewChoice));
+  let outlineEffective = $derived<EffectiveTheme>(resolve(outlineChoice));
+
+  function cycleEditor() {
+    editorChoice = cycleTheme(editorChoice);
+    saveTheme('editor', editorChoice);
+  }
+  function cyclePreview() {
+    previewChoice = cycleTheme(previewChoice);
+    saveTheme('preview', previewChoice);
+  }
+  function cycleOutline() {
+    outlineChoice = cycleTheme(outlineChoice);
+    saveTheme('outline', outlineChoice);
+  }
 
   let doc = $state(loadDoc() || sampleDoc());
   let html = $state(untrack(() => parseMarkdown(doc)));
@@ -391,7 +426,7 @@
 <main class="shell">
   <div class="editor-preview">
     <div
-      class="pane editor-pane"
+      class="pane editor-pane theme-{editorEffective}"
       style="flex-basis: {splitPct}%;"
       oncontextmenu={(e) => e.preventDefault()}
       role="presentation"
@@ -414,6 +449,9 @@
         bind:view={editorView}
         bind:topLine={editorTopLine}
         onRevealRequest={handleEditorReveal}
+        themeChoice={editorChoice}
+        effectiveTheme={editorEffective}
+        onThemeToggle={cycleEditor}
       />
     </div>
     <Splitter bind:pct={splitPct} />
@@ -424,6 +462,9 @@
         onRevealRequest={handlePreviewReveal}
         breadcrumb={previewBreadcrumb}
         onHeaderJump={handleOutlineJump}
+        themeChoice={previewChoice}
+        effectiveTheme={previewEffective}
+        onThemeToggle={cyclePreview}
       />
     </div>
   </div>
@@ -435,6 +476,9 @@
       onJump={handleOutlineJump}
       onHelp={() => (showShortcuts = true)}
       onClear={clearDoc}
+      themeChoice={outlineChoice}
+      effectiveTheme={outlineEffective}
+      onThemeToggle={cycleOutline}
     />
   </div>
 </main>
@@ -516,19 +560,21 @@
   .sticky-header.level-6,
   .sticky-header.level-7,
   .sticky-header.level-8 { color: #1f2328; font-weight: 500; }
-  @media (prefers-color-scheme: dark) {
-    .sticky-header {
-      background: rgba(13, 17, 23, 0.86);
-      border-bottom-color: rgba(48, 54, 61, 0.5);
-    }
-    .sticky-header:hover { background: rgba(56, 139, 253, 0.12); }
-    .sticky-header.level-1 { color: #ff7b72; }
-    .sticky-header.level-2 { color: #79c0ff; }
-    .sticky-header.level-3 { color: #d2a8ff; }
-    .sticky-header.level-4 { color: #ffa657; }
-    .sticky-header.level-5 { color: #a5d6ff; }
-    .sticky-header.level-6,
-    .sticky-header.level-7,
-    .sticky-header.level-8 { color: #c9d1d9; }
+
+  /* v0.7.0: sticky-header dark variant now keyed off the editor pane's theme
+     class (.editor-pane.theme-dark) instead of OS prefers-color-scheme.
+     Mirrors the per-pane toggle. */
+  .editor-pane.theme-dark .sticky-header {
+    background: rgba(13, 17, 23, 0.86);
+    border-bottom-color: rgba(48, 54, 61, 0.5);
   }
+  .editor-pane.theme-dark .sticky-header:hover { background: rgba(56, 139, 253, 0.12); }
+  .editor-pane.theme-dark .sticky-header.level-1 { color: #ff7b72; }
+  .editor-pane.theme-dark .sticky-header.level-2 { color: #79c0ff; }
+  .editor-pane.theme-dark .sticky-header.level-3 { color: #d2a8ff; }
+  .editor-pane.theme-dark .sticky-header.level-4 { color: #ffa657; }
+  .editor-pane.theme-dark .sticky-header.level-5 { color: #a5d6ff; }
+  .editor-pane.theme-dark .sticky-header.level-6,
+  .editor-pane.theme-dark .sticky-header.level-7,
+  .editor-pane.theme-dark .sticky-header.level-8 { color: #c9d1d9; }
 </style>

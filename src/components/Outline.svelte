@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { OutlineNode } from '../lib/markdown';
+  import type { EffectiveTheme, ThemeChoice } from '../lib/theme';
+  import ThemeToggle from './ThemeToggle.svelte';
 
   let {
     nodes,
@@ -7,12 +9,18 @@
     onJump,
     onHelp,
     onClear,
+    themeChoice = 'auto',
+    effectiveTheme = 'light',
+    onThemeToggle,
   }: {
     nodes: OutlineNode[];
     activeLine?: number;
     onJump: (line: number) => void;
     onHelp?: () => void;
     onClear?: () => void;
+    themeChoice?: ThemeChoice;
+    effectiveTheme?: EffectiveTheme;
+    onThemeToggle?: () => void;
   } = $props();
 
   let folded = $state(new Set<number>());
@@ -103,9 +111,18 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<div class="outline-pane" bind:this={host} tabindex="0" role="tree" aria-label="Document outline">
+<div
+  class="outline-pane theme-{effectiveTheme}"
+  bind:this={host}
+  tabindex="0"
+  role="tree"
+  aria-label="Document outline"
+>
   <header class="outline-header">
     <span class="title">Outline</span>
+    {#if onThemeToggle}
+      <ThemeToggle choice={themeChoice} onclick={onThemeToggle} pane="Outline" />
+    {/if}
     {#if onHelp}
       <button onclick={() => onHelp?.()} title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
     {/if}
@@ -332,32 +349,33 @@
   .level-7 > .row { padding-left: 54px; }
   .level-8 > .row { padding-left: 62px; }
 
-  @media (prefers-color-scheme: dark) {
-    .outline-pane {
-      background: #161b22;
-      border-left-color: #30363d;
-      color: #c9d1d9;
-    }
-    .outline-header { border-bottom-color: #30363d; }
-    .outline-header .title { color: #8b949e; }
-    .outline-header button {
-      background: #21262d;
-      border-color: #30363d;
-      color: #c9d1d9;
-    }
-    .outline-header button:hover { background: #30363d; }
-    .outline-header .gh-link {
-      background: #21262d;
-      border-color: #30363d;
-      color: #c9d1d9;
-    }
-    .outline-header .gh-link:hover { background: #30363d; }
-    .outline-node .row:hover { background: rgba(56, 139, 253, 0.10); }
-    .outline-node.active > .row { background: rgba(56, 139, 253, 0.20); }
-    .outline-node.active > .row:hover { background: rgba(56, 139, 253, 0.26); }
-    .outline-node.ancestor > .row .label { color: #58a6ff; }
-    .fold-toggle { color: #8b949e; }
-    .outline-node .row:hover .fold-toggle { color: #c9d1d9; }
-    .outline-empty { color: #8b949e; }
+  /* v0.7.0: outline dark variant now class-driven (.theme-dark on outline-pane
+     root) instead of @media (prefers-color-scheme: dark). Per-pane toggle
+     overrides OS pref. */
+  .outline-pane.theme-dark {
+    background: #161b22;
+    border-left-color: #30363d;
+    color: #c9d1d9;
   }
+  .outline-pane.theme-dark .outline-header { border-bottom-color: #30363d; }
+  .outline-pane.theme-dark .outline-header .title { color: #8b949e; }
+  .outline-pane.theme-dark .outline-header button {
+    background: #21262d;
+    border-color: #30363d;
+    color: #c9d1d9;
+  }
+  .outline-pane.theme-dark .outline-header button:hover { background: #30363d; }
+  .outline-pane.theme-dark .outline-header .gh-link {
+    background: #21262d;
+    border-color: #30363d;
+    color: #c9d1d9;
+  }
+  .outline-pane.theme-dark .outline-header .gh-link:hover { background: #30363d; }
+  .outline-pane.theme-dark .outline-node .row:hover { background: rgba(56, 139, 253, 0.10); }
+  .outline-pane.theme-dark .outline-node.active > .row { background: rgba(56, 139, 253, 0.20); }
+  .outline-pane.theme-dark .outline-node.active > .row:hover { background: rgba(56, 139, 253, 0.26); }
+  .outline-pane.theme-dark .outline-node.ancestor > .row .label { color: #58a6ff; }
+  .outline-pane.theme-dark .fold-toggle { color: #8b949e; }
+  .outline-pane.theme-dark .outline-node .row:hover .fold-toggle { color: #c9d1d9; }
+  .outline-pane.theme-dark .outline-empty { color: #8b949e; }
 </style>

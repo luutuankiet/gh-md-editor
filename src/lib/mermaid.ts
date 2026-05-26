@@ -20,6 +20,29 @@ export async function processMermaid(host: HTMLElement): Promise<void> {
       startOnLoad: false,
       securityLevel: 'strict',
       theme: darkMode ? 'dark' : 'default',
+      // Disable useMaxWidth across every v10 diagram type so SVGs render at
+      // natural width and the surrounding `.mermaid-block { overflow-x: auto }`
+      // wrapper scrolls horizontally when the diagram exceeds pane width.
+      // Without this, mermaid's default `useMaxWidth: true` sets the SVG to
+      // width:100% with a viewBox, which uniformly shrinks text on wide
+      // diagrams ("cramped" labels). Matches GitHub's render.
+      flowchart: { useMaxWidth: false },
+      sequence: { useMaxWidth: false },
+      gantt: { useMaxWidth: false },
+      journey: { useMaxWidth: false },
+      class: { useMaxWidth: false },
+      state: { useMaxWidth: false },
+      er: { useMaxWidth: false },
+      pie: { useMaxWidth: false },
+      requirement: { useMaxWidth: false },
+      c4: { useMaxWidth: false },
+      mindmap: { useMaxWidth: false },
+      timeline: { useMaxWidth: false },
+      gitGraph: { useMaxWidth: false },
+      sankey: { useMaxWidth: false },
+      xyChart: { useMaxWidth: false },
+      quadrantChart: { useMaxWidth: false },
+      block: { useMaxWidth: false },
     });
     mermaidInitialized = true;
   }

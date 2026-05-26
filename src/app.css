@@ -34,8 +34,13 @@ html, body, #app {
   text-align: center;
 }
 .mermaid-block svg {
-  max-width: 100%;
-  height: auto;
+  /* Natural-width render — the parent `.mermaid-block { overflow-x: auto }`
+     scrolls horizontally when the diagram exceeds pane width. Pre-v0.7.1 this
+     rule clamped width to 100%, which together with mermaid's default
+     `useMaxWidth: true` shrank wide diagrams uniformly via viewBox and made
+     text labels cramped. Matches GitHub's render. */
+  display: block;
+  margin: 0 auto;
 }
 .mermaid-error {
   background: rgba(255, 0, 0, 0.08);

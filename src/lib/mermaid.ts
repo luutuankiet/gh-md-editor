@@ -129,12 +129,16 @@ export async function processMermaid(host: HTMLElement): Promise<void> {
           });
           wrap._panzoom = instance;
 
-          // Wheel-zoom gate: plain wheel lets the preview pane scroll past
-          // the diagram (Google-Maps UX); Ctrl/Cmd+wheel zooms at cursor.
-          // Wired manually because svg-pan-zoom's mouseWheelZoomEnabled is
-          // all-or-nothing — no modifier-key support built in.
+          // v0.7.4: plain-wheel zoom (mermaid.live UX). Mouse over diagram
+          // captures wheel → zoom at cursor; wheel-up = zoom in, wheel-down
+          // = zoom out, matching the toolbar's −/+ order and every canvas
+          // tool convention (Google Maps, Figma, draw.io). Trade-off vs the
+          // v0.7.3 Ctrl/Cmd-gated version: to scroll the preview pane past
+          // a diagram, move the cursor outside the diagram first (or use
+          // the scrollbar / keyboard). Wired manually because svg-pan-zoom's
+          // mouseWheelZoomEnabled is all-or-nothing and we want our own
+          // zoom factor + at-cursor focal point.
           svgEl.addEventListener('wheel', (e) => {
-            if (!(e.ctrlKey || e.metaKey)) return;
             e.preventDefault();
             const rect = svgEl.getBoundingClientRect();
             const point = {
@@ -178,8 +182,8 @@ function buildToolbar(source: string): HTMLElement {
   const toolbar = document.createElement('div');
   toolbar.className = 'mermaid-toolbar';
   toolbar.innerHTML = `
-    <button type="button" data-action="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
-    <button type="button" data-action="zoom-in" title="Zoom in (Ctrl/Cmd+wheel)" aria-label="Zoom in">+</button>
+    <button type="button" data-action="zoom-out" title="Zoom out (or wheel down)" aria-label="Zoom out">−</button>
+    <button type="button" data-action="zoom-in" title="Zoom in (or wheel up)" aria-label="Zoom in">+</button>
     <button type="button" data-action="reset" title="Fit to view" aria-label="Reset zoom">⟲</button>
     <button type="button" data-action="open" title="Open in mermaid.live" aria-label="Open in new tab">↗</button>
   `;

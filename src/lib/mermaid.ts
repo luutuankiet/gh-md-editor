@@ -1,31 +1,58 @@
 /**
- * Lazy-render Mermaid blocks inside `host`.
+ * Lazy-render Mermaid blocks inside `host`, then enhance each rendered SVG
+ * with a bounded-height viewport + pan/zoom (svg-pan-zoom v3.6.2) + custom
+ * toolbar overlay. Matches the canvas UX of https://mermaid.live so long
+ * diagrams no longer dominate vertical scroll.
  *
  * Mermaid is dynamically imported so it only ships when a doc contains a
- * `mermaid` fenced block.  Each rendered SVG inherits the original `pre`'s
- * `data-source-line` attribute so the reveal-counterpart command still works.
+ * `mermaid` fenced block. svg-pan-zoom is imported alongside. Each rendered
+ * SVG inherits the original `pre`'s `data-source-line` attribute so the
+ * reveal-counterpart command still works.
+ *
+ * Wheel-zoom is gated on Ctrl/Cmd modifier so plain scrolling lets the
+ * preview pane scroll past the diagram (Google-Maps-style UX). The custom
+ * toolbar provides zoom-in / zoom-out / reset / open-in-new-tab.
+ *
+ * Morphdom cache contract: when source is unchanged across keystrokes,
+ * Preview.svelte's `onBeforeElUpdated` returns false for .mermaid-block —
+ * the wrapper survives intact and its attached svg-pan-zoom instance with
+ * it. When source changes, the old wrapper is discarded; the matching
+ * `onBeforeNodeDiscarded` callback in Preview.svelte invokes the cached
+ * `_panzoom.destroy()` to release global event listeners before GC.
  */
+import type { Instance as PanZoomInstance } from 'svg-pan-zoom';
+
 let mermaidIdSeq = 0;
 let mermaidInitialized = false;
+
+declare global {
+  interface HTMLElement {
+    _panzoom?: PanZoomInstance;
+  }
+}
 
 export async function processMermaid(host: HTMLElement): Promise<void> {
   if (!host) return;
   const blocks = host.querySelectorAll('pre > code.language-mermaid');
   if (!blocks.length) return;
 
-  const { default: mermaid } = await import('mermaid');
+  const [{ default: mermaid }, { default: svgPanZoom }] = await Promise.all([
+    import('mermaid'),
+    import('svg-pan-zoom'),
+  ]);
+
   if (!mermaidInitialized) {
     const darkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: 'strict',
       theme: darkMode ? 'dark' : 'default',
-      // Disable useMaxWidth across every v10 diagram type so SVGs render at
-      // natural width and the surrounding `.mermaid-block { overflow-x: auto }`
-      // wrapper scrolls horizontally when the diagram exceeds pane width.
-      // Without this, mermaid's default `useMaxWidth: true` sets the SVG to
-      // width:100% with a viewBox, which uniformly shrinks text on wide
-      // diagrams ("cramped" labels). Matches GitHub's render.
+      // useMaxWidth:false retained from v0.7.1 — emits SVG at natural width
+      // (no width:100%+viewBox shrink) so mermaid's foreignObject heights
+      // remain correct for multi-line labels (avoids the v0.7.1 cramped-label
+      // regression). We override the SVG's width/height attrs to 100%
+      // post-render so the diagram fills the bounded .mermaid-block wrapper;
+      // svg-pan-zoom reads viewBox to fit+pan+zoom.
       flowchart: { useMaxWidth: false },
       sequence: { useMaxWidth: false },
       gantt: { useMaxWidth: false },
@@ -64,7 +91,79 @@ export async function processMermaid(host: HTMLElement): Promise<void> {
       // can detect 'unchanged' mermaid blocks across keystrokes and reuse
       // the rendered SVG instead of re-rendering (which causes flicker).
       wrap.dataset.mermaidSrc = code;
+
+      // v0.7.3: strip mermaid's natural-pixel sizing so the SVG fills our
+      // bounded wrapper. svg-pan-zoom reads viewBox (mermaid always emits
+      // it) to perform fit+center+pan+zoom; the width/height=100% attrs
+      // give svg-pan-zoom a concrete container size to measure against.
+      const svgEl = wrap.querySelector('svg');
+      if (svgEl) {
+        svgEl.setAttribute('width', '100%');
+        svgEl.setAttribute('height', '100%');
+        svgEl.style.maxWidth = '100%';
+        svgEl.style.display = 'block';
+      }
+
+      // Toolbar overlay appended before pan/zoom init so it's already in
+      // the DOM tree when svg-pan-zoom measures container dimensions.
+      const toolbar = buildToolbar(code);
+      wrap.appendChild(toolbar);
+
       pre.replaceWith(wrap);
+
+      // svg-pan-zoom needs the SVG to be in the live DOM tree with a
+      // measurable container size before init. pre.replaceWith placed wrap
+      // into the document; CSS height (60vh / 480px max) gives the wrapper
+      // a concrete size synchronously.
+      if (svgEl) {
+        try {
+          const instance = svgPanZoom(svgEl, {
+            controlIconsEnabled: false,    // custom toolbar instead
+            fit: true,
+            center: true,
+            minZoom: 0.2,
+            maxZoom: 12,
+            zoomScaleSensitivity: 0.4,
+            mouseWheelZoomEnabled: false,  // gated via custom listener below
+            dblClickZoomEnabled: false,
+          });
+          wrap._panzoom = instance;
+
+          // Wheel-zoom gate: plain wheel lets the preview pane scroll past
+          // the diagram (Google-Maps UX); Ctrl/Cmd+wheel zooms at cursor.
+          // Wired manually because svg-pan-zoom's mouseWheelZoomEnabled is
+          // all-or-nothing — no modifier-key support built in.
+          svgEl.addEventListener('wheel', (e) => {
+            if (!(e.ctrlKey || e.metaKey)) return;
+            e.preventDefault();
+            const rect = svgEl.getBoundingClientRect();
+            const point = {
+              x: e.clientX - rect.left,
+              y: e.clientY - rect.top,
+            };
+            instance.zoomAtPointBy(e.deltaY < 0 ? 1.1 : 0.9, point);
+          }, { passive: false });
+
+          // Toolbar button hooks — late binding so `instance` is in scope.
+          toolbar.querySelector<HTMLButtonElement>('[data-action="zoom-in"]')
+            ?.addEventListener('click', () => instance.zoomBy(1.25));
+          toolbar.querySelector<HTMLButtonElement>('[data-action="zoom-out"]')
+            ?.addEventListener('click', () => instance.zoomBy(0.8));
+          toolbar.querySelector<HTMLButtonElement>('[data-action="reset"]')
+            ?.addEventListener('click', () => {
+              instance.resetZoom();
+              instance.resetPan();
+              instance.fit();
+              instance.center();
+            });
+        } catch (e) {
+          // Pan/zoom enhancement is non-critical — log + continue with the
+          // static SVG so the diagram still renders even if svg-pan-zoom
+          // chokes on edge-case SVG shapes.
+          // eslint-disable-next-line no-console
+          console.warn('[mermaid] svg-pan-zoom init failed:', e);
+        }
+      }
     } catch (e) {
       const err = document.createElement('pre');
       err.className = 'mermaid-error';
@@ -73,4 +172,44 @@ export async function processMermaid(host: HTMLElement): Promise<void> {
       pre.replaceWith(err);
     }
   }
+}
+
+function buildToolbar(source: string): HTMLElement {
+  const toolbar = document.createElement('div');
+  toolbar.className = 'mermaid-toolbar';
+  toolbar.innerHTML = `
+    <button type="button" data-action="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
+    <button type="button" data-action="zoom-in" title="Zoom in (Ctrl/Cmd+wheel)" aria-label="Zoom in">+</button>
+    <button type="button" data-action="reset" title="Fit to view" aria-label="Reset zoom">⟲</button>
+    <button type="button" data-action="open" title="Open in mermaid.live" aria-label="Open in new tab">↗</button>
+  `;
+  // Open-in-new-tab — uses mermaid.live's encoded URL so users get the full
+  // editor + canvas. Bound here (not in the late-binding block) because it
+  // doesn't depend on the svg-pan-zoom instance.
+  const openBtn = toolbar.querySelector<HTMLButtonElement>('[data-action="open"]');
+  if (openBtn) {
+    openBtn.addEventListener('click', () => {
+      const url = buildMermaidLiveUrl(source);
+      window.open(url, '_blank', 'noopener');
+    });
+  }
+  // Prevent toolbar clicks from reaching svg-pan-zoom's pan handler
+  // (clicking a button shouldn't initiate a drag-pan on the SVG).
+  toolbar.addEventListener('mousedown', (e) => e.stopPropagation());
+  toolbar.addEventListener('dblclick', (e) => e.stopPropagation());
+  return toolbar;
+}
+
+function buildMermaidLiveUrl(source: string): string {
+  // mermaid.live's base64 URL format is the simplest interop — pako format
+  // would need a deflate dep. base64 still loads natively in their editor.
+  const state = {
+    code: source,
+    mermaid: { theme: 'default' },
+    autoSync: true,
+    updateDiagram: true,
+  };
+  const json = JSON.stringify(state);
+  const encoded = btoa(unescape(encodeURIComponent(json)));
+  return `https://mermaid.live/edit#base64:${encoded}`;
 }

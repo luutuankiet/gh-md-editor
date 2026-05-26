@@ -120,6 +120,21 @@
         }
         return node;
       },
+      // v0.7.3: when a .mermaid-block is discarded (source changed → no
+      // cache stub created in preSubstituteMermaid → morphdom replaces the
+      // old wrapper), destroy its attached svg-pan-zoom instance to release
+      // the global event listeners it bound on init. Returning true lets
+      // the discard proceed normally.
+      onBeforeNodeDiscarded: (node) => {
+        if (node.nodeType === 1) {
+          const el = node as HTMLElement;
+          if (el.classList?.contains('mermaid-block') && el._panzoom) {
+            try { el._panzoom.destroy(); } catch { /* swallow */ }
+            el._panzoom = undefined;
+          }
+        }
+        return true;
+      },
     });
 
     if (mermaidPending) void processMermaid(localHost);

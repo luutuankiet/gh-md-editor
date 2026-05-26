@@ -28,19 +28,33 @@ html, body, #app {
 }
 
 .mermaid-block {
+  /* v0.7.3: bounded viewport + pan/zoom canvas. Diagrams used to expand to
+     their natural rendered height — could be 1000+ px tall, dominating
+     vertical scroll. Now they sit inside a clipped wrapper sized 60vh
+     capped at 480px; svg-pan-zoom (init in src/lib/mermaid.ts) provides
+     drag-pan and Ctrl/Cmd+wheel zoom. The .mermaid-toolbar overlay anchors
+     top-right of this wrapper. */
   display: block;
   margin: 16px 0;
-  overflow-x: auto;
-  text-align: center;
+  position: relative;
+  height: 60vh;
+  min-height: 240px;
+  max-height: 480px;
+  overflow: hidden;
+  background: #fafbfc;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
 }
 .mermaid-block svg {
-  /* Natural-width render — the parent `.mermaid-block { overflow-x: auto }`
-     scrolls horizontally when the diagram exceeds pane width. Pre-v0.7.1 this
-     rule clamped width to 100%, which together with mermaid's default
-     `useMaxWidth: true` shrank wide diagrams uniformly via viewBox and made
-     text labels cramped. Matches GitHub's render. */
+  /* v0.7.3: SVG fills the bounded wrapper; svg-pan-zoom reads viewBox to
+     fit+center+pan+zoom. Pre-v0.7.3 this rule centred a natural-width SVG
+     and the parent scrolled horizontally — now horizontal/vertical
+     navigation happens via pan gestures inside the clipped wrapper.
+     !important guards against svg-pan-zoom rewriting width/height on
+     resize back to natural pixels. */
   display: block;
-  margin: 0 auto;
+  width: 100% !important;
+  height: 100% !important;
 }
 .mermaid-block foreignObject > div,
 .mermaid-block foreignObject > div > .nodeLabel,
@@ -58,6 +72,67 @@ html, body, #app {
      measurement, eliminating the visible bleed-below symptom. */
   line-height: 1.2;
 }
+
+/* v0.7.3 — toolbar overlay anchored top-right of .mermaid-block. z-index 5
+   stays below .sticky-headers (z:10) so a sticky header scrolling past the
+   diagram still occludes the toolbar instead of vice-versa. */
+.mermaid-toolbar {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 5;
+  display: flex;
+  gap: 2px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  padding: 2px;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.mermaid-toolbar button {
+  width: 26px;
+  height: 26px;
+  border: none;
+  background: transparent;
+  color: #1f2328;
+  cursor: pointer;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0;
+  font-family: inherit;
+}
+.mermaid-toolbar button:hover {
+  background: rgba(9, 105, 218, 0.10);
+}
+.mermaid-toolbar button:active {
+  background: rgba(9, 105, 218, 0.18);
+}
+
+/* Dark-theme variants — mermaid-block lives inside the preview container,
+   so .preview-container.theme-dark ancestor selector binds correctly. */
+.preview-container.theme-dark .mermaid-block {
+  background: #161b22;
+  border-color: #30363d;
+}
+.preview-container.theme-dark .mermaid-toolbar {
+  background: rgba(13, 17, 23, 0.92);
+  border-color: #30363d;
+}
+.preview-container.theme-dark .mermaid-toolbar button {
+  color: #c9d1d9;
+}
+.preview-container.theme-dark .mermaid-toolbar button:hover {
+  background: rgba(56, 139, 253, 0.12);
+}
+.preview-container.theme-dark .mermaid-toolbar button:active {
+  background: rgba(56, 139, 253, 0.20);
+}
+
 .mermaid-error {
   background: rgba(255, 0, 0, 0.08);
   border-left: 3px solid #d00;

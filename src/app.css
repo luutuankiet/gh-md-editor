@@ -42,6 +42,22 @@ html, body, #app {
   display: block;
   margin: 0 auto;
 }
+.mermaid-block foreignObject > div,
+.mermaid-block foreignObject > div > .nodeLabel,
+.mermaid-block foreignObject > div > span,
+.mermaid-block .edgeLabel,
+.mermaid-block .nodeLabel {
+  /* v0.7.2 fix: github-markdown-css cascades `line-height: 1.5` into the
+     preview pane (~24px per line at default font-size), but mermaid sized
+     each label's foreignObject at ~19px per line using its own font metric.
+     For 3+ line `\n`-escaped labels (rendered as <br>-separated spans inside
+     <foreignObject><div><span class="nodeLabel">...</span></div></foreignObject>),
+     the browser then rendered text taller than the foreignObject, bleeding
+     subsequent lines below the node rectangle. Reset line-height inside
+     mermaid labels to ~1.2 so browser rendering matches mermaid's layout
+     measurement, eliminating the visible bleed-below symptom. */
+  line-height: 1.2;
+}
 .mermaid-error {
   background: rgba(255, 0, 0, 0.08);
   border-left: 3px solid #d00;

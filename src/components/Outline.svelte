@@ -205,7 +205,7 @@
     flex-direction: column;
     background: #f6f8fa;
     border-left: 1px solid #d0d7de;
-    font-size: 12px;
+    font-size: calc(12px * var(--app-zoom, 1));
     font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
     color: #1f2328;
     outline: none;
@@ -226,7 +226,7 @@
   .outline-header .title {
     flex: 1;
     font-weight: 600;
-    font-size: 10px;
+    font-size: calc(10px * var(--app-zoom, 1));
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: #57606a;

@@ -7,7 +7,14 @@ import GithubAlerts from 'markdown-it-github-alerts';
 const md = new MarkdownIt({
   html: true,
   linkify: true,
-  breaks: false,
+  // v0.7.7 / v0.2.6: GFM-style soft breaks. Every `\n` in source becomes a
+  // `<br>` in output — matches GitHub issue/PR/comment rendering and the
+  // user's WYSIWYG-ish mental model (editor source line = preview visual line).
+  // Pre-v0.7.7 was strict CommonMark (consecutive non-blank lines collapsed
+  // into one space-joined paragraph), which lost the visual line layout of
+  // structured prose like sequential `**Field:** value` lines used heavily
+  // in agentic-prompt markdown.
+  breaks: true,
   typographer: false,
 });
 
@@ -37,24 +44,99 @@ const BLOCK_OPEN_TYPES = new Set([
 ]);
 
 md.core.ruler.push('source_line_map', (state) => {
-  // v0.6.1: when normalizeAlerts() synthesized body lines for inline `> [!NOTE] body`
-  // patterns, the resulting parsed-source line numbers drift +N from the user's
-  // editor source. We subtract the number of insertions at-or-before each token's
-  // line so editor↔preview navigation maps back to the original line.
-  const insertions: number[] = ((state.env as any)?.alertInsertions ?? []) as number[];
+  // v0.6.1 + v0.7.6 / v0.2.5: undo line-shift from TWO normalizers that run
+  // before markdown-it sees the source:
+  //   (1) normalizeAlerts — synthesizes body lines for inline `> [!NOTE] body`
+  //   (2) normalizeStandaloneTags — surrounds prompt-engineering tags like
+  //       <active_task> / <vision> with blank lines so each becomes its own
+  //       html_block / paragraph, preserving the editor's line layout.
+  // Both insertions arrays are monotonically ascending; subtraction order
+  // matters — undo tag normalizer FIRST since it ran LAST on the alert-
+  // normalized source.
+  const env = state.env as any;
+  const alertInsertions: number[] = (env?.alertInsertions ?? []) as number[];
+  const tagInsertions: number[] = (env?.tagInsertions ?? []) as number[];
   for (const tok of state.tokens) {
     if (!BLOCK_OPEN_TYPES.has(tok.type)) continue;
     if (!tok.map || tok.map.length < 1) continue;
-    const rawLine = tok.map[0] + 1; // 1-indexed in NORMALIZED source
-    let adjustment = 0;
-    for (const ins of insertions) {
-      if (ins <= rawLine) adjustment++;
-      else break; // insertions array is monotonically ascending
+    let line = tok.map[0] + 1; // 1-indexed in FINAL (post-normalize) source
+    let adj = 0;
+    for (const ins of tagInsertions) {
+      if (ins <= line) adj++;
+      else break;
     }
-    const line = rawLine - adjustment;
-    tok.attrJoin('data-source-line', String(line));
+    line -= adj;
+    adj = 0;
+    for (const ins of alertInsertions) {
+      if (ins <= line) adj++;
+      else break;
+    }
+    tok.attrJoin('data-source-line', String(line - adj));
   }
 });
+
+// v0.7.5 / v0.2.4: render arbitrary XML-like tags (e.g. <active_task>, <vision>,
+// <decisions>) as literal text in the preview, NOT as HTML elements the browser
+// silently swallows. Two leak modes existed before this fix:
+//   (1) Tags with underscores (e.g. <active_task>) failed markdown-it's tag
+//       regex and went through the text-token path — automatically HTML-escaped
+//       by markdown-it → already rendered as literal text. Working.
+//   (2) Tags with clean names (e.g. <vision>, <blockers>) PASSED markdown-it's
+//       regex and reached the browser as HTMLUnknownElement instances — invisible
+//       but their content flowed inline, silently collapsing paragraph
+//       boundaries around them. THIS is the leak this override closes.
+// Whitelist approach: override html_block + html_inline renderers to escape any
+// tag whose name is NOT in HTML5_TAG_WHITELIST. <details>, <kbd>, <sub>, <sup>,
+// <mark> etc. pass through byte-identical to before. <script>, <style>, <iframe>
+// are intentionally NOT in the whitelist — additive defense even though html:true
+// is on (author = reader trust model unchanged). Code blocks are automatically
+// safe — their content flows through fence/code_block/code_inline tokens, never
+// html_block/html_inline.
+const HTML5_TAG_WHITELIST = new Set([
+  'a','abbr','address','article','aside','b','bdi','bdo','blockquote','br',
+  'caption','cite','code','col','colgroup','dd','del','details','dfn','div',
+  'dl','dt','em','figcaption','figure','footer','h1','h2','h3','h4','h5','h6',
+  'header','hgroup','hr','i','img','ins','kbd','li','main','mark','nav','ol',
+  'p','picture','pre','q','s','samp','section','small','source','span','strong',
+  'sub','summary','sup','table','tbody','td','tfoot','th','thead','time','tr',
+  'u','ul','var','wbr',
+]);
+
+const FIRST_TAG_NAME_RE = /^<\/?\s*([a-zA-Z][a-zA-Z0-9-]*)\b/;
+
+function isWhitelistedHtml(content: string): boolean {
+  const m = FIRST_TAG_NAME_RE.exec(content.trim());
+  // Comments / CDATA / processing instructions — not a normal tag; pass through.
+  if (!m) return true;
+  return HTML5_TAG_WHITELIST.has(m[1].toLowerCase());
+}
+
+const _origHtmlBlock = md.renderer.rules.html_block;
+const _origHtmlInline = md.renderer.rules.html_inline;
+
+md.renderer.rules.html_block = function (tokens, idx, opts, env, self) {
+  const tok = tokens[idx];
+  const c = tok.content;
+  if (isWhitelistedHtml(c)) {
+    return _origHtmlBlock ? _origHtmlBlock.call(this, tokens, idx, opts, env, self) : c;
+  }
+  // v0.7.6 / v0.2.5: wrap escaped non-whitelisted tags in <p data-source-line="N">
+  // so right-click reveal-counterpart fires on them (walks up from click target,
+  // finds the data-source-line attribute, jumps editor to that line). Safe to
+  // wrap here — unlike the unescaped pass-through case (see // NOTE below)
+  // — because escaped output is pure text, no HTML construct to split.
+  const lineAttr = tok.attrs?.find(([k]) => k === 'data-source-line')?.[1];
+  const escaped = md.utils.escapeHtml(c.trim());
+  return lineAttr
+    ? `<p data-source-line="${lineAttr}">${escaped}</p>\n`
+    : `<p>${escaped}</p>\n`;
+};
+md.renderer.rules.html_inline = function (tokens, idx, opts, env, self) {
+  const c = tokens[idx].content;
+  return isWhitelistedHtml(c)
+    ? (_origHtmlInline ? _origHtmlInline.call(this, tokens, idx, opts, env, self) : c)
+    : md.utils.escapeHtml(c);
+};
 
 // NOTE: do NOT wrap html_block in a <div data-source-line> wrapper — multi-line
 // HTML constructs (most importantly `<details>...</details>`) span SEPARATE
@@ -96,9 +178,110 @@ function normalizeAlerts(src: string): { normalized: string; insertions: number[
   return { normalized: out.join('\n'), insertions };
 }
 
+// v0.7.6 / v0.2.5: detect "lone tag on its own line" — covers BOTH shapes:
+//   - tags markdown-it would accept as HTML (e.g. <vision>, <decisions>)
+//   - tags markdown-it rejects (underscores, spaces, weird chars) but the
+//     user still uses as structural delimiters (e.g. <active_task>,
+//     <some name of tag>, <this_is>)
+// Permissive on tag NAME (allows almost anything up to `>`) because the regex
+// is paired with a whitelist filter — known HTML5 tags pass through untouched,
+// everything else gets blank-line isolated so markdown-it makes each its own
+// html_block / paragraph and the editor line layout is preserved.
+//
+// Anchor `^\s{0,3}`: 0-3 spaces of indent allowed (4+ would mean indented code
+// block per CommonMark spec, which we MUST NOT touch).
+const ANY_STANDALONE_TAG_RE = /^\s{0,3}<\/?\s*([a-zA-Z][^>]*)\s*>\s*$/;
+// Extract a plausible HTML tag name (alphanumerics + hyphens only, per HTML5
+// spec) from the inside content of a tag-shaped line. If the inside content
+// doesn't start with a real-shaped tag name (e.g. <active_task> has an
+// underscore, <some name> has a space), this still returns the leading word
+// — but it won't appear in HTML5_TAG_WHITELIST, so the line gets isolated.
+const HTML_TAG_NAME_PREFIX_RE = /^([a-zA-Z][a-zA-Z0-9-]*)/;
+
+function normalizeStandaloneTags(src: string): { normalized: string; insertions: number[] } {
+  const lines = src.split('\n');
+  const out: string[] = [];
+  const insertions: number[] = [];
+  let inFence = false;
+  let fenceChar = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // CRITICAL: do NOT normalize content inside fenced code blocks. Inserting
+    // blank lines around tag-shaped lines inside ```...``` would mangle the
+    // rendered code-block content (which is preserved as-is by markdown-it,
+    // including any inserted blanks). Mirror the fence-state tracker used by
+    // extractOutline() below.
+    const fenceMatch = /^(\s{0,3})(```+|~~~+)/.exec(line);
+    if (fenceMatch) {
+      const marker = fenceMatch[2];
+      if (!inFence) {
+        inFence = true;
+        fenceChar = marker[0];
+      } else if (marker[0] === fenceChar) {
+        inFence = false;
+        fenceChar = '';
+      }
+      out.push(line);
+      continue;
+    }
+    if (inFence) {
+      out.push(line);
+      continue;
+    }
+
+    const m = ANY_STANDALONE_TAG_RE.exec(line);
+    if (!m) {
+      out.push(line);
+      continue;
+    }
+
+    const nameMatch = HTML_TAG_NAME_PREFIX_RE.exec(m[1].trim());
+    const tagName = nameMatch ? nameMatch[1].toLowerCase() : '';
+
+    if (tagName && HTML5_TAG_WHITELIST.has(tagName)) {
+      // Whitelisted real HTML tag (<details>, <summary>, <kbd>, ...) — leave
+      // untouched; preserves the v0.3.x-era HTML pass-through path so multi-
+      // line constructs like <details>/<summary>...</details> still work.
+      out.push(line);
+      continue;
+    }
+
+    // Non-whitelisted standalone tag — surround with blank lines so markdown-it
+    // sees it as an isolated block, NOT merged into the surrounding paragraph.
+    // The html_block / paragraph_open path then attaches data-source-line, and
+    // the html_block renderer override escapes the tag to literal text wrapped
+    // in <p data-source-line>. Result in the rendered preview: each tag occupies
+    // its own visual line at the editor's source line, with content between
+    // tags rendered as normal markdown (paragraphs, lists, formatting all work).
+    if (out.length > 0 && out[out.length - 1].trim() !== '') {
+      out.push('');
+      insertions.push(out.length); // 1-indexed line number of inserted blank
+    }
+    out.push(line);
+    if (i + 1 < lines.length && lines[i + 1].trim() !== '') {
+      out.push('');
+      insertions.push(out.length);
+    }
+  }
+
+  return { normalized: out.join('\n'), insertions };
+}
+
 export function parseMarkdown(src: string): string {
-  const { normalized, insertions } = normalizeAlerts(src);
-  return md.render(normalized, { alertInsertions: insertions });
+  // Chained normalization. Order matters for line tracking:
+  //   1. normalizeAlerts — splits inline `> [!NOTE] body` into two lines
+  //   2. normalizeStandaloneTags — isolates prompt tags with blank lines
+  // Each stage emits its own insertions array; source_line_map ruler undoes
+  // them in REVERSE order (tag first, then alert) to map tokens back to the
+  // user's original source line.
+  const a = normalizeAlerts(src);
+  const t = normalizeStandaloneTags(a.normalized);
+  return md.render(t.normalized, {
+    alertInsertions: a.insertions,
+    tagInsertions: t.insertions,
+  });
 }
 
 export { md };

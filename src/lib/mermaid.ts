@@ -24,6 +24,10 @@ import type { Instance as PanZoomInstance } from 'svg-pan-zoom';
 
 let mermaidIdSeq = 0;
 let mermaidInitialized = false;
+// v0.2.0 (VS Code): track the theme mermaid was last initialized with so we
+// can detect per-pane theme switches and force re-render (mermaid bakes
+// theme colors into the emitted SVG, so a stale render survives a re-init).
+let currentMermaidTheme: 'light' | 'dark' = 'light';
 
 declare global {
   interface HTMLElement {
@@ -31,8 +35,37 @@ declare global {
   }
 }
 
-export async function processMermaid(host: HTMLElement): Promise<void> {
+export async function processMermaid(host: HTMLElement, effectiveTheme?: 'light' | 'dark'): Promise<void> {
   if (!host) return;
+
+  // v0.2.0: theme is now a caller argument (Preview.svelte threads its
+  // effectiveTheme through). Fallback to OS pref for the web app path. When
+  // the theme switched since last call, destroy svg-pan-zoom instances and
+  // restore the original <pre><code> source so the render loop below picks
+  // the blocks up fresh under the new mermaid theme.
+  const theme: 'light' | 'dark' = effectiveTheme
+    ?? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  const themeChanged = mermaidInitialized && theme !== currentMermaidTheme;
+
+  if (themeChanged) {
+    for (const wrap of Array.from(host.querySelectorAll<HTMLElement>('div.mermaid-block'))) {
+      if (wrap._panzoom) {
+        try { wrap._panzoom.destroy(); } catch { /* swallow */ }
+        wrap._panzoom = undefined;
+      }
+      const src = wrap.dataset.mermaidSrc || '';
+      const sl = wrap.getAttribute('data-source-line');
+      const pre = document.createElement('pre');
+      const code = document.createElement('code');
+      code.className = 'language-mermaid';
+      code.textContent = src;
+      pre.appendChild(code);
+      if (sl) pre.setAttribute('data-source-line', sl);
+      wrap.replaceWith(pre);
+    }
+    mermaidInitialized = false; // force re-init below with the new theme
+  }
+
   const blocks = host.querySelectorAll('pre > code.language-mermaid');
   if (!blocks.length) return;
 
@@ -42,11 +75,10 @@ export async function processMermaid(host: HTMLElement): Promise<void> {
   ]);
 
   if (!mermaidInitialized) {
-    const darkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: 'strict',
-      theme: darkMode ? 'dark' : 'default',
+      theme: theme === 'dark' ? 'dark' : 'default',
       // useMaxWidth:false retained from v0.7.1 — emits SVG at natural width
       // (no width:100%+viewBox shrink) so mermaid's foreignObject heights
       // remain correct for multi-line labels (avoids the v0.7.1 cramped-label
@@ -72,6 +104,7 @@ export async function processMermaid(host: HTMLElement): Promise<void> {
       block: { useMaxWidth: false },
     });
     mermaidInitialized = true;
+    currentMermaidTheme = theme;
   }
 
   for (const block of Array.from(blocks)) {
@@ -194,7 +227,16 @@ function buildToolbar(source: string): HTMLElement {
   if (openBtn) {
     openBtn.addEventListener('click', () => {
       const url = buildMermaidLiveUrl(source);
-      window.open(url, '_blank', 'noopener');
+      // v0.2.0: VS Code webview sandbox blocks window.open. When running
+      // inside the webview, the vscode bridge is exposed on globalThis by
+      // webview/main.ts; route the URL through it so the extension host can
+      // call vscode.env.openExternal which opens the user's default browser.
+      const vsApi = (globalThis as any).__vscodeApi;
+      if (vsApi && typeof vsApi.postMessage === 'function') {
+        vsApi.postMessage({ type: 'openExternal', url });
+      } else {
+        window.open(url, '_blank', 'noopener');
+      }
     });
   }
   // Prevent toolbar clicks from reaching svg-pan-zoom's pan handler

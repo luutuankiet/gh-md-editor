@@ -1,0 +1,184 @@
+{
+  "name": "gh-md-editor",
+  "displayName": "GH MD Editor",
+  "description": "Snappy GitHub-flavored markdown editor with mermaid pan/zoom, code highlight, outline, and per-pane themes. Runs in VS Code Desktop AND vscode.dev / github.dev.",
+  "version": "0.2.6",
+  "publisher": "luutuankiet",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/luutuankiet/gh-md-editor"
+  },
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": ["Other"],
+  "keywords": ["markdown", "editor", "preview", "mermaid", "github"],
+  "activationEvents": [
+    "onCustomEditor:luutuankiet.ghMdEditor",
+    "onLanguage:markdown"
+  ],
+  "main": "./dist/extension/desktop.js",
+  "browser": "./dist/extension/web.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "luutuankiet.ghMdEditor",
+        "displayName": "GH MD Editor",
+        "selector": [
+          { "filenamePattern": "*.md" },
+          { "filenamePattern": "*.markdown" }
+        ],
+        "priority": "default"
+      }
+    ],
+    "configuration": {
+      "title": "GH MD Editor",
+      "properties": {
+        "ghMdEditor.editorTheme": {
+          "type": "string",
+          "enum": ["light", "dark", "auto"],
+          "default": "auto",
+          "description": "Default theme for the editor pane. 'auto' follows your OS color scheme. The in-pane theme cycle button updates this setting on click (workspace target when a workspace is open, else global)."
+        },
+        "ghMdEditor.previewTheme": {
+          "type": "string",
+          "enum": ["light", "dark", "auto"],
+          "default": "auto",
+          "description": "Default theme for the preview pane."
+        },
+        "ghMdEditor.outlineTheme": {
+          "type": "string",
+          "enum": ["light", "dark", "auto"],
+          "default": "auto",
+          "description": "Default theme for the outline pane."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "ghMdEditor.openCurrentFile",
+        "title": "Open Current File in GH MD Editor",
+        "category": "GH MD Editor",
+        "icon": "$(markdown)"
+      },
+      {
+        "command": "ghMdEditor.switchToBuiltInTextEditor",
+        "title": "Switch to Built-in Text Editor",
+        "category": "GH MD Editor",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "ghMdEditor.showOutput",
+        "title": "Show Output Log",
+        "category": "GH MD Editor"
+      },
+      {
+        "command": "ghMdEditor.zoomIn",
+        "title": "Zoom In (Whole App)",
+        "category": "GH MD Editor"
+      },
+      {
+        "command": "ghMdEditor.zoomOut",
+        "title": "Zoom Out (Whole App)",
+        "category": "GH MD Editor"
+      },
+      {
+        "command": "ghMdEditor.zoomReset",
+        "title": "Reset Zoom",
+        "category": "GH MD Editor"
+      },
+      {
+        "command": "ghMdEditor.setAsDefault",
+        "title": "Set as Default Editor for Markdown",
+        "category": "GH MD Editor"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "ghMdEditor.zoomIn",
+        "key": "ctrl+=",
+        "mac": "cmd+=",
+        "when": "activeCustomEditorId == luutuankiet.ghMdEditor"
+      },
+      {
+        "command": "ghMdEditor.zoomIn",
+        "key": "ctrl+shift+=",
+        "mac": "cmd+shift+=",
+        "when": "activeCustomEditorId == luutuankiet.ghMdEditor"
+      },
+      {
+        "command": "ghMdEditor.zoomOut",
+        "key": "ctrl+-",
+        "mac": "cmd+-",
+        "when": "activeCustomEditorId == luutuankiet.ghMdEditor"
+      },
+      {
+        "command": "ghMdEditor.zoomOut",
+        "key": "ctrl+shift+-",
+        "mac": "cmd+shift+-",
+        "when": "activeCustomEditorId == luutuankiet.ghMdEditor"
+      },
+      {
+        "command": "ghMdEditor.zoomReset",
+        "key": "ctrl+0",
+        "mac": "cmd+0",
+        "when": "activeCustomEditorId == luutuankiet.ghMdEditor"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "ghMdEditor.openCurrentFile",
+          "when": "resourceExtname == .md || resourceExtname == .markdown",
+          "group": "navigation@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "ghMdEditor.openCurrentFile",
+          "when": "(resourceExtname == .md || resourceExtname == .markdown) && activeCustomEditorId != luutuankiet.ghMdEditor",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ghMdEditor.switchToBuiltInTextEditor",
+          "when": "activeCustomEditorId == luutuankiet.ghMdEditor",
+          "group": "navigation@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "ghMdEditor.switchToBuiltInTextEditor",
+          "when": "activeCustomEditorId == luutuankiet.ghMdEditor"
+        },
+        {
+          "command": "ghMdEditor.zoomIn",
+          "when": "activeCustomEditorId == luutuankiet.ghMdEditor"
+        },
+        {
+          "command": "ghMdEditor.zoomOut",
+          "when": "activeCustomEditorId == luutuankiet.ghMdEditor"
+        },
+        {
+          "command": "ghMdEditor.zoomReset",
+          "when": "activeCustomEditorId == luutuankiet.ghMdEditor"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build:ext": "node esbuild.config.mjs",
+    "build:webview": "vite build --config vite.config.mts",
+    "build": "npm run build:ext && npm run build:webview",
+    "watch:ext": "node esbuild.config.mjs --watch",
+    "watch:webview": "vite build --config vite.config.mts --watch",
+    "package": "vsce package --no-dependencies",
+    "vsce:publish": "vsce publish --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.84.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.5.0"
+  }
+}

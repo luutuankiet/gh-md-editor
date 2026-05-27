@@ -19,6 +19,8 @@
     themeChoice = 'auto',
     effectiveTheme = 'light',
     onThemeToggle,
+    onZoomIn,
+    onZoomOut,
   }: {
     html: string;
     host?: HTMLElement | null;
@@ -28,6 +30,8 @@
     themeChoice?: ThemeChoice;
     effectiveTheme?: EffectiveTheme;
     onThemeToggle?: () => void;
+    onZoomIn?: () => void;
+    onZoomOut?: () => void;
   } = $props();
 
   let localHost: HTMLElement | null = $state(null);
@@ -66,7 +70,7 @@
     if (isFirstRender || localHost.childElementCount === 0) {
       localHost.innerHTML = html;
       isFirstRender = false;
-      void processMermaid(localHost);
+      void processMermaid(localHost, effectiveTheme);
       void highlightLazy(localHost);
       processGitHubAssets(localHost);
       return;
@@ -76,7 +80,6 @@
     newRoot.innerHTML = html;
     preSubstituteMermaid(newRoot, localHost);
 
-    let mermaidPending = false;
     let highlightPending = false;
 
     morphdom(localHost, newRoot, {
@@ -112,9 +115,11 @@
       onNodeAdded: (node) => {
         if (node.nodeType !== 1) return node;
         const el = node as HTMLElement;
-        if (el.querySelector?.('pre > code.language-mermaid') || el.matches?.('code.language-mermaid')) {
-          mermaidPending = true;
-        }
+        // v0.2.1: mermaid detection moved to a post-morphdom scan below — the
+        // onNodeAdded approach was fragile (missed tag-changing diffs where
+        // morphdom replaces an element rather than adds a fresh subtree),
+        // causing brand-new ```mermaid blocks to render as raw <pre><code>
+        // until tab close+reopen triggered the isFirstRender path.
         if (el.querySelector?.('pre > code[class*="language-"]') || el.matches?.('code[class*="language-"]')) {
           highlightPending = true;
         }
@@ -137,9 +142,33 @@
       },
     });
 
-    if (mermaidPending) void processMermaid(localHost);
+    // v0.2.1: post-morphdom mermaid scan. Rendered blocks are
+    // <div class="mermaid-block"> (they don't match the `pre > code` selector),
+    // so this querySelector ONLY matches un-rendered mermaid — brand-new
+    // blocks the user just typed, or blocks whose source changed (which
+    // preSubstituteMermaid couldn't stub-substitute against the cache).
+    // processMermaid is idempotent on already-rendered blocks but we early-
+    // exit here when there are none to skip the import cost. The perf
+    // invariant the user called out ("don't re-render canvas on every text
+    // edit") is preserved: unchanged cached blocks remain as div.mermaid-block
+    // and never match this selector.
+    if (localHost.querySelector('pre > code.language-mermaid')) {
+      void processMermaid(localHost, effectiveTheme);
+    }
     if (highlightPending) void highlightLazy(localHost);
     processGitHubAssets(localHost);
+  });
+
+  // v0.2.0: re-render mermaid blocks when the preview pane's theme toggles.
+  // The html-change effect above only fires on doc edits; this $effect runs
+  // on effectiveTheme changes. Skip initial mount (html effect handles the
+  // first render with the correct theme already passed in).
+  let _mermaidThemeMounted = false;
+  $effect(() => {
+    if (!localHost) return;
+    const t = effectiveTheme;
+    if (!_mermaidThemeMounted) { _mermaidThemeMounted = true; return; }
+    void processMermaid(localHost, t);
   });
 
   async function highlightLazy(target: HTMLElement) {
@@ -179,6 +208,12 @@
 <div class="preview-container theme-{effectiveTheme}" bind:this={containerEl}>
   {#if onThemeToggle}
     <div class="theme-toggle-slot">
+      {#if onZoomOut}
+        <button type="button" class="control-btn" onclick={onZoomOut} title="Zoom out (Cmd+−)" aria-label="Zoom out">−</button>
+      {/if}
+      {#if onZoomIn}
+        <button type="button" class="control-btn" onclick={onZoomIn} title="Zoom in (Cmd+=)" aria-label="Zoom in">+</button>
+      {/if}
       <ThemeToggle choice={themeChoice} onclick={onThemeToggle} pane="Preview" />
     </div>
   {/if}
@@ -241,7 +276,7 @@
     display: flex;
     align-items: center;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-    font-size: 13px;
+    font-size: calc(13px * var(--app-zoom, 1));
     line-height: 22px;
     white-space: nowrap;
     overflow: hidden;
@@ -274,7 +309,18 @@
     contain: layout style paint;
   }
   :global(.markdown-body) {
-    font-size: 14px;
+    /* v0.2.3: github-markdown-css ships `.markdown-body { font-size: 16px }`
+       at line 16 of its sheet. `injectPreviewThemes` (lib/preview-theme.ts)
+       rewrites every `.markdown-body` selector to `.markdown-body.theme-{light,dark}`,
+       bumping specificity to 0,2,0 — and the injected <style> appends to
+       document.head AFTER Svelte's index.css loads, so it also wins on source
+       order. To enforce app-zoom we need !important to beat that scoped rule.
+       16px base matches the github-markdown-css default so appZoom=1.0 keeps
+       the same rest-state the user has seen since v0.7.0. h1…h5 inside use
+       em-based font-sizes (2em / 1.5em / 1.25em / 1em / .875em — see
+       node_modules/github-markdown-css/github-markdown-light.css:86,291,297,302,307)
+       so they propagate the calc multiplication automatically. */
+    font-size: calc(16px * var(--app-zoom, 1)) !important;
   }
 
   /* v0.7.0 — dark theme via class on .preview-container.theme-dark instead of
@@ -311,12 +357,45 @@
     --color-important: #a371f7;
   }
 
-  /* Toggle docks top-right of preview pane, above sticky-headers wrap (z:10). */
+  /* Toggle docks top-right of preview pane, above sticky-headers wrap (z:10).
+     v0.2.1: now also hosts zoom +/- buttons next to the theme toggle. */
   .theme-toggle-slot {
     position: absolute;
     top: 6px;
     right: 6px;
     z-index: 20;
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+
+  /* v0.2.1: zoom +/- buttons docked next to the theme toggle. Matches
+     ThemeToggle.svelte chrome (24px square, rounded, blur bg, theme-dark
+     variant). Optional onZoomIn/onZoomOut props -> buttons hidden in web app. */
+  .control-btn {
+    width: 24px;
+    height: 24px;
+    border: 1px solid rgba(208, 215, 222, 0.7);
+    background: rgba(246, 248, 250, 0.86);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border-radius: 4px;
+    cursor: pointer;
+    color: #1f2328;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    font: 600 14px/1 system-ui, -apple-system, sans-serif;
+  }
+  .control-btn:hover { background: rgba(208, 215, 222, 0.7); }
+  .preview-container.theme-dark .control-btn {
+    background: rgba(22, 27, 34, 0.86);
+    border-color: rgba(48, 54, 61, 0.7);
+    color: #c9d1d9;
+  }
+  .preview-container.theme-dark .control-btn:hover {
+    background: rgba(48, 54, 61, 0.8);
   }
   /* v0.6.0 — github user-attachments image proxy states */
   :global(.gh-asset-pending) {

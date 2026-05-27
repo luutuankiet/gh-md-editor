@@ -1,0 +1,14 @@
+node_modules/**
+src/**
+webview/**
+*.config.mjs
+*.config.mts
+*.config.ts
+tsconfig.json
+.vscode/**
+.vscode-test-web/**
+.gitignore
+.vscodeignore
+package-lock.json
+**/*.map
+README.dev.md

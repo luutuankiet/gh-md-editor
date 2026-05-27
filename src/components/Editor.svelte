@@ -45,6 +45,8 @@
     themeChoice = 'auto',
     effectiveTheme = 'light',
     onThemeToggle,
+    onZoomIn,
+    onZoomOut,
   }: {
     value?: string;
     view?: EditorView | null;
@@ -53,6 +55,8 @@
     themeChoice?: ThemeChoice;
     effectiveTheme?: EffectiveTheme;
     onThemeToggle?: () => void;
+    onZoomIn?: () => void;
+    onZoomOut?: () => void;
   } = $props();
 
   let host: HTMLDivElement;
@@ -103,9 +107,15 @@
   } catch { /* noop */ }
 
   function makeFontSizeTheme(px: number) {
+    // v0.2.2: scale by --app-zoom CSS variable (set on App-vscode.svelte's
+    // <main class="shell">). Composition: per-pane editor font-size (Cmd+=
+    // inside CM6) * app-level zoom (Cmd+= outside CM6, or +/- buttons).
+    // Browser auto-recomputes when --app-zoom changes — no JS reconfigure
+    // needed on app-zoom toggle. var() defaults to 1 in the web app where
+    // --app-zoom is never set, so existing behavior there is unchanged.
     return EditorView.theme({
-      '.cm-content': { fontSize: px + 'px' },
-      '.cm-gutters': { fontSize: px + 'px' },
+      '.cm-content': { fontSize: `calc(${px}px * var(--app-zoom, 1))` },
+      '.cm-gutters': { fontSize: `calc(${px}px * var(--app-zoom, 1))` },
     });
   }
 
@@ -602,6 +612,12 @@
   </div>
   {#if onThemeToggle}
     <div class="theme-toggle-slot">
+      {#if onZoomOut}
+        <button type="button" class="control-btn" onclick={onZoomOut} title="Zoom out (Cmd+−)" aria-label="Zoom out">−</button>
+      {/if}
+      {#if onZoomIn}
+        <button type="button" class="control-btn" onclick={onZoomIn} title="Zoom in (Cmd+=)" aria-label="Zoom in">+</button>
+      {/if}
       <ThemeToggle choice={themeChoice} onclick={onThemeToggle} pane="Editor" />
     </div>
   {/if}
@@ -670,5 +686,37 @@
     top: 6px;
     right: 24px;
     z-index: 20;
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+
+  /* v0.2.1: zoom +/- buttons docked next to the theme toggle. Matches
+     ThemeToggle.svelte chrome (24px square, rounded, blur bg, theme-dark
+     variant). Optional onZoomIn/onZoomOut props -> buttons hidden in web app. */
+  .control-btn {
+    width: 24px;
+    height: 24px;
+    border: 1px solid rgba(208, 215, 222, 0.7);
+    background: rgba(246, 248, 250, 0.86);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border-radius: 4px;
+    cursor: pointer;
+    color: #1f2328;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    font: 600 14px/1 system-ui, -apple-system, sans-serif;
+  }
+  .control-btn:hover { background: rgba(208, 215, 222, 0.7); }
+  :global(.theme-dark) .control-btn {
+    background: rgba(22, 27, 34, 0.86);
+    border-color: rgba(48, 54, 61, 0.7);
+    color: #c9d1d9;
+  }
+  :global(.theme-dark) .control-btn:hover {
+    background: rgba(48, 54, 61, 0.8);
   }
 </style>

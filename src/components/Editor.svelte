@@ -4,7 +4,7 @@
   import { EditorState, EditorSelection, Compartment } from '@codemirror/state';
   import { history, historyKeymap, defaultKeymap, indentWithTab, selectParentSyntax } from '@codemirror/commands';
   import { indentOnInput, bracketMatching, syntaxTree, LanguageDescription } from '@codemirror/language';
-  import { highlightSelectionMatches, searchKeymap, search, getSearchQuery } from '@codemirror/search';
+  import { searchKeymap, search, getSearchQuery } from '@codemirror/search';
   import { markdown as markdownLang, markdownLanguage } from '@codemirror/lang-markdown';
   import { languages as codeLanguages } from '@codemirror/language-data';
   import { sql } from '@codemirror/lang-sql';
@@ -63,11 +63,10 @@
   let localView: EditorView | null = null;
 
   // v0.5.0: scrollbar match-tick state (rendered in template, updated via
-  // updateListener inside the CM6 setup). Three layers: implicit (word at
-  // cursor, light shade), match (explicit Cmd+F query, brighter), current
-  // (the active match, accent color).
+  // updateListener inside the CM6 setup). Two layers: match (explicit Cmd+F
+  // query) and current (the active match, accent color). The implicit
+  // cursor-word layer was removed — global word highlighting was just noise.
   let matchTicks = $state<number[]>([]);
-  let implicitTicks = $state<number[]>([]);
   let currentTickY = $state<number | null>(null);
 
   // v0.7.0: theme moved out to ../lib/editor-theme.ts and surfaced through a
@@ -309,45 +308,10 @@
     currentTickY = nearest ? docPosToGutterY(vw, nearest.from) : null;
   }
 
-  function recomputeImplicitTicks(vw: EditorView) {
-    const state = vw.state;
-    const sel = state.selection.main;
-    let needle = '';
-    if (!sel.empty) {
-      // Use the actual selection text as the implicit highlight target
-      // — mirrors highlightSelectionMatches' inline behavior on the scrollbar.
-      const sub = state.sliceDoc(sel.from, sel.to);
-      if (sub.length >= 1 && sub.length <= 200 && !/\n/.test(sub)) needle = sub;
-    } else {
-      const word = state.wordAt(sel.head);
-      if (word) {
-        const wt = state.sliceDoc(word.from, word.to);
-        if (wt.length >= 2) needle = wt;
-      }
-    }
-    if (!needle) { implicitTicks = []; return; }
-    const doc = state.doc.toString();
-    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const re = new RegExp(escaped, 'g');
-    const out: number[] = [];
-    let m: RegExpExecArray | null;
-    let safety = 5000;
-    while ((m = re.exec(doc)) && safety-- > 0) {
-      // Skip the exact selection range itself (don't tick what cursor is on)
-      if (!sel.empty && m.index === sel.from) { continue; }
-      const y = docPosToGutterY(vw, m.index);
-      if (y != null) out.push(y);
-      // Avoid zero-length match infinite loop
-      if (m.index === re.lastIndex) re.lastIndex++;
-    }
-    implicitTicks = out;
-  }
-
   function recomputeTicks(vw: EditorView) {
     queueMicrotask(() => {
       try {
         recomputeMatchTicks(vw);
-        recomputeImplicitTicks(vw);
       } catch { /* swallow — ticks are non-critical */ }
     });
   }
@@ -370,7 +334,6 @@
         // (drawSelection handles the click natively when this flag is true).
         EditorState.allowMultipleSelections.of(true),
         highlightActiveLine(),
-        highlightSelectionMatches({ minSelectionLength: 1, highlightWordAroundCursor: true }),
         search({ top: true }),
         // Theme + highlight (Compartment, swappable on per-pane toggle). The
         // returned Extension bundles the light/dark HighlightStyle plus the
@@ -600,9 +563,6 @@
 <div class="editor-container theme-{effectiveTheme}">
   <div class="editor-host" bind:this={host}></div>
   <div class="editor-tick-rail" aria-hidden="true">
-    {#each implicitTicks as y, i (i + ':eimpl')}
-      <span class="tick implicit" style="top: {y}px"></span>
-    {/each}
     {#each matchTicks as y, i (i + ':ematch')}
       <span class="tick match" style="top: {y}px"></span>
     {/each}
@@ -662,9 +622,6 @@
   }
   .editor-tick-rail .tick.match {
     background: rgba(255, 195, 0, 0.85);
-  }
-  .editor-tick-rail .tick.implicit {
-    background: rgba(132, 165, 200, 0.65);
   }
   .editor-tick-rail .tick.current {
     background: #ff6b00;

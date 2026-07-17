@@ -6,7 +6,7 @@
   import morphdom from 'morphdom';
   import { processMermaid } from '../lib/mermaid';
   import PreviewSearch from './PreviewSearch.svelte';
-  import { processGitHubAssets } from '../lib/gh-asset-resolver';
+  import { processGitHubAssets, isGitHubAssetUrl } from '../lib/gh-asset-resolver';
   import type { EffectiveTheme, ThemeChoice } from '../lib/theme';
   import ThemeToggle from './ThemeToggle.svelte';
 
@@ -60,6 +60,39 @@
     }
   }
 
+  // v0.7.8: preserve already-resolved GitHub-asset imgs (and fallback shells)
+  // across per-keystroke morphdom diffs — mirrors preSubstituteMermaid. The live
+  // DOM holds a resolved <img src="blob:…" data-gh-asset-processed> (or a
+  // <span.gh-asset-shell> fallback); the freshly-parsed newRoot holds a raw
+  // <img src="https://github.com/user-attachments/…">. Without a stable key,
+  // morphdom rewrites the live img's src back to the github URL and strips the
+  // processed marker, so processGitHubAssets re-runs → spinner flicker on every
+  // keystroke. Stub the new img with a key-bearing node (matching the live
+  // node's tag) so getNodeKey pairs them and onBeforeElUpdated returns false.
+  function preSubstituteGitHubAssets(newRoot: HTMLElement, oldHost: HTMLElement): void {
+    const processedByUrl = new Map<string, HTMLElement>();
+    for (const el of oldHost.querySelectorAll<HTMLElement>('[data-gh-original-src]')) {
+      // The <img> nested inside a fallback shell also carries the attr — skip it;
+      // the shell <span> is the keyed node we preserve.
+      if (el.tagName === 'IMG' && el.closest('.gh-asset-shell')) continue;
+      const url = el.getAttribute('data-gh-original-src');
+      if (url) processedByUrl.set(url, el);
+    }
+    if (processedByUrl.size === 0) return;
+    for (const img of Array.from(newRoot.querySelectorAll<HTMLImageElement>('img'))) {
+      const src = img.getAttribute('src');
+      if (!src || !isGitHubAssetUrl(src)) continue;
+      const live = processedByUrl.get(src);
+      if (!live) continue;
+      const stub = document.createElement(live.tagName.toLowerCase());
+      stub.setAttribute('data-gh-original-src', src);
+      if (live.tagName === 'IMG') stub.setAttribute('data-gh-asset-processed', 'true');
+      else stub.className = 'gh-asset-shell';
+      img.replaceWith(stub);
+      processedByUrl.delete(src);
+    }
+  }
+
   let isFirstRender = true;
   let lastHtml: string | null = null;
   $effect(() => {
@@ -79,6 +112,7 @@
     const newRoot = document.createElement('div');
     newRoot.innerHTML = html;
     preSubstituteMermaid(newRoot, localHost);
+    preSubstituteGitHubAssets(newRoot, localHost);
 
     let highlightPending = false;
 
@@ -91,6 +125,12 @@
           const src = el.dataset?.mermaidSrc;
           return src ? `mermaid:${src}` : undefined;
         }
+        // v0.7.8: key resolved gh-asset imgs + fallback shells by original URL
+        // so the live (blob-src / shell) node is preserved across keystrokes.
+        const ghUrl = el.getAttribute?.('data-gh-original-src');
+        if (ghUrl && !(el.tagName === 'IMG' && el.closest('.gh-asset-shell'))) {
+          return `gh-asset:${ghUrl}`;
+        }
         return undefined;
       },
       onBeforeElUpdated: (fromEl, toEl) => {
@@ -99,6 +139,15 @@
           else toEl.removeAttribute('open');
         }
         if (fromEl.classList?.contains('mermaid-block')) {
+          return false;
+        }
+        // v0.7.8: preserve resolved gh-asset imgs + fallback shells — skipping
+        // the update keeps the live blob src (or shell) intact, no re-resolve.
+        if (fromEl.classList?.contains('gh-asset-shell')) return false;
+        if (
+          fromEl.tagName === 'IMG' &&
+          (fromEl as HTMLElement).getAttribute('data-gh-asset-processed') === 'true'
+        ) {
           return false;
         }
         if (

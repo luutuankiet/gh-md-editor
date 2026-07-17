@@ -24,6 +24,7 @@ This can be wired into `.github/workflows/deploy.yml` on tag push — see `.clau
 
 | Version | Date | Theme |
 |---|---|---|
+| [v0.8.0](./v0.8.0.md) | 2026-07-17 | Resolved GitHub-attachment images stop flickering / re-resolving on every keystroke (morphdom node preservation, same trick as mermaid blocks). Editor drops the eager cursor-word highlight — inline green + scrollbar implicit ticks removed; Cmd+F is the only word-find now. |
 | [v0.7.0](./v0.7.0.md) | 2026-05-24 | Per-pane dark mode toggle (editor / preview / outline), persisted to localStorage. Editor pane finally gets a real GitHub-dark `HighlightStyle` + EditorView chrome — fixes the washed-out tokens that appeared whenever the OS was dark pre-v0.7. Hot-swap via CodeMirror `Compartment`; `github-markdown-{light,dark}.css` scope-prefixed at runtime so panes can disagree. |
 | [v0.5.2](./v0.5.2.md) | 2026-05-21 | hotfix | Alt+Left-click multi-cursor: explicit DOM-level mousedown handler for cross-browser parity (Mac Firefox fix). |
 | [v0.5.1](./v0.5.1.md) | 2026-05-21 | Preview sticky-header parity + multi-cursor (`Cmd+D` / `Alt+Click`). Section-grow ascend fix. Outline auto-expand. Trash-button storage clear. Scrollbar gutters bumped to 18 px. Shortcuts dialog highlights VS Code muscle-memory bindings. Mac `Ctrl+Shift+→` parity. |

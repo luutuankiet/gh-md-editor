@@ -1,8 +1,8 @@
 <script lang="ts">
-  // PreviewSearch.svelte — v0.5.0 (v0.6.7: auto-expand <details> on Enter-step)
+  // PreviewSearch.svelte — v0.5.0 (v0.6.7: auto-expand <details> on Enter-step;
+  // v0.8.1: click-word implicit highlight removed — explicit search only)
   // Cmd+F search overlay for the preview pane, with:
   //   - explicit query highlight (CSS Custom Highlight API)
-  //   - implicit click-word highlight in a different shade
   //   - scrollbar match indicator ticks (RHS gutter, abs-positioned)
   //   - prev/next navigation, Esc to close
   //   - auto-expand collapsed <details> ancestors of the active match before scroll
@@ -22,18 +22,15 @@
 
   let open = $state(false);
   let query = $state('');
-  let implicitQuery = $state('');
   let currentIndex = $state(0);
   let inputEl: HTMLInputElement | undefined = $state();
 
   // Match arrays — plain (non-$state) since identity comparison is fine for
   // highlight registration; derived $state below is what drives the template.
   let matches: Match[] = [];
-  let implicitMatches: Match[] = [];
 
   let matchCount = $state(0);
   let tickPositions = $state<number[]>([]);
-  let implicitTickPositions = $state<number[]>([]);
   let currentTickPosition = $state<number | null>(null);
 
   // --- Match computation ---
@@ -78,7 +75,6 @@
     if (!HighlightCtor) return;
     try {
       css.highlights.set('gmd-search-match', new HighlightCtor(...matches.map((m) => m.range)));
-      css.highlights.set('gmd-search-implicit', new HighlightCtor(...implicitMatches.map((m) => m.range)));
       const cur = matches[currentIndex];
       css.highlights.set('gmd-search-current', cur ? new HighlightCtor(cur.range) : new HighlightCtor());
     } catch (err) {
@@ -90,7 +86,6 @@
     const css: any = CSS as any;
     if (!css.highlights) return;
     css.highlights.delete('gmd-search-match');
-    css.highlights.delete('gmd-search-implicit');
     css.highlights.delete('gmd-search-current');
   }
 
@@ -114,18 +109,16 @@
     matchCount = matches.length;
     if (matches.length === 0) currentIndex = 0;
     else if (currentIndex >= matches.length) currentIndex = matches.length - 1;
-    implicitMatches = computeMatches(implicitQuery);
     applyHighlights();
     tickPositions = computeTicks(matches);
-    implicitTickPositions = computeTicks(implicitMatches);
     const cur = matches[currentIndex];
     currentTickPosition = cur ? computeTicks([cur])[0] : null;
   }
 
   $effect(() => {
-    // refresh whenever query / implicitQuery / currentIndex changes
+    // refresh whenever query / currentIndex changes
     // (also when host/scrollWrap become available)
-    void query; void implicitQuery; void currentIndex;
+    void query; void currentIndex;
     if (host && scrollWrap) refresh();
   });
 
@@ -160,59 +153,6 @@
     };
     document.addEventListener('keydown', onKey, true);
     return () => document.removeEventListener('keydown', onKey, true);
-  });
-
-  // Click-word implicit highlight — mousedown on the preview body extracts the
-  // word under the click point and uses it as an implicit query (different shade).
-  $effect(() => {
-    if (!host) return;
-    const onClick = (e: MouseEvent) => {
-      if (e.button !== 0) return;
-      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-      const target = e.target as HTMLElement | null;
-      if (target?.closest('.preview-search-overlay, .preview-tick-rail')) return;
-      // Skip clicks inside form controls (links, buttons) so they still work normally.
-      if (target && (target.closest('a, button, input, textarea, select'))) {
-        if (implicitQuery !== '') implicitQuery = '';
-        return;
-      }
-
-      let range: Range | null = null;
-      if ('caretRangeFromPoint' in document) {
-        range = (document as any).caretRangeFromPoint(e.clientX, e.clientY);
-      } else if ('caretPositionFromPoint' in document) {
-        const pos = (document as any).caretPositionFromPoint(e.clientX, e.clientY);
-        if (pos) {
-          range = document.createRange();
-          range.setStart(pos.offsetNode, pos.offset);
-          range.setEnd(pos.offsetNode, pos.offset);
-        }
-      }
-      if (!range || !range.startContainer) return;
-      const node = range.startContainer;
-      if (node.nodeType !== Node.TEXT_NODE) {
-        if (implicitQuery !== '') implicitQuery = '';
-        return;
-      }
-      const text = node.textContent || '';
-      const off = range.startOffset;
-      const wordRe = /[\p{L}\p{N}_]+/gu;
-      let m: RegExpExecArray | null;
-      let word = '';
-      while ((m = wordRe.exec(text))) {
-        if (m.index <= off && off <= m.index + m[0].length) {
-          word = m[0];
-          break;
-        }
-      }
-      if (word.length < 2) {
-        if (implicitQuery !== '') implicitQuery = '';
-        return;
-      }
-      implicitQuery = word;
-    };
-    host.addEventListener('click', onClick);
-    return () => host.removeEventListener('click', onClick);
   });
 
   function openSearch() {
@@ -303,9 +243,6 @@
 {/if}
 
 <div class="preview-tick-rail" aria-hidden="true">
-  {#each implicitTickPositions as y, i (i + ':impl')}
-    <span class="tick implicit" style="top: {y}px"></span>
-  {/each}
   {#each tickPositions as y, i (i + ':match')}
     <span class="tick match" style="top: {y}px"></span>
   {/each}
@@ -391,9 +328,6 @@
   .preview-tick-rail .tick.match {
     background: rgba(255, 195, 0, 0.85);
   }
-  .preview-tick-rail .tick.implicit {
-    background: rgba(132, 165, 200, 0.65);
-  }
   .preview-tick-rail .tick.current {
     background: #ff6b00;
     height: 3px;
@@ -405,10 +339,6 @@
      content is morphdom-managed and lives outside this component's scope. */
   :global(::highlight(gmd-search-match)) {
     background-color: rgba(255, 195, 0, 0.4);
-    color: inherit;
-  }
-  :global(::highlight(gmd-search-implicit)) {
-    background-color: rgba(132, 165, 200, 0.32);
     color: inherit;
   }
   :global(::highlight(gmd-search-current)) {
@@ -434,9 +364,6 @@
     }
     :global(::highlight(gmd-search-match)) {
       background-color: rgba(212, 153, 0, 0.45);
-    }
-    :global(::highlight(gmd-search-implicit)) {
-      background-color: rgba(110, 140, 175, 0.30);
     }
     :global(::highlight(gmd-search-current)) {
       background-color: rgba(212, 92, 0, 0.55);

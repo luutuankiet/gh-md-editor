@@ -64,8 +64,9 @@
 
   // v0.5.0: scrollbar match-tick state (rendered in template, updated via
   // updateListener inside the CM6 setup). Two layers: match (explicit Cmd+F
-  // query) and current (the active match, accent color). The implicit
-  // cursor-word layer was removed — global word highlighting was just noise.
+  // query) and current (the active match, accent color). The cursor-word
+  // layer was removed — global word highlighting was just noise. The preview
+  // pane's click-word equivalent went the same way in v0.8.1.
   let matchTicks = $state<number[]>([]);
   let currentTickY = $state<number | null>(null);
 

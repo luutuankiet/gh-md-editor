@@ -24,6 +24,7 @@ This can be wired into `.github/workflows/deploy.yml` on tag push — see `.clau
 
 | Version | Date | Theme |
 |---|---|---|
+| [v0.8.1](./v0.8.1.md) | 2026-07-25 | Preview pane drops click-word highlighting, matching v0.8.0's editor-side removal. Clicking a word in the reading pane no longer shades every occurrence or paints blue scrollbar ticks; `Cmd/Ctrl+F` search is unchanged. |
 | [v0.8.0](./v0.8.0.md) | 2026-07-17 | Resolved GitHub-attachment images stop flickering / re-resolving on every keystroke (morphdom node preservation, same trick as mermaid blocks). Editor drops the eager cursor-word highlight — inline green + scrollbar implicit ticks removed; Cmd+F is the only word-find now. |
 | [v0.7.0](./v0.7.0.md) | 2026-05-24 | Per-pane dark mode toggle (editor / preview / outline), persisted to localStorage. Editor pane finally gets a real GitHub-dark `HighlightStyle` + EditorView chrome — fixes the washed-out tokens that appeared whenever the OS was dark pre-v0.7. Hot-swap via CodeMirror `Compartment`; `github-markdown-{light,dark}.css` scope-prefixed at runtime so panes can disagree. |
 | [v0.5.2](./v0.5.2.md) | 2026-05-21 | hotfix | Alt+Left-click multi-cursor: explicit DOM-level mousedown handler for cross-browser parity (Mac Firefox fix). |

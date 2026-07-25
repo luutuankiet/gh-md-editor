@@ -16,7 +16,7 @@
   interface Shortcut { pane: string; keys: string; description: string; highlight?: boolean }
   const shortcuts: Shortcut[] = [
     { pane: 'Editor', keys: 'Right-click', description: 'NOVEL FEATURE — flash matching block in preview (auto-expands collapsed <details>, lands on the matching table row not the whole table). Pairs with right-click in the preview going the other way: never lose your place when switching panes.' },
-    { pane: 'Editor', keys: 'Cmd/Ctrl + F', description: 'Find / replace (CodeMirror panel, top-right). Scrollbar shows match ticks; word at cursor lights up implicitly in a fainter shade.' },
+    { pane: 'Editor', keys: 'Cmd/Ctrl + F', description: 'Find / replace (CodeMirror panel, top-right). Scrollbar shows match ticks for the active query.' },
     { pane: 'Editor', keys: 'Alt / Opt + Z', description: 'Toggle word wrap (persisted). Mac Opt+Z handled at the DOM event level so Firefox does not paste Ω.', highlight: true },
     { pane: 'Editor', keys: 'Cmd/Ctrl + D', description: 'Multi-cursor — spawn a caret at the next matching occurrence of the word or selection. Press repeatedly to keep adding cursors.', highlight: true },
     { pane: 'Editor', keys: 'Alt / Opt + Left-click', description: 'Multi-cursor — drop an additional caret at the click point. Combine with Cmd+D for free-form multi-cursor editing.', highlight: true },
@@ -26,7 +26,6 @@
     { pane: 'Editor', keys: '` * _ ~ ( [ { " \'', description: 'Wrap selection with the pair (markdown auto-pair)' },
     { pane: 'Editor', keys: 'Tab / Shift+Tab', description: 'Indent / outdent' },
     { pane: 'Preview', keys: 'Cmd/Ctrl + F', description: 'Find in preview (overlay top-right). Scrollbar match ticks; Enter / Shift+Enter to step through; Esc to close.', highlight: true },
-    { pane: 'Preview', keys: 'Left-click on a word', description: 'Implicit highlight — all matching occurrences light up faintly (different shade than explicit search), with scrollbar ticks.' },
     { pane: 'Preview', keys: 'Right-click', description: 'NOVEL FEATURE — jump editor caret to the clicked block. Pairs with editor right-click for the other direction.' },
     { pane: 'Outline', keys: 'Click row', description: 'Jump both panes; toggle fold if the row has children. Auto-expands when scrolling moves the active heading into a collapsed branch.' },
     { pane: 'Outline', keys: 'Trash icon', description: 'Clear stored draft and reload — restores the sample doc.' },

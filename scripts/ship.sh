@@ -19,6 +19,7 @@
 #   ./scripts/ship.sh release web 0.8.2        bump, build, gate, commit, tag, push
 #   ./scripts/ship.sh release ext 0.2.7        bump, build, package vsix, commit, push
 #   ./scripts/ship.sh release ext 0.2.7 --publish     ...and publish to the Marketplace
+#   ./scripts/ship.sh publish ext              publish an already-built vsix (no rebuild)
 #
 # Flags
 #   --yes        skip the confirmation prompt (required when stdin is not a terminal)
@@ -175,12 +176,34 @@ release_ext() {
 
   if [ "$DO_PUBLISH" = "1" ]; then
     bold "Publishing to the Marketplace"
-    ( cd vscode && npx --yes @vscode/vsce publish --no-dependencies )
-    ok "published - it takes a few minutes to appear on the listing"
+    publish_ext
   else
     info "not published. Install the vsix locally, or re-run with --publish."
     info "  code --install-extension vscode/gh-md-editor-$ver.vsix"
   fi
+}
+
+# ---------------------------------------------------------------- publish --
+# Publishing needs an Azure DevOps token with Marketplace:Manage scope, either
+# in VSCE_PAT or stored by `vsce login luutuankiet`. Tokens expire, and vsce
+# reports that as an opaque TF400813 authorization error - hence the hint below.
+publish_ext() {
+  local ver vsix
+  ver="$(read_version vscode/package.json)"
+  vsix="vscode/gh-md-editor-$ver.vsix"
+  [ -f "$vsix" ] || die "$vsix not found. Run './scripts/ship.sh build ext' first."
+
+  bold "Publishing $vsix to the Marketplace"
+  if ! ( cd vscode && npx --yes @vscode/vsce publish --no-dependencies --packagePath "gh-md-editor-$ver.vsix" ); then
+    warn "publish failed. If the error mentions TF400813 or token verification,"
+    info "the Azure DevOps token has expired. Issue a new one with the"
+    info "Marketplace:Manage scope at https://dev.azure.com/ (User settings ->"
+    info "Personal access tokens), then either:"
+    info "  export VSCE_PAT=<token> && ./scripts/ship.sh publish ext"
+    info "  vsce login luutuankiet   # stores it, then re-run"
+    exit 1
+  fi
+  ok "published - the listing updates a few minutes later"
 }
 
 # ------------------------------------------------------------------- main --
@@ -212,6 +235,10 @@ case "$cmd" in
     esac
     ;;
   check)  git add -A; gates ;;
+  publish)
+    [ "$target" = "ext" ] || die "only the extension is published this way (the web app deploys from a git push)"
+    publish_ext
+    ;;
   status)
     bold "Versions"
     info "web app    v$(read_version package.json)"

@@ -35,8 +35,10 @@ npm run dev
 ## Build
 
 ```bash
-npm run build
-npm run preview
+npm run build          # web app -> dist/
+npm run preview        # serve dist/ locally
+npm run build:ext      # VS Code extension -> vscode/*.vsix
+npm run build:all      # both
 ```
 
 ## Type-check
@@ -45,6 +47,41 @@ npm run preview
 npm run check
 ```
 
+## Shipping
+
+This repo produces **two** deliverables with independent version numbers:
+
+| | Source of truth | Ships to |
+|---|---|---|
+| Web app | `package.json` | GitHub Pages, deployed by Actions on every push to `main` |
+| VS Code extension | `vscode/package.json` | `.vsix` / the VS Code Marketplace |
+
+Most feature work lands in `src/components/*` and `src/lib/*`, which **both** deliverables
+compile from — so one source edit usually wants one release on each side.
+
+`scripts/ship.sh` automates both paths. It finds node under nvm if it isn't on your
+`PATH`, runs the safety gates that keep private files and internal notes out of the
+public remote, and refuses to tag a web release without a matching notes file.
+
+```bash
+npm run status                      # both versions + git state
+npm run gates                       # safety gates only, nothing else
+
+./scripts/ship.sh release web 0.8.2 # bump, build, gate, commit, tag, push
+./scripts/ship.sh release ext 0.2.8 # bump, build, package vsix, commit, push
+./scripts/ship.sh publish ext       # push an already-built vsix to the Marketplace
+./scripts/ship.sh --help
+```
+
+Before a **web** release, write `releases/vX.Y.Z.md` and add its row to the
+[index](./releases/README.md) — the script checks for the file and stops if it's missing.
+It asks for confirmation before anything irreversible; pass `--yes` in a script.
+
+Publishing the extension needs an Azure DevOps token with the `Marketplace: Manage`
+scope, either in `VSCE_PAT` or stored via `vsce login luutuankiet`. These expire, and
+the failure surfaces as an opaque `TF400813` error — the script explains the fix when
+it hits one.
+
 ## Releases
 
-Narrative release notes live in [`releases/`](./releases/). Start with the [index](./releases/README.md) or jump to the latest: [v0.4.2](./releases/v0.4.2.md).
+Narrative release notes live in [`releases/`](./releases/). Start with the [index](./releases/README.md) or jump to the latest: [v0.8.1](./releases/v0.8.1.md).

@@ -12,6 +12,21 @@ GitHub-flavored markdown editor as a VS Code custom editor for `.md` / `.markdow
 
 ## Build (local)
 
+From the repo root, one command does the clean-build-and-package:
+
+```bash
+npm run build:ext                    # -> vscode/gh-md-editor-X.Y.Z.vsix
+```
+
+Or drive the whole release — version bump, build, package, safety gates, commit, push:
+
+```bash
+./scripts/ship.sh release ext 0.2.8
+./scripts/ship.sh publish ext        # separately, once you have a Marketplace token
+```
+
+The underlying steps, if you'd rather run them by hand:
+
 ```bash
 cd vscode
 npm install

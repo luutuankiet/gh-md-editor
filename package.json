@@ -7,7 +7,12 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "build:ext": "bash scripts/ship.sh build ext",
+    "build:all": "bash scripts/ship.sh build",
+    "gates": "bash scripts/ship.sh check",
+    "status": "bash scripts/ship.sh status",
+    "ship": "bash scripts/ship.sh"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.0",

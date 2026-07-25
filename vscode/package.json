@@ -2,7 +2,7 @@
   "name": "gh-md-editor",
   "displayName": "GH MD Editor",
   "description": "Snappy GitHub-flavored markdown editor with mermaid pan/zoom, code highlight, outline, and per-pane themes. Runs in VS Code Desktop AND vscode.dev / github.dev.",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "publisher": "luutuankiet",
   "license": "MIT",
   "repository": {

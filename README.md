@@ -95,6 +95,48 @@ scope, either in `VSCE_PAT` or stored via `vsce login luutuankiet`. These expire
 the failure surfaces as an opaque `TF400813` error — the script explains the fix when
 it hits one.
 
+## Appendix — how releasing works
+
+A memo for whoever runs the next one.
+
+### Three deliverables, three version numbers
+
+| Deliverable | Version lives in | Ships to | Triggered by |
+|---|---|---|---|
+| Web app | `package.json` | GitHub Pages | any push to `main` (`deploy.yml`) |
+| Server / CLI | `server/package.json` | npm `@luutuankiet/gh-md-editor` | pushing a `v*` tag (`publish-npm.yml`) |
+| VS Code extension | `vscode/package.json` | VS Code Marketplace | manual `vsce publish` |
+
+They version independently on purpose. Most feature work lands in `src/components/*` and `src/lib/*`, which all three compile from, so one source edit usually deserves a release on more than one side.
+
+### Cutting a web + npm release
+
+```bash
+# 1. write the notes file first — ship.sh refuses to release without it
+$EDITOR releases/v0.9.2.md          # title line + ~8 short bullets, no diagrams
+
+# 2. bump the npm package by hand (ship.sh only bumps the root package.json)
+$EDITOR server/package.json
+
+# 3. bump, build, run the gates, commit, tag, push
+./scripts/ship.sh release web 0.9.2
+
+# 4. create the GitHub release page from the notes file
+gh release create v0.9.2 --repo luutuankiet/gh-md-editor --notes-file releases/v0.9.2.md
+```
+
+Step 3 pushes to `main` (Pages redeploys) and pushes the tag (npm publishes). Step 4 is separate because `gh` isn't installed everywhere — run it from any machine that has it.
+
+Extension releases are their own command: `./scripts/ship.sh release ext 0.2.8 --publish` (needs `VSCE_PAT`, or `vsce login luutuankiet` first).
+
+### Things that will bite you
+
+- **Check npm before picking a version.** `npm view @luutuankiet/gh-md-editor version`. npm refuses to overwrite a published version, so the tag must be ahead of whatever is already on the registry — not just ahead of the last git tag. These two drifted apart once already, when the first publish had to be done by hand.
+- **npm auth is OIDC, not a token.** Nothing secret is stored in this repo. npmjs.com trusts this repository plus the exact workflow filename `publish-npm.yml`. Renaming or moving that file silently breaks publishing until the trust config is updated.
+- **A brand-new npm package has to be published manually once.** Trusted publishing can only be attached to a package that already exists, so the bootstrap publish is `npm login && npm publish` from `server/` after `npm run build:server`.
+- **`ship.sh` gates the commit.** It refuses to ship if the private working-notes directory or agent config is staged, or if internal note identifiers leak into shipped files. Fix the content rather than bypassing it.
+- **Release notes are the release body verbatim.** Keep them to a title plus roughly eight short bullets — see `releases/README.md`.
+
 ## Releases
 
 Narrative release notes live in [`releases/`](./releases/). Start with the [index](./releases/README.md) or jump to the latest: [v0.8.1](./releases/v0.8.1.md).

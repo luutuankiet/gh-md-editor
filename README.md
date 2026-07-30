@@ -25,6 +25,19 @@ https://github.com/user-attachments/assets/71694022-c26e-4ef5-9ecc-28074059191a
 - **Keyboard shortcuts dialog** (press `?` with the outline focused, or click the `?` in the outline header)
 - **localStorage persistence** — documents survive reloads
 
+## Server mode
+
+Since v0.9.1 the same editor can be served over a real folder, turning it into a small browser IDE:
+
+```bash
+npx @luutuankiet/gh-md-editor          # serves the current directory on http://127.0.0.1:8790
+npx @luutuankiet/gh-md-editor --port 9000 --host 0.0.0.0 --token secret
+```
+
+`.md` files open in the three-pane cockpit above; every other file opens in a plain CodeMirror editor with language auto-detect and syntax highlighting. Also included: a lazy file tree, preview/pinned tabs with `Cmd/Ctrl+S` write-back and mtime-conflict prompts, an integrated terminal (multiple persistent sessions), workspace search backed by ripgrep, a git source-control panel with line-level stage/revert, fuzzy quick open, and a listening-ports panel.
+
+It binds to loopback by default. Going beyond that with `--host` exposes a terminal, so pair it with `--token` or a reverse proxy that authenticates.
+
 ## Dev
 
 ```bash

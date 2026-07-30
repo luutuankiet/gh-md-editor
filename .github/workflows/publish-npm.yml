@@ -1,0 +1,32 @@
+# npm publish via OIDC trusted publishing — no long-lived token in CI.
+# BOOTSTRAP (one-time): trusted publishers can only be configured on an
+# EXISTING package, so the very first publish is manual:
+#   npm run build:server && cd server && npm login && npm publish
+# Then on npmjs.com → package → Settings → Trusted Publisher → GitHub Actions:
+#   owner: luutuankiet, repository: gh-md-editor,
+#   workflow filename: publish-npm.yml, allowed action: npm publish.
+# After that, pushing a v* tag publishes hands-free with provenance.
+name: publish-npm
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC token exchange for npm trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest # OIDC publish requires GitHub-hosted runners
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # npm >= 11.5.1 required for OIDC publish
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm ci
+      - run: npm run build:server
+      - run: npm publish
+        working-directory: server

@@ -5,6 +5,7 @@
   import { history, historyKeymap, defaultKeymap, indentWithTab, selectParentSyntax } from '@codemirror/commands';
   import { indentOnInput, bracketMatching, syntaxTree, LanguageDescription } from '@codemirror/language';
   import { searchKeymap, search, getSearchQuery } from '@codemirror/search';
+  import { wordHighlight, wordMatchRanges } from '../lib/word-highlight';
   import { markdown as markdownLang, markdownLanguage } from '@codemirror/lang-markdown';
   import { languages as codeLanguages } from '@codemirror/language-data';
   import { sql } from '@codemirror/lang-sql';
@@ -64,11 +65,13 @@
 
   // v0.5.0: scrollbar match-tick state (rendered in template, updated via
   // updateListener inside the CM6 setup). Two layers: match (explicit Cmd+F
-  // query) and current (the active match, accent color). The cursor-word
-  // layer was removed — global word highlighting was just noise. The preview
-  // pane's click-word equivalent went the same way in v0.8.1.
+  // query) and current (the active match, accent color). v0.9.0 adds a word
+  // layer (blue) — unlike the always-on cursor-word layer removed earlier as
+  // noise, it only fires when the selection is exactly one whole word, i.e.
+  // a double-click (cmd_f port).
   let matchTicks = $state<number[]>([]);
   let currentTickY = $state<number | null>(null);
+  let wordTicks = $state<number[]>([]);
 
   // v0.7.0: theme moved out to ../lib/editor-theme.ts and surfaced through a
   // Compartment so per-pane light/dark toggle can hot-swap without rebuilding
@@ -309,10 +312,22 @@
     currentTickY = nearest ? docPosToGutterY(vw, nearest.from) : null;
   }
 
+  function recomputeWordTicks(vw: EditorView) {
+    const ranges = wordMatchRanges(vw.state);
+    if (ranges.length < 2) { wordTicks = []; return; }
+    const ticks: number[] = [];
+    for (const r of ranges) {
+      const y = docPosToGutterY(vw, r.from);
+      if (y != null) ticks.push(y);
+    }
+    wordTicks = ticks;
+  }
+
   function recomputeTicks(vw: EditorView) {
     queueMicrotask(() => {
       try {
         recomputeMatchTicks(vw);
+        recomputeWordTicks(vw);
       } catch { /* swallow — ticks are non-critical */ }
     });
   }
@@ -336,6 +351,7 @@
         EditorState.allowMultipleSelections.of(true),
         highlightActiveLine(),
         search({ top: true }),
+        wordHighlight,
         // Theme + highlight (Compartment, swappable on per-pane toggle). The
         // returned Extension bundles the light/dark HighlightStyle plus the
         // defaultHighlightStyle fallback (covers fenced-code nested grammars
@@ -465,7 +481,7 @@
           '.cm-panel.cm-search': {
             position: 'absolute',
             top: '8px',
-            right: '24px',
+            right: '30px',
             maxWidth: '460px',
             padding: '6px 8px',
             backdropFilter: 'blur(8px)',
@@ -564,6 +580,9 @@
 <div class="editor-container theme-{effectiveTheme}">
   <div class="editor-host" bind:this={host}></div>
   <div class="editor-tick-rail" aria-hidden="true">
+    {#each wordTicks as y, i (i + ':eword')}
+      <span class="tick word" style="top: {y}px"></span>
+    {/each}
     {#each matchTicks as y, i (i + ':ematch')}
       <span class="tick match" style="top: {y}px"></span>
     {/each}
@@ -603,31 +622,35 @@
     overflow: auto;
   }
 
-  /* v0.5.1: scrollbar gutter widened 12 -> 18px so highlight ticks read at a
-     glance — the previous 12px / 8px-tick combo was visible only when squinting. */
+  /* v0.9.0: gutter widened 18 -> 24px (highlighted spots must read clearly
+     across the file). Layers bottom-to-top: word (blue, double-click), match
+     (amber, Cmd+F), current (orange, active match). */
   .editor-tick-rail {
     position: absolute;
     top: 0;
     bottom: 0;
     right: 0;
-    width: 18px;
+    width: 24px;
     pointer-events: none;
     z-index: 5;
   }
   .editor-tick-rail .tick {
     position: absolute;
     right: 2px;
-    width: 14px;
-    height: 2px;
+    width: 20px;
+    height: 3px;
     border-radius: 1px;
+  }
+  .editor-tick-rail .tick.word {
+    background: rgba(56, 139, 253, 0.9);
   }
   .editor-tick-rail .tick.match {
     background: rgba(255, 195, 0, 0.85);
   }
   .editor-tick-rail .tick.current {
     background: #ff6b00;
-    height: 3px;
-    width: 16px;
+    height: 4px;
+    width: 22px;
     right: 1px;
   }
 
@@ -638,11 +661,11 @@
   /* Theme toggle docked top-right of pane, above tick rail (z:5) and the
      CM search panel (z:15 when open). The toggle is z:20 so it stays
      reachable even with search open; gap from the right edge clears the
-     18px tick gutter. */
+     24px tick gutter. */
   .theme-toggle-slot {
     position: absolute;
     top: 6px;
-    right: 24px;
+    right: 30px;
     z-index: 20;
     display: flex;
     gap: 4px;

@@ -38,6 +38,79 @@
   let scrollWrap: HTMLElement | null = $state(null);
   let containerEl: HTMLElement | null = $state(null);
 
+  // v0.9.0: double-click whole-word highlight (cmd_f port for the rendered
+  // view). Transient by design — clearWordHighlights runs before every
+  // re-render so morphdom never diffs against the injected spans.
+  let previewWordTicks = $state<number[]>([]);
+
+  function clearWordHighlights() {
+    if (!localHost) return;
+    const hits = localHost.querySelectorAll('span.gmd-word-hit');
+    for (const s of Array.from(hits)) {
+      const parent = s.parentNode;
+      if (!parent) continue;
+      parent.replaceChild(document.createTextNode(s.textContent ?? ''), s);
+      parent.normalize();
+    }
+    if (hits.length) previewWordTicks = [];
+  }
+
+  function recomputePreviewWordTicks() {
+    if (!scrollWrap || !localHost) { previewWordTicks = []; return; }
+    const sh = scrollWrap.scrollHeight;
+    const ch = scrollWrap.clientHeight;
+    if (!sh || !ch) { previewWordTicks = []; return; }
+    const wrapTop = scrollWrap.getBoundingClientRect().top;
+    const ticks: number[] = [];
+    for (const s of localHost.querySelectorAll<HTMLElement>('span.gmd-word-hit')) {
+      ticks.push(((s.getBoundingClientRect().top - wrapTop + scrollWrap.scrollTop) / sh) * ch);
+    }
+    previewWordTicks = ticks;
+  }
+
+  function handlePreviewClick() {
+    // Single click clears; a double-click fires click first, then re-applies.
+    clearWordHighlights();
+  }
+
+  function handlePreviewDblClick() {
+    clearWordHighlights();
+    if (!localHost) return;
+    const sel = window.getSelection();
+    const word = sel?.toString().trim() ?? '';
+    // Whole-word-only gate, mirroring the editors: a double-click selects one
+    // word; drags and multi-word selections do nothing.
+    if (!word || !/^[\w$]+$/.test(word)) return;
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`\\b${escaped}\\b`, 'g');
+    const walker = document.createTreeWalker(localHost, NodeFilter.SHOW_TEXT);
+    const texts: Text[] = [];
+    let n: Node | null;
+    while ((n = walker.nextNode())) texts.push(n as Text);
+    let count = 0;
+    for (const tn of texts) {
+      const text = tn.nodeValue ?? '';
+      re.lastIndex = 0;
+      if (!re.test(text)) continue;
+      re.lastIndex = 0;
+      const frag = document.createDocumentFragment();
+      let last = 0;
+      for (let m: RegExpExecArray | null; (m = re.exec(text)) !== null && count < 2000; ) {
+        frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+        const span = document.createElement('span');
+        span.className = 'gmd-word-hit';
+        span.textContent = m[0];
+        frag.appendChild(span);
+        last = m.index + m[0].length;
+        count++;
+      }
+      frag.appendChild(document.createTextNode(text.slice(last)));
+      tn.parentNode?.replaceChild(frag, tn);
+      if (count >= 2000) break;
+    }
+    recomputePreviewWordTicks();
+  }
+
   function preSubstituteMermaid(newRoot: HTMLElement, oldHost: HTMLElement): void {
     const renderedBySrc = new Map<string, HTMLElement>();
     for (const m of oldHost.querySelectorAll<HTMLElement>('div.mermaid-block')) {
@@ -99,6 +172,9 @@
     if (!localHost || html == null) return;
     if (html === lastHtml) return;
     lastHtml = html;
+    // v0.9.0: drop word-highlight wraps before any re-render — morphdom must
+    // never diff against our injected spans.
+    clearWordHighlights();
 
     if (isFirstRender || localHost.childElementCount === 0) {
       localHost.innerHTML = html;
@@ -280,11 +356,19 @@
     </div>
   {/if}
   <div class="preview-wrap" bind:this={scrollWrap}>
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions a11y_click_events_have_key_events -->
     <article
       class="markdown-body theme-{effectiveTheme}"
       bind:this={localHost}
       oncontextmenu={handleContextMenu}
+      onclick={handlePreviewClick}
+      ondblclick={handlePreviewDblClick}
     ></article>
+  </div>
+  <div class="preview-tick-rail" aria-hidden="true">
+    {#each previewWordTicks as y, i (i + ':pword')}
+      <span class="tick word" style="top: {y}px"></span>
+    {/each}
   </div>
   <PreviewSearch host={localHost} {scrollWrap} container={containerEl} />
 </div>
@@ -350,6 +434,29 @@
     overflow-y: auto;
     overflow-x: hidden;
     background: #ffffff;
+  }
+  /* v0.9.0: word-instance tick rail, same chrome as the editor panes. */
+  .preview-tick-rail {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 0;
+    width: 24px;
+    pointer-events: none;
+    z-index: 12;
+  }
+  .preview-tick-rail .tick {
+    position: absolute;
+    right: 2px;
+    width: 20px;
+    height: 3px;
+    border-radius: 1px;
+  }
+  .preview-tick-rail .tick.word { background: rgba(56, 139, 253, 0.9); }
+  :global(.markdown-body .gmd-word-hit) {
+    background: rgba(56, 139, 253, 0.3);
+    outline: 1px solid rgba(56, 139, 253, 0.4);
+    border-radius: 2px;
   }
   .markdown-body {
     box-sizing: border-box;

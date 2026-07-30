@@ -1,0 +1,411 @@
+<script lang="ts">
+  // Workspace search, VS Code layout, backed by the streamed /api/search
+  // ripgrep endpoint. Results are rendered as they arrive rather than after
+  // the scan completes — the reason the endpoint streams at all.
+  let { onOpen }: { onOpen: (path: string, line: number) => void } = $props();
+
+  type Hit = { line: number; text: string; cols: [number, number][] };
+  type FileHits = { path: string; hits: Hit[] };
+
+  let query = $state('');
+  let include = $state('');
+  let matchCase = $state(false);
+  let wholeWord = $state(false);
+  let useRegex = $state(false);
+
+  let files = $state<FileHits[]>([]);
+  let total = $state(0);
+  let truncated = $state(false);
+  let running = $state(false);
+  let error = $state<string | null>(null);
+  let collapsed = $state<Record<string, boolean>>({});
+
+  let input: HTMLInputElement | null = null;
+  let ctrl: AbortController | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  // Any option change re-runs the search. A stale result set sitting under a
+  // freshly-toggled "match case" is worse than paying for a re-scan.
+  $effect(() => {
+    query;
+    include;
+    matchCase;
+    wholeWord;
+    useRegex;
+    schedule();
+  });
+
+  $effect(() => {
+    const onFocus = () => {
+      input?.focus();
+      input?.select();
+    };
+    window.addEventListener('gmd:focus-search', onFocus);
+    return () => window.removeEventListener('gmd:focus-search', onFocus);
+  });
+
+  function schedule() {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(run, 220);
+  }
+
+  async function run() {
+    // Abort first: the server kills its rg on request close, so a fast typist
+    // never leaves a pile of scans running behind the current one.
+    ctrl?.abort();
+    const q = query.trim();
+    files = [];
+    total = 0;
+    truncated = false;
+    error = null;
+    if (!q) {
+      running = false;
+      return;
+    }
+
+    const c = new AbortController();
+    ctrl = c;
+    running = true;
+
+    const params = new URLSearchParams({ q });
+    if (matchCase) params.set('case', '1');
+    if (wholeWord) params.set('word', '1');
+    if (useRegex) params.set('regex', '1');
+    if (include.trim()) params.set('glob', include.trim());
+
+    // Accumulated outside $state and copied on flush: mutating an object the
+    // proxy already wrapped would not signal, and copying every chunk without
+    // a throttle would thrash the DOM on a big result set.
+    const batch: FileHits[] = [];
+    let cur: FileHits | null = null;
+    let lastFlush = 0;
+    const flush = (force: boolean) => {
+      const now = performance.now();
+      if (!force && now - lastFlush < 100) return;
+      lastFlush = now;
+      files = batch.map((f) => ({ path: f.path, hits: f.hits.slice() }));
+    };
+
+    try {
+      const res = await fetch(`/api/search?${params}`, { signal: c.signal });
+      if (!res.ok || !res.body) {
+        const body = await res.json().catch(() => ({}));
+        error = body?.error ?? `HTTP ${res.status}`;
+        return;
+      }
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let tail = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        tail += dec.decode(value, { stream: true });
+        const lines = tail.split('\n');
+        tail = lines.pop() ?? '';
+        for (const raw of lines) {
+          if (!raw) continue;
+          let ev: any;
+          try { ev = JSON.parse(raw); } catch { continue; }
+          if (ev.t === 'f') {
+            cur = { path: ev.path, hits: [] };
+            batch.push(cur);
+          } else if (ev.t === 'm' && cur) {
+            cur.hits.push({ line: ev.line, text: ev.text, cols: ev.cols ?? [] });
+            total++;
+          } else if (ev.t === 'done') {
+            truncated = !!ev.truncated;
+          } else if (ev.t === 'err') {
+            error = ev.error;
+          }
+        }
+        flush(false);
+      }
+      flush(true);
+    } catch (e) {
+      if ((e as Error)?.name !== 'AbortError') error = String((e as Error)?.message ?? e);
+    } finally {
+      if (ctrl === c) {
+        ctrl = null;
+        running = false;
+      }
+    }
+  }
+
+  // Leading indentation is dead width in a 200px sidebar, so it is trimmed —
+  // and the match offsets shift with it or every highlight lands wrong.
+  function segs(h: Hit) {
+    const lead = h.text.length - h.text.trimStart().length;
+    const text = h.text.slice(lead);
+    const out: { t: string; hit: boolean }[] = [];
+    let i = 0;
+    for (const [s0, e0] of h.cols) {
+      const s = Math.max(0, s0 - lead);
+      const e = Math.max(0, e0 - lead);
+      if (e <= i) continue;
+      if (s > i) out.push({ t: text.slice(i, s), hit: false });
+      out.push({ t: text.slice(s, e), hit: true });
+      i = e;
+    }
+    if (i < text.length) out.push({ t: text.slice(i), hit: false });
+    return out;
+  }
+
+  const baseOf = (p: string) => p.slice(p.lastIndexOf('/') + 1);
+  const dirOf = (p: string) => {
+    const i = p.lastIndexOf('/');
+    return i === -1 ? '' : p.slice(0, i);
+  };
+</script>
+
+<div class="spanel">
+  <div class="sbar">
+    <span class="sbar-label">Search</span>
+    <span class="sbar-gap"></span>
+    {#if running}
+      <span class="sbar-sub">searching…</span>
+    {:else if query.trim() && !error}
+      <span class="sbar-sub">{total}{truncated ? '+' : ''} in {files.length} file{files.length === 1 ? '' : 's'}</span>
+    {/if}
+  </div>
+
+  <div class="sfields">
+    <div class="sinput">
+      <input
+        bind:this={input}
+        bind:value={query}
+        placeholder="Search"
+        spellcheck="false"
+        autocomplete="off"
+        onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); run(); } }}
+      />
+      <span class="sopts">
+        <button type="button" class:on={matchCase} title="Match case" onclick={() => (matchCase = !matchCase)}>Aa</button>
+        <button type="button" class:on={wholeWord} title="Match whole word" onclick={() => (wholeWord = !wholeWord)}>ab</button>
+        <button type="button" class:on={useRegex} title="Use regular expression" onclick={() => (useRegex = !useRegex)}>.*</button>
+      </span>
+    </div>
+    <input class="sglob" bind:value={include} placeholder="files to include" spellcheck="false" autocomplete="off" />
+  </div>
+
+  <div class="sresults">
+    {#if error}
+      <div class="smsg err">{error}</div>
+    {:else if query.trim() && !running && files.length === 0}
+      <div class="smsg">No results</div>
+    {/if}
+    {#each files as f (f.path)}
+      <div class="sfile">
+        <button type="button" class="sfile-head" onclick={() => (collapsed[f.path] = !collapsed[f.path])}>
+          <svg class="chev" class:open={!collapsed[f.path]} viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5z" /></svg>
+          <span class="sfile-name">{baseOf(f.path)}</span>
+          <span class="sfile-dir">{dirOf(f.path)}</span>
+          <span class="sfile-count">{f.hits.length}</span>
+        </button>
+        {#if !collapsed[f.path]}
+          <ul class="shits">
+            {#each f.hits as h, hi (hi)}
+              <li>
+                <button type="button" class="shit" onclick={() => onOpen(f.path, h.line)}>
+                  <span class="shit-ln">{h.line}</span>
+                  <span class="shit-text">{#each segs(h) as s}{#if s.hit}<mark>{s.t}</mark>{:else}{s.t}{/if}{/each}</span>
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    {/each}
+    {#if truncated}
+      <div class="smsg">result cap reached — narrow the query</div>
+    {/if}
+  </div>
+</div>
+
+<style>
+  .spanel {
+    flex: 1 1 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: #0d1117;
+  }
+  .sbar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px 4px 12px;
+  }
+  .sbar-label {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #8b949e;
+  }
+  .sbar-gap { flex: 1 1 auto; }
+  .sbar-sub {
+    font-size: 11px;
+    color: #6e7681;
+    white-space: nowrap;
+  }
+  .sfields {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 0 8px 6px 10px;
+  }
+  .sinput {
+    display: flex;
+    align-items: center;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+  }
+  .sinput:focus-within { border-color: #58a6ff; }
+  .sinput input {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 3px 6px;
+    border: none;
+    background: transparent;
+    color: #c9d1d9;
+    font-size: 12px;
+    outline: none;
+  }
+  .sopts {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 1px;
+    padding-right: 2px;
+  }
+  .sopts button {
+    width: 20px;
+    height: 18px;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    background: transparent;
+    color: #6e7681;
+    font-size: 11px;
+    font-family: ui-monospace, Menlo, monospace;
+    cursor: pointer;
+  }
+  .sopts button:hover { background: #21262d; color: #c9d1d9; }
+  .sopts button.on {
+    background: #1f6feb55;
+    color: #c9d1d9;
+    box-shadow: inset 0 0 0 1px #58a6ff;
+  }
+  .sglob {
+    padding: 3px 6px;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    background: transparent;
+    color: #c9d1d9;
+    font-size: 12px;
+    outline: none;
+  }
+  .sglob:focus { border-color: #58a6ff; }
+  .sresults {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: auto;
+    padding-bottom: 8px;
+  }
+  .smsg {
+    padding: 6px 12px;
+    font-size: 12px;
+    color: #8b949e;
+  }
+  .smsg.err { color: #f85149; }
+  .sfile-head {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    padding: 2px 8px 2px 4px;
+    border: none;
+    background: transparent;
+    color: #c9d1d9;
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .sfile-head:hover { background: #161b22; }
+  .chev {
+    flex: 0 0 auto;
+    width: 12px;
+    height: 12px;
+    fill: #8b949e;
+    transition: transform 0.1s linear;
+  }
+  .chev.open { transform: rotate(90deg); }
+  .sfile-name {
+    flex: 0 0 auto;
+    max-width: 55%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sfile-dir {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+    text-align: left;
+    font-size: 11px;
+    color: #6e7681;
+  }
+  .sfile-count {
+    flex: 0 0 auto;
+    min-width: 16px;
+    padding: 0 5px;
+    border-radius: 8px;
+    background: #21262d;
+    color: #8b949e;
+    font-size: 10px;
+    line-height: 15px;
+    text-align: center;
+  }
+  .shits {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .shit {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    width: 100%;
+    padding: 1px 8px 1px 20px;
+    border: none;
+    background: transparent;
+    color: #8b949e;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 11.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .shit:hover { background: #161b22; color: #c9d1d9; }
+  .shit-ln {
+    flex: 0 0 auto;
+    min-width: 26px;
+    color: #6e7681;
+    text-align: right;
+  }
+  .shit-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: pre;
+  }
+  mark {
+    background: #1f6feb66;
+    color: inherit;
+    border-radius: 2px;
+  }
+</style>

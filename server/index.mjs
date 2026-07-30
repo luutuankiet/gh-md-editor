@@ -30,6 +30,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -60,6 +61,13 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--tunnel-bin') tunnelBin = argv[++i];
   else if (a === '--help' || a === '-h') {
     console.log('usage: node server/index.mjs [dir] [--host 127.0.0.1] [--port 8790] [--auth <token>] [--tunnel [cloudflared|funnel]] [--tunnel-bin <path>]');
+    console.log('');
+    console.log('  --tunnel        public HTTPS URL, auth forced on. Downloads cloudflared once');
+    console.log('                  into ~/.cache/gh-md-editor if it is not already installed.');
+    console.log('  --tunnel funnel Tailscale Funnel instead — needs tailscale installed and logged in.');
+    console.log('');
+    console.log('  optional host tools: ripgrep (search + quick open), git (source control),');
+    console.log('  a C toolchain (integrated terminal). Everything else works without them.');
     process.exit(0);
   } else if (!a.startsWith('--')) rootArg = a;
 }
@@ -299,10 +307,13 @@ function listFiles(baseAbs) {
     const child = spawn('rg', ['--files'], { cwd: baseAbs });
     let buf = '';
     let truncated = false;
+    // A missing rg used to resolve to an empty list with no error, so quick
+    // open just silently found nothing. Carry the reason to the client.
+    let error = '';
     const done = () => {
       const files = buf.split('\n').filter(Boolean);
       if (files.length > FILELIST_CAP) { files.length = FILELIST_CAP; truncated = true; }
-      const entry = { at: Date.now(), files, truncated };
+      const entry = { at: Date.now(), files, truncated, error };
       fileListCache.set(baseAbs, entry);
       resolve(entry);
     };
@@ -310,7 +321,10 @@ function listFiles(baseAbs) {
       if (buf.length < 8 * 1024 * 1024) buf += d;
       else truncated = true;
     });
-    child.on('error', done);
+    child.on('error', (e) => {
+      error = e.code === 'ENOENT' ? 'ripgrep (rg) not found on PATH' : String(e.message ?? e);
+      done();
+    });
     child.on('close', done);
   });
 }
@@ -338,7 +352,8 @@ async function apiQuickOpen(res, params) {
   const baseAbs = resolveSafe(params.get('path') || '.');
   if (!baseAbs) return sendJson(res, 400, { error: 'path escapes root' });
   const q = (params.get('q') ?? '').trim();
-  const { files, truncated } = await listFiles(baseAbs);
+  const { files, truncated, error } = await listFiles(baseAbs);
+  if (error) return sendJson(res, 200, { files: [], truncated: false, error });
   let out;
   if (!q) {
     out = files.slice(0, QUICKOPEN_CAP);
@@ -1145,8 +1160,78 @@ server.on('upgrade', (req, socket, head) => {
 let tunnelChild = null;
 process.on('exit', () => { try { tunnelChild?.kill('SIGTERM'); } catch {} });
 
-function startTunnel(provider) {
-  const bin = tunnelBin ?? (provider === 'funnel' ? 'tailscale' : 'cloudflared');
+// Is a binary usable? spawnSync is the portable probe — `which` and `where`
+// differ per platform and neither exists in a bare container.
+function onPath(bin) {
+  const r = spawnSync(bin, ['--version'], { stdio: 'ignore' });
+  return !r.error;
+}
+
+// cloudflared is a ~35MB per-platform Go binary, so it cannot be an npm
+// dependency without taxing every install for the few who tunnel. Fetch it
+// once into a user cache dir instead — that keeps `--tunnel` a genuinely
+// zero-setup flag, which is its entire reason to exist. No apt, no brew, no
+// manual download, and every later run reuses the cached copy.
+const TUNNEL_CACHE = path.join(os.homedir(), '.cache', 'gh-md-editor');
+
+function cloudflaredAsset() {
+  const arch = { x64: 'amd64', arm64: 'arm64', ia32: '386', arm: 'arm' }[process.arch];
+  if (!arch) return null;
+  if (process.platform === 'linux') return { asset: `cloudflared-linux-${arch}`, bin: 'cloudflared', tgz: false };
+  // The macOS build is published only as a tarball, and only for amd64/arm64.
+  if (process.platform === 'darwin' && (arch === 'amd64' || arch === 'arm64')) return { asset: `cloudflared-darwin-${arch}.tgz`, bin: 'cloudflared', tgz: true };
+  if (process.platform === 'win32' && (arch === 'amd64' || arch === '386')) return { asset: `cloudflared-windows-${arch}.exe`, bin: 'cloudflared.exe', tgz: false };
+  return null;
+}
+
+async function fetchCloudflared() {
+  const a = cloudflaredAsset();
+  if (!a) return { error: `no cloudflared build for ${process.platform}/${process.arch} — install it yourself and pass --tunnel-bin <path>` };
+  const dest = path.join(TUNNEL_CACHE, a.bin);
+  try { await fs.access(dest); return { bin: dest }; } catch { /* not cached yet */ }
+  const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/${a.asset}`;
+  console.log(`  tunnel: cloudflared is not installed — downloading it once to ${dest}`);
+  try {
+    const r = await fetch(url, { redirect: 'follow' });
+    if (!r.ok) throw new Error(`HTTP ${r.status} from ${url}`);
+    const buf = Buffer.from(await r.arrayBuffer());
+    await fs.mkdir(TUNNEL_CACHE, { recursive: true });
+    if (a.tgz) {
+      const tar = path.join(TUNNEL_CACHE, a.asset);
+      await fs.writeFile(tar, buf);
+      const x = spawnSync('tar', ['-xzf', tar, '-C', TUNNEL_CACHE], { stdio: 'ignore' });
+      await fs.rm(tar, { force: true });
+      if (x.error || x.status !== 0) throw new Error('tar could not unpack the download');
+    } else {
+      // Write beside the target then rename: a killed download must never
+      // leave a truncated binary that exists and fails forever after.
+      await fs.writeFile(`${dest}.part`, buf);
+      await fs.rename(`${dest}.part`, dest);
+    }
+    await fs.chmod(dest, 0o755).catch(() => {});
+    console.log('  tunnel: cloudflared ready.');
+    return { bin: dest };
+  } catch (e) {
+    return { error: `could not download cloudflared: ${String(e?.message ?? e)}` };
+  }
+}
+
+async function resolveTunnelBin(provider) {
+  if (tunnelBin) return { bin: tunnelBin };
+  if (provider === 'funnel') {
+    // Funnel cannot be auto-installed: it needs a root daemon and an
+    // authenticated tailnet, neither of which this process can arrange.
+    if (onPath('tailscale')) return { bin: 'tailscale' };
+    return { error: 'tailscale is not installed. Funnel needs the daemon running and logged in (https://tailscale.com/download) — plain `--tunnel` needs nothing at all.' };
+  }
+  if (onPath('cloudflared')) return { bin: 'cloudflared' };
+  return await fetchCloudflared();
+}
+
+async function startTunnel(provider) {
+  const resolved = await resolveTunnelBin(provider);
+  if (resolved.error) return { error: resolved.error };
+  const bin = resolved.bin;
   const args = provider === 'funnel'
     ? ['funnel', String(port)]
     : ['tunnel', '--url', `http://127.0.0.1:${port}`, '--no-autoupdate'];
@@ -1200,6 +1285,17 @@ server.listen(port, host, () => {
     console.warn('  !! Editor, git, search and port forwarding all work regardless.');
     console.warn('  !! To enable the terminal, install a toolchain and reinstall:');
     console.warn('  !!   Debian/Ubuntu: apt-get install -y build-essential python3');
+    console.warn('');
+  }
+  // Two host binaries are load-bearing for whole panels and neither can be an
+  // npm dependency. Say so at boot instead of letting a panel look broken.
+  const missing = ['rg', 'git'].filter((b) => !onPath(b));
+  if (missing.length) {
+    console.warn('');
+    if (missing.includes('rg')) console.warn('  !! ripgrep (rg) is not on PATH — workspace search and quick open find nothing.');
+    if (missing.includes('git')) console.warn('  !! git is not on PATH — the source-control panel stays empty.');
+    console.warn(`  !!   Debian/Ubuntu: apt-get install -y ${missing.map((m) => (m === 'rg' ? 'ripgrep' : m)).join(' ')}`);
+    console.warn(`  !!   macOS:         brew install ${missing.map((m) => (m === 'rg' ? 'ripgrep' : m)).join(' ')}`);
     console.warn('');
   }
   const loopback = host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '::ffff:127.0.0.1';

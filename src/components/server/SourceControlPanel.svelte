@@ -195,8 +195,12 @@
       title={d.path}
       style="padding-left: {6 + depth * 14}px"
       onclick={() => toggleDir(key)}
+      data-depth={depth}
       onkeydown={(e) => { if (e.key === 'Enter') toggleDir(key); }}
     >
+      {#each Array(depth) as _, i}
+        <span class="guide" style="left: {12 + i * 14}px"></span>
+      {/each}
       <span class="chevron">{collapsed.has(key) ? '▸' : '▾'}</span>
       <img class="ficon" alt="" aria-hidden="true" src={folderIconUrl(leafName(d.name), !collapsed.has(key))} />
       <span class="fname dirname">{d.name}</span>
@@ -224,6 +228,9 @@
       onclick={() => onOpenDiff(repo, { path: f.path, staged: isStaged, untracked: f.untracked })}
       onkeydown={(e) => { if (e.key === 'Enter') onOpenDiff(repo, { path: f.path, staged: isStaged, untracked: f.untracked }); }}
     >
+      {#each Array(depth) as _, i}
+        <span class="guide" style="left: {12 + i * 14}px"></span>
+      {/each}
       <span class="chevron"></span>
       <img class="ficon" alt="" aria-hidden="true" src={fileIconUrl(leafName(f.path))} />
       <span class="fname">{leafName(f.path)}</span>
@@ -415,6 +422,7 @@
   }
   .section-head .icon-btn { margin-left: auto; }
   .filerow {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 6px;
@@ -423,6 +431,14 @@
     white-space: nowrap;
   }
   .filerow:hover { background: rgba(110, 118, 129, 0.12); }
+  .guide {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: #21262d;
+    pointer-events: none;
+  }
   .fname {
     flex: 1 1 0;
     overflow: hidden;

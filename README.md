@@ -30,13 +30,39 @@ https://github.com/user-attachments/assets/71694022-c26e-4ef5-9ecc-28074059191a
 Since v0.9.1 the same editor can be served over a real folder, turning it into a small browser IDE:
 
 ```bash
-npx @luutuankiet/gh-md-editor          # serves the current directory on http://127.0.0.1:8790
-npx @luutuankiet/gh-md-editor --port 9000 --host 0.0.0.0 --token secret
+npx @luutuankiet/gh-md-editor                        # current directory on http://127.0.0.1:8790
+npx @luutuankiet/gh-md-editor . --host 0.0.0.0 --port 9000 --auth secret
+npx @luutuankiet/gh-md-editor . --tunnel             # public HTTPS URL, auth forced on
 ```
 
 `.md` files open in the three-pane cockpit above; every other file opens in a plain CodeMirror editor with language auto-detect and syntax highlighting. Also included: a lazy file tree, preview/pinned tabs with `Cmd/Ctrl+S` write-back and mtime-conflict prompts, an integrated terminal (multiple persistent sessions), workspace search backed by ripgrep, a git source-control panel with line-level stage/revert, fuzzy quick open, and a listening-ports panel.
 
-It binds to loopback by default. Going beyond that with `--host` exposes a terminal, so pair it with `--token` or a reverse proxy that authenticates.
+### What the host needs
+
+Only Node ≥ 20 is required. Everything below is optional, degrades loudly at startup rather than failing, and never blocks the rest of the editor:
+
+| Want | Install on the host | Without it |
+|---|---|---|
+| Search + quick open (`Cmd/Ctrl+P`) | `ripgrep` | both come back empty, with the reason |
+| Source-control panel | `git` | the panel stays empty |
+| Integrated terminal | a C toolchain, so the optional `node-pty` can build: `build-essential python3` (Debian/Ubuntu) or Xcode CLT (macOS) | terminal disabled, one warning at boot |
+| `--tunnel` (public URL) | nothing — cloudflared is downloaded once into `~/.cache/gh-md-editor` | n/a |
+| `--tunnel funnel` | `tailscale`, running and logged in | falls back to a clear error; the local server keeps serving |
+
+A fully-loaded Debian/Ubuntu box is therefore:
+
+```bash
+apt-get install -y ripgrep git build-essential python3
+npx -y @luutuankiet/gh-md-editor . --host 0.0.0.0 --port 8790 --auth "$(openssl rand -hex 16)"
+```
+
+The listening-ports panel reads `/proc/net/tcp`, so it is Linux-only; elsewhere the panel accepts a port typed by hand.
+
+### Reaching it
+
+It binds to loopback by default. `--host 0.0.0.0` opens it to the network, which also exposes the terminal — pair that with `--auth <token>` or an authenticating reverse proxy.
+
+`--tunnel` skips all of that: it starts a cloudflared quick tunnel and prints a public HTTPS URL that works from a phone with no router config, no account and no signup. Because that URL is reachable by the whole internet, auth is forced on with a server-minted token baked into the printed link. If the tunnel binary is missing or dies, the local server carries on serving regardless. `--tunnel funnel` uses Tailscale Funnel instead for a stable hostname, and `--tunnel-bin <path>` points at a binary you already have.
 
 ## Dev
 

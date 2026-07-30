@@ -136,6 +136,16 @@
   let activeGroupId = $state(1);
 
   let activeGroup = $derived(groups.find((g) => g.id === activeGroupId) ?? groups[0]);
+  // VS Code prints the containing folder dimmed beside the filename so two
+  // tabs called index.ts stay distinguishable. Relative to the anchored
+  // workspace folder, empty for files sitting at its root.
+  function tabDir(p: string): string {
+    if (!p || p.includes(':')) return '';
+    const rel = folder && p.startsWith(`${folder}/`) ? p.slice(folder.length + 1) : p;
+    const i = rel.lastIndexOf('/');
+    return i === -1 ? '' : rel.slice(0, i);
+  }
+
   let activeTab = $derived(activeGroup.tabs.find((t) => t.path === activeGroup.activePath) ?? null);
   let title = $derived(
     rootInfo ? (folder ? `${rootInfo.root}/${folder}` : rootInfo.root) : folder
@@ -707,7 +717,7 @@
       <!-- Both views stay mounted: remounting the explorer would collapse every
            expanded folder, remounting search would drop the result set. -->
       <div class="side-view" class:hidden={sideView !== 'explorer'}>
-        <FileTree {folder} {rootInfo} onOpen={openFile} onOpenWorkspace={openWorkspace} onNewTerminal={newTerminalAt} />
+        <FileTree {folder} {rootInfo} activePath={activeGroup.activePath ?? ''} onOpen={openFile} onOpenWorkspace={openWorkspace} onNewTerminal={newTerminalAt} />
       </div>
       <div class="side-view" class:hidden={sideView !== 'search'}>
         <SearchPanel onOpen={(p, line) => openFile(p, { pinned: false, line })} />
@@ -751,6 +761,7 @@
                   onkeydown={(e) => { if (e.key === 'Enter') g.activePath = tab.path; }}
                 >
                   <span class="tab-name">{tab.name}</span>
+                  {#if tabDir(tab.path)}<span class="tab-dir">{tabDir(tab.path)}</span>{/if}
                   {#if isDirty(tab)}<span class="dirty-dot" aria-label="Unsaved changes">●</span>{/if}
                   <button
                     type="button"
@@ -1125,6 +1136,14 @@
     box-shadow: inset 0 -2px 0 #58a6ff;
   }
   .tab.preview .tab-name { font-style: italic; }
+  .tab-dir {
+    color: #6e7681;
+    font-size: 10.5px;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    direction: rtl;
+  }
   .dirty-dot {
     color: #58a6ff;
     font-size: 10px;

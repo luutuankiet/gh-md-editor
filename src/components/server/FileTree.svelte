@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack, tick } from 'svelte';
   import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
 
   type EntryType = 'dir' | 'file' | 'link';
@@ -12,9 +13,10 @@
     children: TreeNode[] | null;
   }
 
-  let { folder, rootInfo = null, onOpen, onOpenWorkspace, onNewTerminal }: {
+  let { folder, rootInfo = null, activePath = '', onOpen, onOpenWorkspace, onNewTerminal }: {
     folder: string;
     rootInfo?: { root: string; sep: string } | null;
+    activePath?: string;
     onOpen: (path: string, opts: { pinned: boolean }) => void;
     onOpenWorkspace: (path: string) => void;
     onNewTerminal: (cwd: string) => void;
@@ -22,6 +24,10 @@
 
   let roots = $state<TreeNode[]>([]);
   let rootError = $state('');
+  let treeEl = $state<HTMLDivElement | undefined>(undefined);
+  // The file backing the active editor tab: highlighted, its folders forced
+  // open, scrolled into view. Distinct from `selected` (multi-select).
+  let activeRow = $state('');
   // Cmd/Ctrl+click multi-select — a Set of node paths, reassigned (never
   // mutated) on change so Svelte sees it.
   let selected = $state<Set<string>>(new Set());
@@ -60,6 +66,54 @@
     fetchChildren(f)
       .then((nodes) => { roots = nodes; })
       .catch((err) => { rootError = err instanceof Error ? err.message : String(err); });
+  });
+
+  // Node paths carry the workspace-folder prefix; guides and reveal both
+  // reason in folder-relative segments, so strip it in one place.
+  function stripFolder(p: string): string {
+    return folder && p.startsWith(`${folder}/`) ? p.slice(folder.length + 1) : p;
+  }
+
+  // A depth-i guide line is lit when the active file lives underneath the
+  // ancestor folder at that depth — the vertical trail VS Code draws from the
+  // root down to whatever is open.
+  function guideLit(nodePath: string, i: number): boolean {
+    if (!activeRow) return false;
+    const anc = stripFolder(nodePath).split('/').slice(0, i + 1).join('/');
+    const act = stripFolder(activeRow);
+    return act === anc || act.startsWith(`${anc}/`);
+  }
+
+  // Reveal the active file: expand every ancestor, fetching children on the
+  // way so a never-opened subtree still opens, then scroll the row into view.
+  async function reveal(target: string) {
+    if (!target || target.includes(':')) { activeRow = ''; return; }
+    const segs = stripFolder(target).split('/');
+    let nodes = roots;
+    let acc = folder;
+    for (let i = 0; i < segs.length - 1; i++) {
+      acc = acc ? `${acc}/${segs[i]}` : segs[i];
+      const dir = nodes.find((n) => n.path === acc && n.type === 'dir');
+      if (!dir) return;
+      if (dir.children === null && !dir.loading) {
+        dir.loading = true;
+        try { dir.children = await fetchChildren(dir.path); }
+        catch { dir.children = []; }
+        finally { dir.loading = false; }
+      }
+      dir.expanded = true;
+      nodes = dir.children ?? [];
+    }
+    activeRow = target;
+    await tick();
+    treeEl?.querySelector<HTMLElement>(`[data-path="${CSS.escape(target)}"]`)?.scrollIntoView({ block: 'nearest' });
+  }
+
+  // untrack() is load-bearing: reveal both reads and mutates `roots`, so a
+  // tracked call would re-enter itself forever.
+  $effect(() => {
+    const target = activePath;
+    untrack(() => { void reveal(target); });
   });
 
   async function toggleDir(node: TreeNode) {
@@ -188,12 +242,17 @@
       type="button"
       class="row"
       class:selected={selected.has(node.path)}
+      class:active={node.path === activeRow}
+      data-path={node.path}
       style="padding-left: {8 + depth * 14}px"
       onclick={(e) => handleClick(e, node)}
       ondblclick={() => handleDblClick(node)}
       oncontextmenu={(e) => handleContextMenu(e, node)}
       title={node.path}
     >
+      {#each Array(depth) as _, i}
+        <span class="guide" class:lit={guideLit(node.path, i)} style="left: {14 + i * 14}px"></span>
+      {/each}
       <span class="chevron">{node.type === 'dir' ? (node.expanded ? '▾' : '▸') : ''}</span>
       <img
         class="icon"
@@ -210,7 +269,7 @@
   {/each}
 {/snippet}
 
-<div class="tree">
+<div class="tree" bind:this={treeEl}>
   {#if rootError}
     <div class="error">{rootError}</div>
   {:else}
@@ -252,6 +311,7 @@
     box-sizing: border-box;
   }
   .row {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 4px;
@@ -269,6 +329,16 @@
   }
   .row:hover { background: rgba(56, 139, 253, 0.12); }
   .row.selected { background: rgba(56, 139, 253, 0.22); }
+  .row.active { background: rgba(56, 139, 253, 0.16); }
+  .guide {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: #21262d;
+    pointer-events: none;
+  }
+  .guide.lit { background: #58a6ff; }
   .chevron {
     width: 12px;
     flex: 0 0 12px;

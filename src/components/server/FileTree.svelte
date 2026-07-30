@@ -12,15 +12,20 @@
     children: TreeNode[] | null;
   }
 
-  let { folder, onOpen, onOpenWorkspace }: {
+  let { folder, rootInfo = null, onOpen, onOpenWorkspace, onNewTerminal }: {
     folder: string;
+    rootInfo?: { root: string; sep: string } | null;
     onOpen: (path: string, opts: { pinned: boolean }) => void;
     onOpenWorkspace: (path: string) => void;
+    onNewTerminal: (cwd: string) => void;
   } = $props();
 
   let roots = $state<TreeNode[]>([]);
   let rootError = $state('');
-  let menu = $state<{ x: number; y: number; path: string; type: EntryType } | null>(null);
+  // Cmd/Ctrl+click multi-select — a Set of node paths, reassigned (never
+  // mutated) on change so Svelte sees it.
+  let selected = $state<Set<string>>(new Set());
+  let menu = $state<{ x: number; y: number; path: string; type: EntryType; paths: string[] } | null>(null);
   let toast = $state('');
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -75,7 +80,16 @@
     node.expanded = true;
   }
 
-  function handleClick(node: TreeNode) {
+  function handleClick(e: MouseEvent, node: TreeNode) {
+    if (e.metaKey || e.ctrlKey) {
+      // Cmd/Ctrl+click toggles selection membership without opening anything.
+      const next = new Set(selected);
+      if (next.has(node.path)) next.delete(node.path);
+      else next.add(node.path);
+      selected = next;
+      return;
+    }
+    if (selected.size) selected = new Set();
     if (node.type === 'dir') void toggleDir(node);
     else onOpen(node.path, { pinned: false });
   }
@@ -86,9 +100,11 @@
 
   function handleContextMenu(e: MouseEvent, node: TreeNode) {
     // Every row gets the menu — files for copy-as-context, dirs additionally
-    // for "Open workspace here".
+    // for "Open workspace here". Right-clicking inside a multi-selection acts
+    // on the whole selection; outside it, on the clicked row alone.
     e.preventDefault();
-    menu = { x: e.clientX, y: e.clientY, path: node.path, type: node.type };
+    const paths = selected.has(node.path) && selected.size > 1 ? [...selected] : [node.path];
+    menu = { x: e.clientX, y: e.clientY, path: node.path, type: node.type, paths };
   }
 
   // Click anywhere closes the menu. Listener registered only while the menu
@@ -129,10 +145,11 @@
     ta.remove();
   }
 
-  async function copyAsContext(target: string) {
+  async function copyAsContext(targets: string[]) {
     menu = null;
     try {
-      const r = await fetch(`/api/context?path=${encodeURIComponent(target)}&base=${encodeURIComponent(folder)}`);
+      const qs = targets.map((p) => `path=${encodeURIComponent(p)}`).join('&');
+      const r = await fetch(`/api/context?${qs}&base=${encodeURIComponent(folder)}&absolute=1`);
       const d = await r.json();
       if (!r.ok) { showToast(d.error ?? `HTTP ${r.status}`); return; }
       if (!d.files) { showToast('Nothing to copy (binary or empty).'); return; }
@@ -142,6 +159,27 @@
       showToast(e instanceof Error ? e.message : String(e));
     }
   }
+
+  // Client-side absolute join — /api/root already exposes root + sep, no
+  // extra server round-trip needed.
+  function absPath(rel: string): string {
+    if (!rootInfo) return rel;
+    if (!rel) return rootInfo.root;
+    return rootInfo.root + rootInfo.sep + rel.split('/').join(rootInfo.sep);
+  }
+
+  async function copyFullPath(paths: string[]) {
+    menu = null;
+    await toClipboard(paths.map(absPath).join('\n'));
+    showToast(paths.length === 1 ? 'Copied full path.' : `Copied ${paths.length} full paths.`);
+  }
+
+  function terminalHere(node: { path: string; type: EntryType }) {
+    menu = null;
+    // Files spawn the shell in their parent folder.
+    const dir = node.type === 'dir' ? node.path : node.path.split('/').slice(0, -1).join('/');
+    onNewTerminal(dir);
+  }
 </script>
 
 {#snippet rows(nodes: TreeNode[], depth: number)}
@@ -149,8 +187,9 @@
     <button
       type="button"
       class="row"
+      class:selected={selected.has(node.path)}
       style="padding-left: {8 + depth * 14}px"
-      onclick={() => handleClick(node)}
+      onclick={(e) => handleClick(e, node)}
       ondblclick={() => handleDblClick(node)}
       oncontextmenu={(e) => handleContextMenu(e, node)}
       title={node.path}
@@ -181,13 +220,19 @@
 
 {#if menu}
   <div class="ctx-menu" style="left: {menu.x}px; top: {menu.y}px" role="menu">
-    {#if menu.type === 'dir'}
+    {#if menu.type === 'dir' && menu.paths.length === 1}
       <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && pickWorkspace(menu.path)}>
         Open workspace here
       </button>
     {/if}
-    <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && copyAsContext(menu.path)}>
-      Copy as context
+    <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && copyAsContext(menu.paths)}>
+      Copy as context{#if menu.paths.length > 1}&nbsp;({menu.paths.length}){/if}
+    </button>
+    <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && copyFullPath(menu.paths)}>
+      Copy full path{#if menu.paths.length > 1}s&nbsp;({menu.paths.length}){/if}
+    </button>
+    <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && terminalHere(menu)}>
+      Open new terminal here
     </button>
   </div>
 {/if}
@@ -223,6 +268,7 @@
     line-height: 20px;
   }
   .row:hover { background: rgba(56, 139, 253, 0.12); }
+  .row.selected { background: rgba(56, 139, 253, 0.22); }
   .chevron {
     width: 12px;
     flex: 0 0 12px;

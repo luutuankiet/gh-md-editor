@@ -4,6 +4,7 @@
   import CodeTab from './server/CodeTab.svelte';
   import SourceControlPanel from './server/SourceControlPanel.svelte';
   import DiffTab from './server/DiffTab.svelte';
+  import SaveAsModal from './server/SaveAsModal.svelte';
 
   interface Tab {
     path: string;
@@ -15,6 +16,9 @@
     mtimeMs: number;
     binary?: boolean;
     error?: string;
+    // A blank Alt+N buffer never written to disk. `path` is a synthetic
+    // `untitled:` key until Save As assigns a real one.
+    untitled?: boolean;
     // Set by a search-result click; consumed by CodeTab to scroll + select.
     reveal?: { line: number; seq: number };
     // Present on kind === 'diff' tabs: which repo/file/side the tab shows.
@@ -144,6 +148,108 @@
       .catch(() => { /* title bar stays folder-only */ });
   });
 
+  // ---- Session persistence: reopen the same tabs/splits/panels after a
+  // browser close or crash. Snapshot lives in localStorage (debounced, plus a
+  // synchronous flush in beforeunload). Real files are NOT restored from the
+  // cache — restore re-fetches from disk so mtimeMs stays a live freshness
+  // token; a dirty buffer additionally carries its draft so a crash cannot
+  // eat edits. Keyed per workspace folder.
+  const SESSION_KEY = `ghmd.session:${folder}`;
+  const DRAFT_CAP = 512 * 1024;
+  let sessionRestored = false;
+  let sessionTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function sessionSnapshot() {
+    return {
+      activeGroupId,
+      sideView,
+      bottomView,
+      groups: groups.map((g) => ({
+        id: g.id,
+        size: g.size,
+        activePath: g.activePath,
+        tabs: g.tabs.map((t) => ({
+          path: t.path,
+          name: t.name,
+          kind: t.kind,
+          pinned: t.pinned,
+          git: t.git,
+          untitled: t.untitled,
+          // Untitled buffers live nowhere else; dirty files carry their draft.
+          content: t.untitled && t.content.length <= DRAFT_CAP ? t.content : undefined,
+          draft: !t.untitled && isDirty(t) && t.content.length <= DRAFT_CAP ? t.content : undefined,
+        })),
+      })),
+    };
+  }
+
+  function saveSessionNow() {
+    if (!sessionRestored) return;
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(sessionSnapshot())); } catch { /* quota — drop */ }
+  }
+
+  $effect(() => {
+    // Building the snapshot tracks every persisted field; the write itself is
+    // debounced so keystrokes don't hammer localStorage.
+    const json = JSON.stringify(sessionSnapshot());
+    if (!sessionRestored) return;
+    clearTimeout(sessionTimer);
+    sessionTimer = setTimeout(() => {
+      try { localStorage.setItem(SESSION_KEY, json); } catch { /* quota — drop */ }
+    }, 400);
+  });
+
+  async function restoreSession() {
+    let snap: any = null;
+    try { snap = JSON.parse(localStorage.getItem(SESSION_KEY) ?? 'null'); } catch { /* corrupt — fresh start */ }
+    if (!snap?.groups?.length) { sessionRestored = true; return; }
+    const restored: Group[] = [];
+    for (const g of snap.groups) {
+      const grp: Group = { id: g.id, size: g.size ?? 1, tabs: [], activePath: null };
+      for (const st of g.tabs ?? []) {
+        if (typeof st?.path !== 'string') continue;
+        let tab: Tab | null = null;
+        if (st.untitled) {
+          tab = { path: st.path, name: st.name ?? st.path, kind: 'code', pinned: true, content: st.content ?? '', savedContent: '', mtimeMs: 0, untitled: true };
+        } else if (st.kind === 'diff' && st.git) {
+          // Diff tabs own no content — DiffTab re-derives from git on mount.
+          tab = { path: st.path, name: st.name ?? st.path, kind: 'diff', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0, git: st.git };
+        } else {
+          try {
+            const res = await fetch(`/api/file?path=${encodeURIComponent(st.path)}`);
+            if (!res.ok) continue; // vanished since last session — drop the tab
+            const data = await res.json();
+            if (data.binary) {
+              tab = { path: st.path, name: st.name ?? baseName(st.path), kind: 'code', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: data.mtimeMs ?? 0, binary: true };
+            } else {
+              tab = {
+                path: st.path,
+                name: st.name ?? baseName(st.path),
+                kind: kindOf(st.name ?? baseName(st.path)),
+                pinned: !!st.pinned,
+                content: typeof st.draft === 'string' ? st.draft : data.content,
+                savedContent: data.content,
+                mtimeMs: data.mtimeMs,
+              };
+            }
+          } catch { continue; }
+        }
+        if (tab) grp.tabs.push(tab);
+      }
+      grp.activePath = grp.tabs.some((t) => t.path === g.activePath) ? g.activePath : (grp.tabs[0]?.path ?? null);
+      if (grp.tabs.length) restored.push(grp);
+    }
+    if (restored.length) {
+      groups = restored;
+      nextGroupId = Math.max(...restored.map((g) => g.id)) + 1;
+      activeGroupId = restored.some((g) => g.id === snap.activeGroupId) ? snap.activeGroupId : restored[0].id;
+    }
+    if (snap.sideView === 'explorer' || snap.sideView === 'search') sideView = snap.sideView;
+    if (snap.bottomView === 'terminal' || snap.bottomView === 'ports') bottomView = snap.bottomView;
+    sessionRestored = true;
+  }
+  void restoreSession();
+
   function isDirty(t: Tab): boolean {
     return !t.binary && !t.error && t.content !== t.savedContent;
   }
@@ -249,8 +355,11 @@
     activeGroupId = home.id;
   }
 
+  let saveAs = $state<{ tab: Tab } | null>(null);
+
   async function saveTab(tab: Tab) {
     if (tab.binary || tab.error) return;
+    if (tab.untitled) { saveAs = { tab }; return; }
     const put = (baseMtimeMs: number) =>
       fetch('/api/file', {
         method: 'PUT',
@@ -281,6 +390,47 @@
         tab.mtimeMs = data.mtimeMs;
       }
     }
+  }
+
+  // Save As landed: the untitled buffer becomes a real file tab in place.
+  async function saveAsCommit(relPath: string) {
+    const tab = saveAs?.tab;
+    saveAs = null;
+    if (!tab) return;
+    const res = await fetch('/api/file', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: relPath, content: tab.content, createDirs: true }),
+    });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      window.alert(`Save failed: ${d.error ?? `HTTP ${res.status}`}`);
+      return;
+    }
+    const data = await res.json();
+    const oldPath = tab.path;
+    tab.path = relPath;
+    tab.name = baseName(relPath);
+    tab.kind = kindOf(tab.name);
+    tab.untitled = false;
+    tab.savedContent = tab.content;
+    tab.mtimeMs = data.mtimeMs;
+    for (const g of groups) if (g.activePath === oldPath) g.activePath = relPath;
+    window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
+  }
+
+  // Alt/Opt+N — blank buffer, VS Code's untitled model. Pinned from birth: a
+  // preview-slot untitled tab would be silently replaced by the next open.
+  let untitledSeq = 1;
+  function newUntitledTab() {
+    const used = new Set(groups.flatMap((g) => g.tabs.map((t) => t.path)));
+    let n = untitledSeq;
+    while (used.has(`untitled:Untitled-${n}`)) n++;
+    untitledSeq = n + 1;
+    const tab: Tab = { path: `untitled:Untitled-${n}`, name: `Untitled-${n}`, kind: 'code', pinned: true, content: '', savedContent: '', mtimeMs: 0, untitled: true };
+    const home = activeGroup;
+    home.tabs.push(tab);
+    home.activePath = tab.path;
   }
 
   function closeTab(g: Group, path: string) {
@@ -420,6 +570,14 @@
     location.search = '?folder=' + encodeURIComponent(path);
   }
 
+  // Explorer context menu → spawn a shell cd'd into that folder. Reveal the
+  // panel first so the new tab is visible when it lands.
+  function newTerminalAt(cwd: string) {
+    layout.showBottom = true;
+    bottomView = 'terminal';
+    window.dispatchEvent(new CustomEvent('gmd:new-terminal', { detail: { cwd } }));
+  }
+
   $effect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.code === 'KeyS') {
@@ -428,6 +586,10 @@
       } else if (e.altKey && e.code === 'KeyW') {
         e.preventDefault();
         if (activeGroup.activePath) closeTab(activeGroup, activeGroup.activePath);
+      } else if (e.altKey && !e.metaKey && !e.ctrlKey && e.code === 'KeyN') {
+        // Alt/Opt+N — new untitled buffer (the browser owns plain Ctrl/Cmd+N).
+        e.preventDefault();
+        newUntitledTab();
       } else if ((e.metaKey || e.ctrlKey) && e.code === 'KeyB') {
         e.preventDefault();
         layout.showLeft = !layout.showLeft;
@@ -462,8 +624,10 @@
         }
       }
     };
-    // Always-on leave guard — unconditional by design.
+    // Always-on leave guard — unconditional by design. Also the last chance
+    // to flush the session snapshot (the autosave is debounced).
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      saveSessionNow();
       e.preventDefault();
       e.returnValue = '';
     };
@@ -543,7 +707,7 @@
       <!-- Both views stay mounted: remounting the explorer would collapse every
            expanded folder, remounting search would drop the result set. -->
       <div class="side-view" class:hidden={sideView !== 'explorer'}>
-        <FileTree {folder} onOpen={openFile} onOpenWorkspace={openWorkspace} />
+        <FileTree {folder} {rootInfo} onOpen={openFile} onOpenWorkspace={openWorkspace} onNewTerminal={newTerminalAt} />
       </div>
       <div class="side-view" class:hidden={sideView !== 'search'}>
         <SearchPanel onOpen={(p, line) => openFile(p, { pinned: false, line })} />
@@ -667,6 +831,16 @@
     </aside>
   </div>
 </div>
+
+{#if saveAs}
+  <SaveAsModal
+    root={rootInfo}
+    {folder}
+    initialName={saveAs.tab.name}
+    onCancel={() => { saveAs = null; }}
+    onSave={saveAsCommit}
+  />
+{/if}
 
 <style>
   .app {

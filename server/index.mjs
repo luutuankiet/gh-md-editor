@@ -29,6 +29,7 @@ try {
 import { spawn, spawnSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -42,16 +43,30 @@ let host = '127.0.0.1';
 let port = 8790;
 let auth = null;
 let rootArg = '.';
+let tunnel = null;      // 'cloudflared' | 'funnel'
+let tunnelBin = null;   // explicit binary path override
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--host') host = argv[++i];
   else if (a === '--port') port = Number(argv[++i]);
   else if (a === '--auth') auth = argv[++i];
+  else if (a === '--tunnel') {
+    // Optional value: bare `--tunnel` means cloudflared — the zero-setup path
+    // (no account, real TLS, WebSocket-clean, phone-openable).
+    tunnel = argv[i + 1] && !argv[i + 1].startsWith('--') && ['cloudflared', 'funnel'].includes(argv[i + 1])
+      ? argv[++i]
+      : 'cloudflared';
+  }
+  else if (a === '--tunnel-bin') tunnelBin = argv[++i];
   else if (a === '--help' || a === '-h') {
-    console.log('usage: node server/index.mjs [dir] [--host 127.0.0.1] [--port 8790] [--auth <token>]');
+    console.log('usage: node server/index.mjs [dir] [--host 127.0.0.1] [--port 8790] [--auth <token>] [--tunnel [cloudflared|funnel]] [--tunnel-bin <path>]');
     process.exit(0);
   } else if (!a.startsWith('--')) rootArg = a;
 }
+// A tunnel URL is reachable by the whole internet and /api/pty is a shell —
+// force auth on. The token is minted server-side (not user-supplied) so a
+// bare `--tunnel` can never ship an unauthenticated public shell.
+if (tunnel && !auth) auth = crypto.randomBytes(16).toString('base64url');
 const ROOT = path.resolve(process.cwd(), rootArg);
 
 // --- helpers ---------------------------------------------------------------
@@ -177,34 +192,48 @@ async function apiFileGet(res, params) {
 // skipped and counted; the whole payload is capped at MAX_BODY.
 const CONTEXT_SKIP_DIRS = new Set(['.git', 'node_modules']);
 async function apiContext(res, params) {
-  const abs = resolveSafe(params.get('path'));
-  if (!abs) return sendJson(res, 400, { error: 'path escapes root' });
+  // Multi-select sends several path params; each may be a file or a dir.
+  const rels = params.getAll('path');
+  if (rels.length === 0) return sendJson(res, 400, { error: 'path required' });
+  const targets = [];
+  for (const rel of rels) {
+    const abs = resolveSafe(rel);
+    if (!abs) return sendJson(res, 400, { error: 'path escapes root' });
+    targets.push(abs);
+  }
   const baseAbs = resolveSafe(params.get('base') ?? '.') ?? ROOT;
+  // absolute=1 → src attributes carry the host filesystem path. The payload
+  // is pasted into agent prompts that resolve files server-side, where a
+  // workspace-relative path is ambiguous.
+  const absolute = params.get('absolute') === '1';
   const files = [];
+  const seen = new Set();
   let skipped = 0;
-  const collect = async (p) => {
+  const collect = async (p, top) => {
     let st;
     try { st = await fs.stat(p); } catch { skipped++; return; }
     if (st.isDirectory()) {
-      if (p !== abs && CONTEXT_SKIP_DIRS.has(path.basename(p))) { skipped++; return; }
+      if (p !== top && CONTEXT_SKIP_DIRS.has(path.basename(p))) { skipped++; return; }
       let entries;
       try { entries = await fs.readdir(p); } catch { skipped++; return; }
       entries.sort((a, b) => a.localeCompare(b));
-      for (const name of entries) await collect(path.join(p, name));
+      for (const name of entries) await collect(path.join(p, name), top);
     } else if (st.isFile()) {
       if (st.size > MAX_FILE) { skipped++; return; }
+      if (seen.has(p)) return; // overlapping selections (dir + file inside it)
+      seen.add(p);
       files.push(p);
     }
   };
-  await collect(abs);
+  for (const abs of targets) await collect(abs, abs);
   const blocks = [];
   let total = 0;
   for (const p of files) {
     let buf;
     try { buf = await fs.readFile(p); } catch { skipped++; continue; }
     if (looksBinary(buf)) { skipped++; continue; }
-    const rel = path.relative(baseAbs, p).split(path.sep).join('/');
-    const block = `<file src="${rel}">\n${buf.toString('utf8')}\n</file>`;
+    const src = absolute ? p : path.relative(baseAbs, p).split(path.sep).join('/');
+    const block = `<file src="${src}">\n${buf.toString('utf8')}\n</file>`;
     total += block.length;
     if (total > MAX_BODY) return sendJson(res, 413, { error: `context exceeds ${MAX_BODY} bytes — select a smaller folder` });
     blocks.push(block);
@@ -223,7 +252,7 @@ async function apiFilePut(req, res) {
   } catch (e) {
     return sendJson(res, 400, { error: 'invalid JSON body' });
   }
-  const { path: rel, content, baseMtimeMs } = body ?? {};
+  const { path: rel, content, baseMtimeMs, createDirs } = body ?? {};
   if (typeof rel !== 'string' || typeof content !== 'string') {
     return sendJson(res, 400, { error: 'path and content required' });
   }
@@ -239,6 +268,9 @@ async function apiFilePut(req, res) {
         content: looksBinary(buf) ? null : buf.toString('utf8'),
       });
     }
+    // Save As can type a path whose folders don't exist yet — opt-in mkdir -p
+    // so the modal needs no separate mkdir round-trip.
+    if (createDirs) await fs.mkdir(path.dirname(abs), { recursive: true });
     // Atomic-ish write: temp file + rename, same dir so rename stays atomic.
     const tmp = path.join(path.dirname(abs), `.${path.basename(abs)}.gmd-tmp-${process.pid}`);
     await fs.writeFile(tmp, content, 'utf8');
@@ -420,6 +452,8 @@ async function serveStatic(res, urlPath) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  // Tunnel hygiene: the auth token can ride in the URL — never leak it via Referer.
+  res.setHeader('referrer-policy', 'no-referrer');
   if (!authorized(req, url)) {
     return sendJson(res, 401, { error: 'auth token required (--auth is enabled); open /?token=<token>' });
   }
@@ -442,8 +476,12 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { terminals: [...sessions.values()].map(sessionInfo) });
     }
     if (url.pathname === '/api/terminals' && req.method === 'POST') {
+      // "Open new terminal here": optional workspace-relative cwd.
+      const cwdRel = url.searchParams.get('cwd');
+      const cwdAbs = cwdRel ? resolveSafe(cwdRel) : null;
+      if (cwdRel && !cwdAbs) return sendJson(res, 400, { error: 'cwd escapes root' });
       try {
-        return sendJson(res, 200, sessionInfo(createSession()));
+        return sendJson(res, 200, sessionInfo(createSession(cwdAbs ?? undefined)));
       } catch (e) {
         return sendJson(res, 500, { error: `failed to spawn shell: ${String(e?.message ?? e)}` });
       }
@@ -962,7 +1000,7 @@ const SCROLLBACK = 200_000;
 const sessions = new Map();
 let termSeq = 0;
 
-function createSession() {
+function createSession(cwd) {
   if (!pty) throw new Error(`terminal unavailable — node-pty is not installed (${ptyError})`);
   const shell = process.env.SHELL || '/bin/bash';
   // Login shell so the user's rc/profile chain loads — same feel as the
@@ -971,12 +1009,13 @@ function createSession() {
     name: 'xterm-256color',
     cols: 80,
     rows: 24,
-    cwd: ROOT,
+    cwd: cwd ?? ROOT,
     env: { ...process.env, TERM: 'xterm-256color' },
   });
   const s = {
     id: `t${++termSeq}`,
-    title: path.basename(shell),
+    // "Open new terminal here" labels the tab with the folder it starts in.
+    title: cwd && cwd !== ROOT ? `${path.basename(shell)} — ${path.basename(cwd)}` : path.basename(shell),
     pty: p,
     pid: p.pid,
     buf: '',
@@ -1096,6 +1135,60 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
+// --- public tunnel (optional) ----------------------------------------------
+// `--tunnel` shells out to a tunnel binary as a CHILD process dialing
+// 127.0.0.1:<port> — the local server never blocks on it and keeps working if
+// it dies. Default provider is cloudflared's quick tunnel (no account, real
+// TLS, WebSocket-verified). `--tunnel funnel` uses Tailscale Funnel for a
+// stable hostname; note Funnel strips ?query on WS upgrades, so land on
+// /?token= first to pick up the auth cookie before the terminal connects.
+let tunnelChild = null;
+process.on('exit', () => { try { tunnelChild?.kill('SIGTERM'); } catch {} });
+
+function startTunnel(provider) {
+  const bin = tunnelBin ?? (provider === 'funnel' ? 'tailscale' : 'cloudflared');
+  const args = provider === 'funnel'
+    ? ['funnel', String(port)]
+    : ['tunnel', '--url', `http://127.0.0.1:${port}`, '--no-autoupdate'];
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      return resolve({ error: String(e?.message ?? e) });
+    }
+    tunnelChild = child;
+    let out = '';
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; clearTimeout(timer); resolve(r); } };
+    // cloudflared prints the URL on stderr, tailscale on stdout — watch both.
+    const scan = (d) => {
+      out += d;
+      const m = provider === 'funnel'
+        ? /https:\/\/[^\s|]+\.ts\.net[^\s|]*/.exec(out)
+        : /https:\/\/[a-z0-9-]+\.trycloudflare\.com/.exec(out);
+      if (m) finish({ url: m[0].replace(/\/+$/, '') });
+    };
+    child.stdout.on('data', scan);
+    child.stderr.on('data', scan);
+    child.on('error', (e) => {
+      finish({ error: e.code === 'ENOENT' ? `${bin} not found on PATH` : String(e.message ?? e) });
+    });
+    child.on('exit', (code) => {
+      if (!done) finish({ error: `${bin} exited ${code} before printing a URL${out ? `:\n${out.trim().split('\n').slice(-4).join('\n')}` : ''}` });
+      else console.error(`  !! tunnel process exited (${code}) — the public URL is dead; local server still up.`);
+      tunnelChild = null;
+    });
+    // No URL in 30s → give up but KEEP SERVING locally. Never exit non-zero
+    // here — a missing tunnel binary must not reproduce the node-pty
+    // silent-death failure shape.
+    const timer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch {}
+      finish({ error: 'no public URL after 30s — gave up (server keeps running locally)' });
+    }, 30_000);
+  });
+}
+
 server.listen(port, host, () => {
   console.log(`gh-md-editor server mode`);
   console.log(`  root: ${ROOT}`);
@@ -1117,5 +1210,19 @@ server.listen(port, host, () => {
     console.warn('  !! port a full shell running as your user.');
     console.warn('  !! Opt in to auth: --auth <token>  (then open /?token=<token>)');
     console.warn('');
+  }
+  if (tunnel) {
+    console.log(`  tunnel: starting ${tunnel}…`);
+    startTunnel(tunnel).then((r) => {
+      if (r.error) {
+        console.warn(`  !! tunnel failed: ${r.error}`);
+        console.warn('  !! local server unaffected — fix the tunnel binary and restart to retry.');
+        return;
+      }
+      console.log('');
+      console.log(`  PUBLIC: ${r.url}/?token=${auth}`);
+      console.log('  !! anyone with this full URL gets a shell as your user — share with care.');
+      console.log('  !! the tunnel dies when this process exits; the URL is not reusable.');
+    });
   }
 });

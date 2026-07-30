@@ -36,10 +36,10 @@
     }
   }
 
-  async function spawn() {
+  async function spawn(cwd?: string) {
     try {
       error = null;
-      const t = await api('/api/terminals', { method: 'POST' });
+      const t = await api(`/api/terminals${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ''}`, { method: 'POST' });
       terms = [...terms, t];
       activeId = t.id;
     } catch (e) {
@@ -73,7 +73,8 @@
   // Ctrl/Cmd+Shift+` — new terminal, VS Code's binding. Dispatched by the app
   // shell so it can reveal the panel first.
   $effect(() => {
-    const onNew = () => spawn();
+    // "Open new terminal here" rides the same event with a cwd detail.
+    const onNew = (e: Event) => spawn((e as CustomEvent).detail?.cwd);
     window.addEventListener('gmd:new-terminal', onNew);
     return () => window.removeEventListener('gmd:new-terminal', onNew);
   });

@@ -24,6 +24,7 @@ This can be wired into `.github/workflows/deploy.yml` on tag push — see `.clau
 
 | Version | Date | Theme |
 |---|---|---|
+| [v0.10.0](./v0.10.0.md) | 2026-07-30 | `--tunnel` exposes the server over public HTTPS via a cloudflared quick tunnel (or Tailscale Funnel), force-enabling a server-minted auth token. Editor sessions (tabs, splits, diffs, panels, unsaved drafts) persist across a browser close. `Alt/Opt+N` blank buffers with a click-through Save As dialog. Explorer multi-select, absolute paths in copied context, copy-full-path and open-terminal-here context items. |
 | [v0.9.1](./v0.9.1.md) | 2026-07-30 | Server mode — `npx @luutuankiet/gh-md-editor` serves any folder in the browser: file tree, tabs, terminal, ripgrep search, git source control, quick open, ports panel. `.md` opens the three-pane cockpit, everything else a plain syntax-highlighted editor. Editor gains a double-click word-highlight layer. First npm release via OIDC trusted publishing. |
 | [v0.8.1](./v0.8.1.md) | 2026-07-25 | Preview pane drops click-word highlighting, matching v0.8.0's editor-side removal. Clicking a word in the reading pane no longer shades every occurrence or paints blue scrollbar ticks; `Cmd/Ctrl+F` search is unchanged. |
 | [v0.8.0](./v0.8.0.md) | 2026-07-17 | Resolved GitHub-attachment images stop flickering / re-resolving on every keystroke (morphdom node preservation, same trick as mermaid blocks). Editor drops the eager cursor-word highlight — inline green + scrollbar implicit ticks removed; Cmd+F is the only word-find now. |

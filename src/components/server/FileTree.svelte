@@ -34,6 +34,9 @@
   let menu = $state<{ x: number; y: number; path: string; type: EntryType; paths: string[] } | null>(null);
   let toast = $state('');
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
+  let refreshing = $state(false);
+  // Shift+click extends from the last row touched by a plain or Cmd/Ctrl click.
+  let anchorPath = '';
 
   function joinPath(base: string, name: string): string {
     return base ? `${base}/${name}` : name;
@@ -134,7 +137,112 @@
     node.expanded = true;
   }
 
+  // Rows in the order they are painted, respecting collapsed folders — the
+  // coordinate space a shift-range has to be computed in.
+  function flatten(nodes: TreeNode[], out: string[] = []): string[] {
+    for (const n of nodes) {
+      out.push(n.path);
+      if (n.type === 'dir' && n.expanded && n.children) flatten(n.children, out);
+    }
+    return out;
+  }
+
+  function collectExpanded(nodes: TreeNode[], out: string[] = []): string[] {
+    for (const n of nodes) {
+      if (n.type === 'dir' && n.expanded) {
+        out.push(n.path);
+        if (n.children) collectExpanded(n.children, out);
+      }
+    }
+    return out;
+  }
+
+  // Collapse-all is a toggle, not a one-way door: the second press restores
+  // exactly the folders that were open before, so a mis-click costs nothing.
+  let lastExpanded: string[] = [];
+  let anyExpanded = $derived(collectExpanded(roots).length > 0);
+
+  function collapseAll(nodes: TreeNode[]) {
+    for (const n of nodes) {
+      if (n.type !== 'dir') continue;
+      n.expanded = false;
+      if (n.children) collapseAll(n.children);
+    }
+  }
+
+  async function toggleCollapseAll() {
+    const open = collectExpanded(roots);
+    if (open.length) {
+      lastExpanded = open;
+      collapseAll(roots);
+      return;
+    }
+    // collectExpanded reports parents before children, so replaying the list
+    // in order always has the parent open before its child is asked for.
+    for (const p of lastExpanded) await expandPath(p);
+  }
+
+  // Force a path open, fetching each level on the way. Unlike reveal() this
+  // expands the target itself, not just its ancestors.
+  async function expandPath(target: string) {
+    const segs = stripFolder(target).split('/');
+    let nodes = roots;
+    let acc = folder;
+    for (const seg of segs) {
+      acc = acc ? `${acc}/${seg}` : seg;
+      const dir = nodes.find((n) => n.path === acc && n.type === 'dir');
+      if (!dir) return;
+      if (dir.children === null) {
+        try { dir.children = await fetchChildren(dir.path); }
+        catch { dir.children = []; }
+      }
+      dir.expanded = true;
+      nodes = dir.children ?? [];
+    }
+  }
+
+  // Re-read the workspace from disk after something changed it behind our back
+  // (a terminal command, another session, an agent). The tree is rebuilt from
+  // scratch, then the previously-open folders and the active file are walked
+  // back open so the view looks untouched apart from the new reality.
+  async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
+    const open = collectExpanded(roots);
+    const keepActive = activeRow;
+    try {
+      roots = await fetchChildren(folder);
+      rootError = '';
+      for (const p of open) await expandPath(p);
+      if (keepActive) await reveal(keepActive);
+    } catch (err) {
+      rootError = err instanceof Error ? err.message : String(err);
+    } finally {
+      refreshing = false;
+    }
+  }
+
+  // The command palette's "Refresh Explorer" reaches the tree through here.
+  $effect(() => {
+    const on = () => { void refresh(); };
+    window.addEventListener('gmd:refresh-explorer', on);
+    return () => window.removeEventListener('gmd:refresh-explorer', on);
+  });
+
   function handleClick(e: MouseEvent, node: TreeNode) {
+    if (e.shiftKey && anchorPath) {
+      // Range select across the visible rows, VS Code style. No open, no
+      // anchor move — a second shift+click re-extends from the same anchor.
+      const flat = flatten(roots);
+      const a = flat.indexOf(anchorPath);
+      const b = flat.indexOf(node.path);
+      if (a >= 0 && b >= 0) {
+        const [lo, hi] = a <= b ? [a, b] : [b, a];
+        selected = new Set(flat.slice(lo, hi + 1));
+        return;
+      }
+    }
+    anchorPath = node.path;
     if (e.metaKey || e.ctrlKey) {
       // Cmd/Ctrl+click toggles selection membership without opening anything.
       const next = new Set(selected);
@@ -228,6 +336,38 @@
     showToast(paths.length === 1 ? 'Copied full path.' : `Copied ${paths.length} full paths.`);
   }
 
+  // Destructive and irreversible — confirmation is mandatory, and the server
+  // re-validates every path anyway (and refuses the workspace root).
+  async function deleteEntries(paths: string[]) {
+    menu = null;
+    if (!paths.length) return;
+    const names = paths.map((p) => p.split('/').pop()).join(', ');
+    const what = paths.length === 1 ? names : `${paths.length} items (${names})`;
+    if (!window.confirm(`Delete ${what}? Folders are removed with everything inside. This cannot be undone.`)) return;
+    const qs = paths.map((p) => `path=${encodeURIComponent(p)}`).join('&');
+    try {
+      const res = await fetch(`/api/entry?${qs}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+      const gone: string[] = data.deleted ?? [];
+      if (gone.length) {
+        // Tabs backed by a deleted file must not linger as ghosts.
+        window.dispatchEvent(new CustomEvent('gmd:paths-deleted', { detail: { paths: gone } }));
+        window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
+      }
+      showToast(
+        data.errors?.length
+          ? `Deleted ${gone.length}, failed ${data.errors.length}: ${data.errors[0].error}`
+          : `Deleted ${gone.length} item${gone.length === 1 ? '' : 's'}.`
+      );
+      selected = new Set();
+      anchorPath = '';
+      await refresh();
+    } catch (e) {
+      showToast(String((e as Error)?.message ?? e));
+    }
+  }
+
   function terminalHere(node: { path: string; type: EntryType }) {
     menu = null;
     // Files spawn the shell in their parent folder.
@@ -269,12 +409,41 @@
   {/each}
 {/snippet}
 
-<div class="tree" bind:this={treeEl}>
-  {#if rootError}
-    <div class="error">{rootError}</div>
-  {:else}
-    {@render rows(roots, 0)}
-  {/if}
+<div class="explorer">
+  <div class="ehead">
+    <span class="etitle">Explorer</span>
+    <button
+      type="button"
+      class="ebtn"
+      title={anyExpanded ? 'Collapse all folders' : 'Restore expanded folders'}
+      aria-label="Collapse all folders"
+      onclick={() => void toggleCollapseAll()}
+    >
+      {#if anyExpanded}
+        <svg class="stroke" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3.4 8 7l4-3.6" /><path d="M4 12.6 8 9l4 3.6" /></svg>
+      {:else}
+        <svg class="stroke" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 7 8 3.4 12 7" /><path d="M4 9 8 12.6 12 9" /></svg>
+      {/if}
+    </button>
+    <button
+      type="button"
+      class="ebtn"
+      class:busy={refreshing}
+      title="Refresh from disk"
+      aria-label="Refresh explorer"
+      disabled={refreshing}
+      onclick={() => void refresh()}
+    >
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5a5.5 5.5 0 1 0 5.32 6.9l-1.29-.34A4.2 4.2 0 1 1 8 3.8v2.2l3.2-2.75L8 .5z" /></svg>
+    </button>
+  </div>
+  <div class="tree" bind:this={treeEl}>
+    {#if rootError}
+      <div class="error">{rootError}</div>
+    {:else}
+      {@render rows(roots, 0)}
+    {/if}
+  </div>
 </div>
 
 {#if menu}
@@ -293,6 +462,10 @@
     <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && terminalHere(menu)}>
       Open new terminal here
     </button>
+    <div class="ctx-sep"></div>
+    <button type="button" role="menuitem" class="ctx-item danger" onclick={() => menu && void deleteEntries(menu.paths)}>
+      Delete{#if menu.paths.length > 1}&nbsp;({menu.paths.length}){/if}
+    </button>
   </div>
 {/if}
 {#if toast}
@@ -300,8 +473,52 @@
 {/if}
 
 <style>
-  .tree {
+  .explorer {
+    display: flex;
+    flex-direction: column;
     height: 100%;
+    min-height: 0;
+  }
+  .ehead {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px 4px 10px;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    opacity: 0.75;
+    border-bottom: 1px solid rgba(127, 127, 127, 0.22);
+  }
+  .etitle { flex: 1; }
+  .ebtn {
+    background: none;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    padding: 2px;
+    line-height: 0;
+    border-radius: 3px;
+  }
+  .ebtn:hover { background: rgba(127, 127, 127, 0.22); }
+  .ebtn svg { width: 14px; height: 14px; fill: currentColor; }
+  .ebtn svg.stroke {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .ebtn.busy { opacity: 0.5; }
+  .ctx-sep {
+    height: 1px;
+    margin: 4px 6px;
+    background: rgba(127, 127, 127, 0.28);
+  }
+  .ctx-item.danger { color: #f47067; }
+  .tree {
+    flex: 1;
+    min-height: 0;
     overflow: auto;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
     font-size: 13px;

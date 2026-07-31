@@ -15,7 +15,13 @@
 
   // Three-pane markdown cockpit hosted inside a tab of the server shell.
   // `value` is the tab's document content, owned by App-server.svelte.
-  let { value = $bindable('') }: { value?: string } = $props();
+  let { value = $bindable(''), name = '', reveal = null }: {
+    value?: string;
+    name?: string;
+    // Sidebar-outline jump, same channel the code editor uses. `seq` makes a
+    // repeat click on the same heading fire again.
+    reveal?: { line: number; seq: number } | null;
+  } = $props();
 
   // Per-pane theme state, localStorage-backed (same keys as the web app).
   let editorChoice = $state<ThemeChoice>(loadTheme('editor'));
@@ -48,10 +54,33 @@
 
   let doc = $state(untrack(() => value));
   let html = $state(untrack(() => parseMarkdown(doc)));
-  let splitPct = $state(50);
+  // Pane ratios are a workspace preference, not a per-file one: resize once and
+  // every markdown file opened afterwards inherits the layout. Keyed by the
+  // workspace anchor so separate folders keep separate layouts.
+  const wsKey = new URLSearchParams(location.search).get('folder') ?? '';
+  function loadPct(key: string, fallback: number): number {
+    try {
+      const raw = localStorage.getItem(`ghmd.${key}:${wsKey}`);
+      const n = raw === null ? NaN : Number(raw);
+      return Number.isFinite(n) && n > 5 && n < 95 ? n : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+  function savePct(key: string, v: number) {
+    try {
+      localStorage.setItem(`ghmd.${key}:${wsKey}`, String(Math.round(v)));
+    } catch {
+      /* private mode / quota — layout just won't persist */
+    }
+  }
+
+  let splitPct = $state(loadPct('mdSplit', 50));
   // outlineSplitterPct = splitter position from LEFT of shell, %. Outline pane is
   // RIGHT of splitter, so its width = 100 - outlineSplitterPct.
-  let outlineSplitterPct = $state(80);
+  let outlineSplitterPct = $state(loadPct('mdOutlineSplit', 80));
+  $effect(() => { savePct('mdSplit', splitPct); });
+  $effect(() => { savePct('mdOutlineSplit', outlineSplitterPct); });
   let editorView: EditorView | null = $state(null);
   let previewHost: HTMLElement | null = $state(null);
   let showShortcuts = $state(false);
@@ -87,6 +116,34 @@
   });
 
   let outline = $derived<OutlineNode[]>(extractOutline(doc));
+
+  // Feed the sidebar outline (shared with code tabs). Debounced so typing does
+  // not spray events at the shell.
+  $effect(() => {
+    const nodes = outline;
+    const nm = name;
+    const t = setTimeout(() => {
+      window.dispatchEvent(new CustomEvent('gmd:outline', { detail: { name: nm, nodes } }));
+    }, 200);
+    return () => clearTimeout(t);
+  });
+
+  // …and answer the shell's request on tab switch, without waiting for an edit.
+  $effect(() => {
+    const on = () => {
+      window.dispatchEvent(new CustomEvent('gmd:outline', { detail: { name, nodes: outline } }));
+    };
+    window.addEventListener('gmd:outline-request', on);
+    return () => window.removeEventListener('gmd:outline-request', on);
+  });
+
+  // Sidebar clicked a heading — reuse the cockpit's own jump path.
+  $effect(() => {
+    const r = reveal;
+    if (!r) return;
+    untrack(() => handleOutlineJump(r.line));
+  });
+
   let activeHeadingLine = $state(0);
   let editorTopLine = $state(1);
   // Track preview scrollTop so the sticky stack hides when the user is at the

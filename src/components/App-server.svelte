@@ -25,11 +25,32 @@
     git?: { repo: string; path: string; staged: boolean; untracked: boolean };
   }
 
+  import OutlinePanel from './server/OutlinePanel.svelte';
+  import type { OutlineNode } from '../lib/code-outline';
+
   const folder = new URLSearchParams(location.search).get('folder') ?? '';
 
   // Which view the left sidebar shows. Both stay mounted (CSS-hidden) so the
   // explorer keeps its expanded folders and search keeps its results.
   let sideView = $state<'explorer' | 'search'>('explorer');
+
+  // Outline lives as a collapsible section at the bottom of the explorer, VS
+  // Code style. Collapsed by default; the choice is remembered per workspace.
+  const OUTLINE_KEY = `ghmd.outlineOpen:${folder}`;
+  let outlineOpen = $state(
+    (() => {
+      try { return localStorage.getItem(OUTLINE_KEY) === '1'; }
+      catch { return false; }
+    })()
+  );
+  function toggleOutline(force?: boolean) {
+    outlineOpen = force ?? !outlineOpen;
+    try { localStorage.setItem(OUTLINE_KEY, outlineOpen ? '1' : '0'); }
+    catch { /* private mode — section just won't persist */ }
+  }
+  // Handle on the panel, so the header's collapse-all button can drive the
+  // fold state that lives inside it.
+  let outlinePanel = $state<{ toggleFoldAll: () => void } | undefined>(undefined);
   let revealSeq = 0;
 
   // Which view the bottom panel shows; the terminal keeps running when hidden.
@@ -40,33 +61,175 @@
   let qoQuery = $state('');
   let qoOpen = $state(false);
   let qoResults = $state<{ path: string }[]>([]);
+  // Which mode the current results were fetched under. The mode flips the
+  // instant the query string changes, but results arrive a round-trip later —
+  // without this tag, files left over from the previous query paint under the
+  // folder glyph, and picking one hands a file path to "open workspace here".
+  let qoResultsMode = $state<'file' | 'folder'>('file');
   let qoSel = $state(0);
   let qoSeq = 0;
 
+  // The header box does triple duty, VS Code style: bare text searches files,
+  // a leading `>` turns it into the command palette, a leading `#` into the
+  // folder picker (which the palette's Open Folder commands switch it to).
+  let qoFolderAction = $state<'same' | 'tab' | 'window'>('same');
+  let qoMode = $derived(qoQuery.startsWith('>') ? 'cmd' : qoQuery.startsWith('#') ? 'folder' : 'file');
+  let qoTerm = $derived(qoQuery.replace(/^[>#]\s*/, '').trim());
+  // Never show results that belong to a mode other than the one being typed.
+  let qoShown = $derived(qoResultsMode === qoMode ? qoResults : []);
+
+  const COMMANDS: { label: string; hint?: string; run: () => void }[] = [
+    { label: 'Open Folder…', hint: 'this tab', run: () => startFolderMode('same') },
+    { label: 'Open Folder in New Tab', run: () => startFolderMode('tab') },
+    { label: 'Open Folder in New Window', run: () => startFolderMode('window') },
+    { label: 'Close All Editor Tabs', run: closeAllTabs },
+    { label: 'Close Other Editor Tabs', run: closeOtherTabs },
+    { label: 'Refresh Explorer', run: () => window.dispatchEvent(new CustomEvent('gmd:refresh-explorer')) },
+    { label: 'Show Outline', run: () => { layout.showLeft = true; sideView = 'explorer'; toggleOutline(true); } },
+    { label: 'New Untitled File', hint: 'Alt+N', run: () => newUntitledTab() },
+  ];
+  let qoCommands = $derived(
+    qoTerm ? COMMANDS.filter((c) => c.label.toLowerCase().includes(qoTerm.toLowerCase())) : COMMANDS
+  );
+
   async function qoSearch() {
+    if (qoMode === 'cmd') { qoSel = 0; return; }
+    // Pin the mode at request time: the box can flip between send and receive.
+    const mode = qoMode === 'folder' ? 'folder' : 'file';
     const seq = ++qoSeq;
-    const qs = new URLSearchParams({ q: qoQuery.trim(), path: folder || '.' });
+    const qs = new URLSearchParams({ q: qoTerm, path: folder || '.' });
+    // Folder mode reuses the same endpoint; the server derives the directory
+    // set from its cached file list rather than spawning a second scan.
+    if (qoMode === 'folder') qs.set('dirs', '1');
     try {
       const r = await fetch(`/api/quickopen?${qs}`);
       const d = await r.json();
       if (seq !== qoSeq) return; // a newer keystroke owns the dropdown
       qoResults = d.files ?? [];
+      qoResultsMode = mode;
       qoSel = 0;
     } catch { /* dropdown keeps last results */ }
   }
 
-  function qoPick(p: string) {
+  function qoClose() {
     qoOpen = false;
     qoQuery = '';
+    qoResults = [];
     qoInput?.blur();
+  }
+
+  function workspaceUrl(path: string) {
+    return `${location.pathname}?folder=${encodeURIComponent(path)}`;
+  }
+
+  // Same anchor semantics as "Open workspace here", with VS Code's three
+  // destinations: this tab, a browser tab, a separate browser window.
+  function openWorkspaceIn(path: string, how: 'same' | 'tab' | 'window') {
+    const url = workspaceUrl(path);
+    if (how === 'tab') window.open(url, '_blank');
+    else if (how === 'window') window.open(url, '_blank', 'popup,width=1400,height=900');
+    else location.href = url;
+  }
+
+  function startFolderMode(how: 'same' | 'tab' | 'window') {
+    qoFolderAction = how;
+    qoQuery = '#';
+    qoOpen = true;
+    qoInput?.focus();
+    void qoSearch();
+  }
+
+  function qoPick(p: string, how: 'same' | 'tab' | 'window' = qoFolderAction) {
+    if (qoMode === 'folder') {
+      // Quick-open paths are relative to the anchored workspace; '.' is the
+      // anchor itself.
+      const target = p === '.' ? folder : folder ? `${folder}/${p}` : p;
+      qoClose();
+      openWorkspaceIn(target, how);
+      return;
+    }
+    qoClose();
     void openFile(folder ? `${folder}/${p}` : p, { pinned: false });
   }
 
+  function qoRun(i: number) {
+    const c = qoCommands[i];
+    if (!c) return;
+    qoClose();
+    c.run();
+  }
+
   function qoKeydown(e: KeyboardEvent) {
-    if (e.key === 'ArrowDown') { e.preventDefault(); qoSel = Math.min(qoSel + 1, qoResults.length - 1); }
+    const len = qoMode === 'cmd' ? qoCommands.length : qoShown.length;
+    if (e.key === 'ArrowDown') { e.preventDefault(); qoSel = Math.min(qoSel + 1, len - 1); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); qoSel = Math.max(qoSel - 1, 0); }
-    else if (e.key === 'Enter') { e.preventDefault(); if (qoResults[qoSel]) qoPick(qoResults[qoSel].path); }
+    else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (qoMode === 'cmd') { qoRun(qoSel); return; }
+      const hit = qoShown[qoSel];
+      if (hit) qoPick(hit.path, e.metaKey || e.ctrlKey ? 'tab' : e.shiftKey ? 'window' : qoFolderAction);
+    }
     else if (e.key === 'Escape') { qoOpen = false; qoInput?.blur(); }
+  }
+
+  // ---- Sidebar outline ----
+  // Editors push their structure up; only the active tab's push is kept, so
+  // the panel always describes what is actually on screen.
+  let outlineNodes = $state<OutlineNode[]>([]);
+  let outlineSubject = $state('');
+  let lastOutlineAsk = '';
+
+  $effect(() => {
+    const onOutline = (e: Event) => {
+      const d = (e as CustomEvent).detail as { name?: string; nodes?: OutlineNode[] } | null;
+      if (!d) return;
+      const active = activeTab;
+      if (!active || d.name !== active.name) return;
+      outlineNodes = d.nodes ?? [];
+      outlineSubject = active.name;
+    };
+    const onDeleted = (e: Event) => {
+      const paths: string[] = (e as CustomEvent).detail?.paths ?? [];
+      if (paths.length) dropTabsUnder(paths);
+    };
+    window.addEventListener('gmd:outline', onOutline);
+    window.addEventListener('gmd:paths-deleted', onDeleted);
+    return () => {
+      window.removeEventListener('gmd:outline', onOutline);
+      window.removeEventListener('gmd:paths-deleted', onDeleted);
+    };
+  });
+
+  // Switching tabs (or restoring a session) leaves the sidebar describing the
+  // wrong file until the new editor happens to push. Clear and ask instead of
+  // waiting — mounted editors answer the request immediately.
+  $effect(() => {
+    const nm = activeTab?.name ?? '';
+    // Guard on a plain variable, not reactive state: the active tab's object is
+    // written to constantly (content, mtime, reveal) and every write re-runs
+    // this effect. Without the guard those re-runs wipe the outline that was
+    // just delivered — which is exactly what happens during session restore.
+    if (nm === lastOutlineAsk) return;
+    lastOutlineAsk = nm;
+    outlineNodes = [];
+    outlineSubject = nm;
+    const ask = () => window.dispatchEvent(new CustomEvent('gmd:outline-request'));
+    ask();
+    // A restored tab only mounts once its content comes back from the server,
+    // which routinely lands after this effect has already asked. Keep asking on
+    // a short schedule until an editor answers, then stop. Reads of
+    // `outlineNodes` inside the timer are untracked, so this cannot self-retrigger.
+    let tries = 0;
+    const poll = setInterval(() => {
+      if (outlineNodes.length || ++tries > 8) clearInterval(poll);
+      else ask();
+    }, 300);
+    return () => clearInterval(poll);
+  });
+
+  function outlineJump(line: number) {
+    const t = activeTab;
+    if (t) t.reveal = { line, seq: ++revealSeq };
   }
 
   import TerminalPanel from './server/TerminalPanel.svelte';
@@ -455,6 +618,34 @@
     if (g.tabs.length === 0 && groups.length > 1) removeGroup(g.id);
   }
 
+  function closeAllTabs() {
+    for (const g of [...groups]) for (const t of [...g.tabs]) closeTab(g, t.path);
+  }
+
+  function closeOtherTabs() {
+    const keepGroup = activeGroupId;
+    const keepPath = activeGroup.activePath;
+    for (const g of [...groups]) {
+      for (const t of [...g.tabs]) {
+        if (g.id === keepGroup && t.path === keepPath) continue;
+        closeTab(g, t.path);
+      }
+    }
+  }
+
+  // A deleted file's tab has nothing left to save back to — drop it without the
+  // dirty prompt rather than leave a ghost buffer pointing at nothing.
+  function dropTabsUnder(paths: string[]) {
+    const hit = (p: string) => paths.some((d) => p === d || p.startsWith(`${d}/`));
+    for (const g of [...groups]) {
+      for (let i = g.tabs.length - 1; i >= 0; i--) if (hit(g.tabs[i].path)) g.tabs.splice(i, 1);
+      if (!g.tabs.some((t) => t.path === g.activePath)) {
+        g.activePath = g.tabs[g.tabs.length - 1]?.path ?? null;
+      }
+      if (g.tabs.length === 0 && groups.length > 1) removeGroup(g.id);
+    }
+  }
+
   function removeGroup(id: number) {
     const idx = groups.findIndex((g) => g.id === id);
     if (idx < 0 || groups.length === 1) return;
@@ -618,6 +809,12 @@
         qoInput?.focus();
         qoInput?.select();
         void qoSearch();
+      } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'KeyX') {
+        // Command palette — same box, `>` prefix, VS Code's binding.
+        e.preventDefault();
+        qoQuery = '>';
+        qoOpen = true;
+        qoInput?.focus();
       } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'Backquote') {
         // VS Code's new-terminal binding. Reveal the panel first, then let the
         // terminal panel (always mounted) do the spawn.
@@ -658,25 +855,44 @@
       <input
         bind:this={qoInput}
         class="qo-input"
-        placeholder="Go to file… (Ctrl+Shift+F)"
+        placeholder="Go to file… (Ctrl+Shift+F) — type &gt; for commands"
         bind:value={qoQuery}
         onfocus={() => { qoOpen = true; void qoSearch(); }}
         onblur={() => { qoOpen = false; }}
         oninput={() => void qoSearch()}
         onkeydown={qoKeydown}
       />
-      {#if qoOpen && qoResults.length}
+      {#if qoOpen && qoMode === 'cmd' && qoCommands.length}
         <div class="qo-drop">
-          {#each qoResults as r, i (r.path)}
+          {#each qoCommands as c, i (c.label)}
             <button
               type="button"
               class="qo-item"
               class:sel={i === qoSel}
-              onmousedown={(e) => { e.preventDefault(); qoPick(r.path); }}
+              onmousedown={(e) => { e.preventDefault(); qoRun(i); }}
             >
-              <img class="qo-icon" alt="" src={fileIconUrl(baseName(r.path))} />
-              <span class="qo-name">{baseName(r.path)}</span>
-              <span class="qo-path">{r.path}</span>
+              <span class="qo-glyph">›</span>
+              <span class="qo-name">{c.label}</span>
+              {#if c.hint}<span class="qo-path">{c.hint}</span>{/if}
+            </button>
+          {/each}
+        </div>
+      {:else if qoOpen && qoShown.length}
+        <div class="qo-drop">
+          {#each qoShown as r, i (r.path)}
+            <button
+              type="button"
+              class="qo-item"
+              class:sel={i === qoSel}
+              onmousedown={(e) => { e.preventDefault(); qoPick(r.path, e.metaKey || e.ctrlKey ? 'tab' : e.shiftKey ? 'window' : qoFolderAction); }}
+            >
+              {#if qoMode === 'folder'}
+                <span class="qo-glyph">▸</span>
+              {:else}
+                <img class="qo-icon" alt="" src={fileIconUrl(baseName(r.path))} />
+              {/if}
+              <span class="qo-name">{qoMode === 'folder' ? r.path : baseName(r.path)}</span>
+              {#if qoMode !== 'folder'}<span class="qo-path">{r.path}</span>{/if}
             </button>
           {/each}
         </div>
@@ -716,12 +932,41 @@
     <aside class="sidebar" class:hidden={!layout.showLeft} style="flex-basis: {layout.leftW}px">
       <!-- Both views stay mounted: remounting the explorer would collapse every
            expanded folder, remounting search would drop the result set. -->
-      <div class="side-view" class:hidden={sideView !== 'explorer'}>
-        <FileTree {folder} {rootInfo} activePath={activeGroup.activePath ?? ''} onOpen={openFile} onOpenWorkspace={openWorkspace} onNewTerminal={newTerminalAt} />
+      <div class="side-view stack" class:hidden={sideView !== 'explorer'}>
+        <div class="stack-item grow">
+          <FileTree {folder} {rootInfo} activePath={activeGroup.activePath ?? ''} onOpen={openFile} onOpenWorkspace={openWorkspace} onNewTerminal={newTerminalAt} />
+        </div>
+        <!-- Outline: collapsed by default, expands into the lower half. -->
+        <div class="stack-item outline" class:open={outlineOpen}>
+          <div class="section-head">
+            <button type="button" class="sec-main" onclick={() => toggleOutline()}>
+              <span class="sec-chev">{outlineOpen ? '▾' : '▸'}</span>
+              <span class="sec-title">Outline</span>
+              {#if outlineOpen && outlineSubject}<span class="sec-sub" title={outlineSubject}>{outlineSubject}</span>{/if}
+            </button>
+            {#if outlineOpen}
+              <button
+                type="button"
+                class="sec-btn"
+                title="Collapse or expand all sections"
+                aria-label="Collapse all outline sections"
+                onclick={() => outlinePanel?.toggleFoldAll()}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3.4 8 7l4-3.6" /><path d="M4 12.6 8 9l4 3.6" /></svg>
+              </button>
+            {/if}
+          </div>
+          {#if outlineOpen}
+            <div class="section-body">
+              <OutlinePanel bind:this={outlinePanel} nodes={outlineNodes} onJump={outlineJump} />
+            </div>
+          {/if}
+        </div>
       </div>
       <div class="side-view" class:hidden={sideView !== 'search'}>
         <SearchPanel onOpen={(p, line) => openFile(p, { pinned: false, line })} />
       </div>
+
     </aside>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="resizer v" class:hidden={!layout.showLeft} onpointerdown={(e) => startDrag(e, { left: true })}></div>
@@ -788,7 +1033,7 @@
                   {:else if at.kind === 'diff' && at.git}
                     <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} />
                   {:else if at.kind === 'md'}
-                    <MarkdownTab bind:value={at.content} />
+                    <MarkdownTab bind:value={at.content} name={at.name} reveal={at.reveal ?? null} />
                   {:else}
                     <CodeTab bind:value={at.content} filename={at.name} reveal={at.reveal ?? null} />
                   {/if}
@@ -1047,6 +1292,71 @@
   }
   .qo-item.sel, .qo-item:hover { background: rgba(56, 139, 253, 0.15); }
   .qo-icon { width: 16px; height: 16px; flex: 0 0 16px; }
+  .qo-glyph { width: 16px; flex: 0 0 16px; text-align: center; color: #8b949e; }
+  /* Explorer sidebar = stacked sections (tree + outline), VS Code style. */
+  .side-view.stack { display: flex; flex-direction: column; min-height: 0; }
+  .stack-item { display: flex; flex-direction: column; min-height: 0; }
+  .stack-item.grow { flex: 1 1 auto; }
+  .stack-item.outline { flex: 0 0 auto; border-top: 1px solid #30363d; }
+  .stack-item.outline.open { flex: 0 1 45%; }
+  .section-head {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    padding-right: 4px;
+    box-sizing: border-box;
+  }
+  .sec-main {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+    padding: 5px 8px;
+    background: none;
+    border: 0;
+    color: inherit;
+    font: inherit;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    opacity: 0.8;
+    cursor: pointer;
+    text-align: left;
+  }
+  .section-head:hover { background: rgba(127, 127, 127, 0.16); }
+  .sec-btn {
+    flex: 0 0 auto;
+    background: none;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    padding: 2px;
+    line-height: 0;
+    border-radius: 3px;
+    opacity: 0.8;
+  }
+  .sec-btn:hover { background: rgba(127, 127, 127, 0.28); }
+  .sec-btn svg {
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .sec-chev { flex: 0 0 10px; }
+  .sec-sub {
+    margin-left: auto;
+    text-transform: none;
+    letter-spacing: 0;
+    opacity: 0.7;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .section-body { flex: 1; min-height: 0; overflow: hidden; }
   .qo-name { flex: 0 0 auto; white-space: nowrap; }
   .qo-path {
     color: #8b949e;

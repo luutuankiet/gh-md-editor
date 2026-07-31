@@ -348,18 +348,57 @@ function fuzzyRank(q, p) {
   return score - p.length * 0.01;
 }
 
+// Explorer delete. Repeatable ?path= — one call handles a whole multi-select.
+// Every path is re-resolved through resolveSafe (a client is never trusted to
+// stay inside the workspace) and the workspace root itself is never removable.
+async function apiDeleteEntry(res, params) {
+  const rels = params.getAll('path').filter((p) => typeof p === 'string' && p.length);
+  if (!rels.length) return sendJson(res, 400, { error: 'path required' });
+  const deleted = [];
+  const errors = [];
+  for (const rel of rels) {
+    const abs = resolveSafe(rel);
+    if (!abs) { errors.push({ path: rel, error: 'path escapes root' }); continue; }
+    if (abs === ROOT) { errors.push({ path: rel, error: 'refusing to delete the workspace root' }); continue; }
+    try {
+      await fs.rm(abs, { recursive: true });
+      deleted.push(rel);
+    } catch (e) {
+      errors.push({ path: rel, error: String(e?.message ?? e) });
+    }
+  }
+  // The quick-open file list is now stale for every base it was cached under.
+  fileListCache.clear();
+  sendJson(res, 200, { deleted, errors });
+}
+
 async function apiQuickOpen(res, params) {
   const baseAbs = resolveSafe(params.get('path') || '.');
   if (!baseAbs) return sendJson(res, 400, { error: 'path escapes root' });
   const q = (params.get('q') ?? '').trim();
   const { files, truncated, error } = await listFiles(baseAbs);
   if (error) return sendJson(res, 200, { files: [], truncated: false, error });
+  // dirs=1 -> the command palette's folder picker. The directory set is derived
+  // from the already-cached `rg --files` listing (every ancestor of every file,
+  // deduped) so folder search costs no extra process spawn.
+  let pool = files;
+  if (params.get('dirs') === '1') {
+    const dirs = new Set(['.']);
+    for (const f of files) {
+      let i = f.lastIndexOf('/');
+      while (i > 0) {
+        dirs.add(f.slice(0, i));
+        i = f.lastIndexOf('/', i - 1);
+      }
+    }
+    pool = [...dirs].sort();
+  }
   let out;
   if (!q) {
-    out = files.slice(0, QUICKOPEN_CAP);
+    out = pool.slice(0, QUICKOPEN_CAP);
   } else {
     const ranked = [];
-    for (const p of files) {
+    for (const p of pool) {
       const s = fuzzyRank(q, p);
       if (s >= 0) ranked.push([s, p]);
     }
@@ -506,6 +545,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, ok ? 200 : 404, ok ? { ok: true } : { error: 'no such terminal' });
     }
     if (url.pathname === '/api/quickopen' && req.method === 'GET') return await apiQuickOpen(res, url.searchParams);
+    if (url.pathname === '/api/entry' && req.method === 'DELETE') return await apiDeleteEntry(res, url.searchParams);
     if (url.pathname === '/api/ports' && req.method === 'GET') return await apiPorts(res);
     if (url.pathname.startsWith('/api/')) return sendJson(res, 404, { error: 'unknown endpoint' });
     const px = parseProxyPath(url.pathname);

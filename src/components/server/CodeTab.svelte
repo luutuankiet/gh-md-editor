@@ -23,6 +23,8 @@
   import { languages } from '@codemirror/language-data';
   import { tags as t } from '@lezer/highlight';
 
+  import { outlineFromState } from '../../lib/code-outline';
+
   let { value = $bindable(''), filename, reveal = null }: {
     value?: string;
     filename: string;
@@ -35,6 +37,29 @@
   // $state so the reveal effect below re-runs once the view actually exists;
   // a plain let would leave a jump requested at open time silently dropped.
   let view = $state<EditorView | null>(null);
+
+  // Sidebar outline feed. Debounced because a parse-tree walk on every
+  // keystroke is wasted work, and deferred into a timer so the read of
+  // `filename` never lands inside the editor-creation effect's tracking scope.
+  let outlineTimer: ReturnType<typeof setTimeout> | undefined;
+  function pushOutline(vw: EditorView) {
+    clearTimeout(outlineTimer);
+    outlineTimer = setTimeout(() => {
+      window.dispatchEvent(new CustomEvent('gmd:outline', {
+        detail: { name: filename, nodes: outlineFromState(vw.state) },
+      }));
+    }, 200);
+  }
+
+  // The shell asks for a fresh push whenever the active tab changes.
+  $effect(() => {
+    const on = () => {
+      const vw = view;
+      if (vw) pushOutline(vw);
+    };
+    window.addEventListener('gmd:outline-request', on);
+    return () => window.removeEventListener('gmd:outline-request', on);
+  });
 
   const languageCompartment = new Compartment();
   const themeCompartment = new Compartment();
@@ -270,6 +295,7 @@
         EditorView.updateListener.of((u) => {
           if (u.docChanged) {
             value = u.state.doc.toString();
+            pushOutline(u.view);
           }
           if (
             u.docChanged || u.selectionSet || u.viewportChanged || u.geometryChanged ||
@@ -299,6 +325,7 @@
     untrack(() => {
       view = created;
     });
+    pushOutline(created);
 
     // Ticks on container resize (splitter drag) + initial pass. `created` is
     // a local and the tick fns only write state — no tracked reads added.
@@ -325,7 +352,10 @@
     const detected = LanguageDescription.matchFilename(languages, name);
     untrack(() => {
       selectedLanguage = detected ? detected.name : PLAIN;
-      void applyLanguage(selectedLanguage);
+      void applyLanguage(selectedLanguage).then(() => {
+        const vw = view;
+        if (vw) pushOutline(vw);
+      });
     });
   });
 

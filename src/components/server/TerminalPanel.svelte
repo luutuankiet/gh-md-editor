@@ -7,6 +7,10 @@
   // nothing and running output keeps streaming in the background.
   let { visible = true }: { visible?: boolean } = $props();
 
+  // Shells start in the workspace the session is anchored to, not the server's
+  // launch directory — same anchor the explorer and git panel read.
+  const folder = new URLSearchParams(location.search).get('folder') ?? '';
+
   type Term = { id: string; title: string; pid: number };
 
   let terms = $state<Term[]>([]);
@@ -39,7 +43,8 @@
   async function spawn(cwd?: string) {
     try {
       error = null;
-      const t = await api(`/api/terminals${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ''}`, { method: 'POST' });
+      const target = cwd ?? folder;
+      const t = await api(`/api/terminals${target ? `?cwd=${encodeURIComponent(target)}` : ''}`, { method: 'POST' });
       terms = [...terms, t];
       activeId = t.id;
     } catch (e) {

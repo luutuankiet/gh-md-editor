@@ -130,7 +130,7 @@
     position: fixed;
     inset: 0;
     z-index: 200;
-    background: rgba(1, 4, 9, 0.6);
+    background: rgba(0, 0, 0, 0.55);
     display: flex;
     align-items: flex-start;
     justify-content: center;
@@ -138,10 +138,10 @@
   }
   .modal {
     width: min(560px, 90vw);
-    background: #161b22;
-    border: 1px solid #30363d;
+    background: #272727;
+    border: 1px solid #404040;
     border-radius: 8px;
-    box-shadow: 0 12px 32px rgba(1, 4, 9, 0.9);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -151,19 +151,19 @@
     font-size: 11px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: #8b949e;
+    color: #949494;
   }
   .minput {
     margin: 4px 10px;
     padding: 5px 10px;
-    background: #010409;
-    border: 1px solid #30363d;
+    background: #1e1e1e;
+    border: 1px solid #404040;
     border-radius: 6px;
-    color: #c9d1d9;
+    color: #c5c8c6;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
     font-size: 12px;
   }
-  .minput:focus { outline: none; border-color: #58a6ff; }
+  .minput:focus { outline: none; border-color: #e58520; }
   .merror {
     padding: 2px 14px;
     color: #ff7b72;
@@ -181,7 +181,7 @@
     width: 100%;
     border: none;
     background: transparent;
-    color: #c9d1d9;
+    color: #c5c8c6;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
     font-size: 12px;
     text-align: left;
@@ -189,13 +189,13 @@
     border-radius: 4px;
     cursor: pointer;
   }
-  .mrow:hover { background: rgba(56, 139, 253, 0.15); }
+  .mrow:hover { background: #444444; }
   .micon { width: 16px; height: 16px; flex: 0 0 16px; }
   .mup {
     width: 16px;
     flex: 0 0 16px;
     text-align: center;
-    color: #8b949e;
+    color: #949494;
   }
   .mname {
     overflow: hidden;
@@ -208,18 +208,18 @@
     justify-content: flex-end;
     gap: 8px;
     padding: 8px 12px;
-    border-top: 1px solid #30363d;
+    border-top: 1px solid #404040;
   }
   .mbtn {
-    background: #21262d;
-    color: #c9d1d9;
-    border: 1px solid #30363d;
+    background: #353535;
+    color: #c5c8c6;
+    border: 1px solid #404040;
     border-radius: 6px;
     padding: 4px 14px;
     font-size: 12px;
     cursor: pointer;
   }
-  .mbtn:hover { border-color: #58a6ff; }
+  .mbtn:hover { border-color: #e58520; }
   .mbtn.primary {
     background: #238636;
     border-color: #2ea043;

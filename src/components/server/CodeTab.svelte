@@ -1,14 +1,13 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import { EditorView, lineNumbers, drawSelection, highlightActiveLine, keymap } from '@codemirror/view';
-  import { EditorState, Compartment } from '@codemirror/state';
+  import { EditorState, EditorSelection, Compartment } from '@codemirror/state';
   import { history, historyKeymap, defaultKeymap } from '@codemirror/commands';
   import {
     indentOnInput,
     bracketMatching,
     LanguageDescription,
     syntaxHighlighting,
-    HighlightStyle,
     defaultHighlightStyle,
     codeFolding,
     foldGutter,
@@ -17,20 +16,30 @@
   } from '@codemirror/language';
   import { indentFoldService } from '../../lib/fold-indent';
   import { TAB_DND_MIME, PATH_DND_MIME } from '../../lib/dnd';
-  import { search, searchKeymap, getSearchQuery } from '@codemirror/search';
+  import { search, searchKeymap, getSearchQuery, searchPanelOpen } from '@codemirror/search';
   import { indentationMarkers } from '@replit/codemirror-indentation-markers';
   import { wordHighlight, wordMatchRanges } from '../../lib/word-highlight';
   import { languages } from '@codemirror/language-data';
-  import { tags as t } from '@lezer/highlight';
+  import { monokaiCodeBundle } from '../../lib/monokai-dimmed';
 
   import { outlineFromState } from '../../lib/code-outline';
+  import { dotenvLanguage } from '../../lib/lang-dotenv';
+  import { expandSelection, shrinkSelection, resetSelectionHistory } from '../../lib/expand-selection';
+  import { formatDocumentText } from '../../lib/format-doc';
+
+  // One list, three consumers: the picker's name list, the picker's lookup,
+  // and filename auto-detection. Anything appended here has to be visible to
+  // all three or the picker and the detector disagree about what exists.
+  const LANGS = [dotenvLanguage, ...languages];
 
   let { value = $bindable(''), filename, reveal = null }: {
     value?: string;
     filename: string;
     // Search-result jump. `seq` is what makes a repeat click on the same line
     // fire again — a bare line number would compare equal and do nothing.
-    reveal?: { line: number; seq: number } | null;
+    // `select` carries a range to highlight instead of just placing the cursor,
+    // which is how an outline double-click selects a whole declaration.
+    reveal?: { line: number; seq: number; select?: { from: number; to: number } } | null;
   } = $props();
 
   let host: HTMLDivElement;
@@ -61,6 +70,42 @@
     return () => window.removeEventListener('gmd:outline-request', on);
   });
 
+  // Format Document. A refusal (wrong language, unparseable buffer) is
+  // surfaced as a notice rather than thrown, so the chord never looks dead.
+  let notice = $state('');
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+  function showNotice(msg: string) {
+    notice = msg;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => { notice = ''; }, 3000);
+  }
+
+  function formatDocument(vw: EditorView): boolean {
+    const before = vw.state.doc.toString();
+    const outcome = formatDocumentText(before, filename);
+    if (!outcome.ok) { showNotice(outcome.message); return true; }
+    if (outcome.text === before) { showNotice('Already formatted'); return true; }
+    // Reindenting shifts every offset in the document, so the cursor is
+    // restored by line number instead — the closest thing to "where you
+    // were" that survives a whole-document replace.
+    const line = vw.state.doc.lineAt(vw.state.selection.main.head).number;
+    vw.dispatch({ changes: { from: 0, to: vw.state.doc.length, insert: outcome.text } });
+    const doc = vw.state.doc;
+    const at = doc.line(Math.min(line, doc.lines));
+    vw.dispatch({ selection: EditorSelection.cursor(at.from), scrollIntoView: true });
+    return true;
+  }
+
+  // Same command, reached from the palette instead of the keyboard.
+  $effect(() => {
+    const on = () => {
+      const vw = view;
+      if (vw) formatDocument(vw);
+    };
+    window.addEventListener('gmd:format-document', on);
+    return () => window.removeEventListener('gmd:format-document', on);
+  });
+
   const languageCompartment = new Compartment();
   const themeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
@@ -79,46 +124,16 @@
   }
 
   const PLAIN = 'plain text';
-  const languageNames = [PLAIN, ...languages.map((l) => l.name).sort((a, b) => a.localeCompare(b))];
+  const languageNames = [PLAIN, ...LANGS.map((l) => l.name).sort((a, b) => a.localeCompare(b))];
   let selectedLanguage = $state(PLAIN);
 
-  // Minimal dark chrome — oneDark is not a dependency, and syntax colors for
-  // lazily-loaded grammars come from the default highlight style anyway.
-  const darkTheme = EditorView.theme({
-    '&': { backgroundColor: '#0d1117', color: '#c9d1d9' },
-    '.cm-gutters': { backgroundColor: '#0d1117', color: '#6e7681', border: 'none' },
-    '.cm-activeLine': { backgroundColor: 'rgba(110, 118, 129, 0.12)' },
-    '.cm-activeLineGutter': { backgroundColor: 'rgba(110, 118, 129, 0.12)' },
-    '.cm-cursor': { borderLeftColor: '#c9d1d9' },
-    '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': {
-      backgroundColor: 'rgba(56, 139, 253, 0.3)',
-    },
-  }, { dark: true });
   const lightTheme = EditorView.theme({}, { dark: false });
 
-  // GitHub-Dark token palette, matched to the #0d1117 chrome above. Without an
-  // explicit syntaxHighlighting() extension CodeMirror parses but never paints
-  // — basicSetup normally supplies one; this hand-rolled setup must too.
-  const darkHighlight = HighlightStyle.define([
-    { tag: [t.keyword, t.operatorKeyword, t.modifier, t.controlKeyword], color: '#ff7b72' },
-    { tag: [t.string, t.special(t.string), t.regexp], color: '#a5d6ff' },
-    { tag: [t.comment, t.lineComment, t.blockComment], color: '#8b949e', fontStyle: 'italic' },
-    { tag: [t.function(t.variableName), t.function(t.propertyName)], color: '#d2a8ff' },
-    { tag: [t.number, t.bool, t.atom, t.null, t.constant(t.variableName)], color: '#79c0ff' },
-    { tag: [t.typeName, t.className, t.namespace], color: '#ffa657' },
-    { tag: [t.propertyName, t.attributeName], color: '#79c0ff' },
-    { tag: t.tagName, color: '#7ee787' },
-    { tag: [t.definition(t.variableName), t.variableName], color: '#c9d1d9' },
-    { tag: [t.meta, t.processingInstruction], color: '#8b949e' },
-    { tag: t.heading, color: '#79c0ff', fontWeight: 'bold' },
-    { tag: t.link, color: '#a5d6ff', textDecoration: 'underline' },
-    { tag: t.emphasis, fontStyle: 'italic' },
-    { tag: t.strong, fontWeight: 'bold' },
-    { tag: t.invalid, color: '#f85149' },
-  ]);
-
-  // Theme + matching token colors travel together through one compartment.
-  const darkBundle = [darkTheme, syntaxHighlighting(darkHighlight)];
+  // Chrome and token colours both live in monokai-dimmed.ts, shared with the
+  // markdown pane. Without an explicit syntaxHighlighting() extension
+  // CodeMirror parses but never paints — basicSetup normally supplies one,
+  // and this hand-rolled setup has to as well; the bundle carries it.
+  const darkBundle = monokaiCodeBundle;
   const lightBundle = [lightTheme, syntaxHighlighting(defaultHighlightStyle, { fallback: true })];
 
   // Shell is dark-by-default (VS Code-like); only the markdown cockpit keeps
@@ -133,6 +148,10 @@
   let matchTicks = $state<number[]>([]);
   let currentTickY = $state<number | null>(null);
   let wordTicks = $state<number[]>([]);
+  // Find-box visibility mirrored out of CodeMirror state: the language picker
+  // and the find box both want the top-right corner, so the picker steps aside
+  // while the box is up. Written from recomputeMatchTicks, read only by markup.
+  let searchOpen = $state(false);
 
   function docPosToGutterY(vw: EditorView, pos: number): number | null {
     const scroller = vw.scrollDOM;
@@ -146,7 +165,15 @@
   }
 
   function recomputeMatchTicks(vw: EditorView) {
-    const q = getSearchQuery(vw.state);
+    // Gated on the panel, not just on the query. CodeMirror drops its own
+    // inline match decorations the instant the panel unmounts, but the query
+    // object survives — so ticks keyed off the query alone outlive the box that
+    // produced them. Escape now clears text highlights and ticks together, and
+    // Cmd+F brings both back with the query untouched. Double-click word
+    // highlights are a separate layer and are unaffected either way.
+    const panelOpen = searchPanelOpen(vw.state);
+    searchOpen = panelOpen;
+    const q = panelOpen ? getSearchQuery(vw.state) : null;
     if (!q || !q.search || !q.valid) {
       matchTicks = [];
       currentTickY = null;
@@ -200,7 +227,7 @@
       view.dispatch({ effects: languageCompartment.reconfigure([]) });
       return;
     }
-    const desc = languages.find((l) => l.name === name);
+    const desc = LANGS.find((l) => l.name === name);
     if (!desc) return;
     const support = await desc.load();
     // Re-check the picker hasn't moved on while the grammar was loading.
@@ -231,7 +258,7 @@
         indentationMarkers({
           highlightActiveBlock: true,
           hideFirstIndent: false,
-          colors: { light: '#d0d7de', dark: '#2f353d', activeLight: '#57606a', activeDark: '#8b949e' },
+          colors: { light: '#d0d7de', dark: '#3c3c3c', activeLight: '#606060', activeDark: '#949494' },
         }),
         search({ top: true }),
         wordHighlight,
@@ -243,8 +270,8 @@
         // bracket and BOTH boundaries need to be obvious at a glance.
         EditorView.theme({
           '.cm-matchingBracket, &.cm-focused .cm-matchingBracket': {
-            backgroundColor: 'rgba(56, 139, 253, 0.32)',
-            outline: '1px solid rgba(56, 139, 253, 0.9)',
+            backgroundColor: 'rgba(229, 133, 32, 0.35)',
+            outline: '1px solid rgba(84, 122, 255, 0.9)',
             borderRadius: '2px',
           },
           '.cm-nonmatchingBracket, &.cm-focused .cm-nonmatchingBracket': {
@@ -286,16 +313,30 @@
         }),
         // No Mod-s here — the shell owns save.
         keymap.of([
+          // Structural selection. Declared before defaultKeymap so these win
+          // the chord outright rather than depending on list order luck.
+          // Deliberately NOT bound to Mod-, which is Cmd on macOS and would
+          // shadow the platform-native select-to-line-start/end.
+          { key: 'Ctrl-Shift-ArrowLeft', preventDefault: true, run: expandSelection },
+          { key: 'Ctrl-Shift-ArrowRight', preventDefault: true, run: shrinkSelection },
+          // VS Code's own chord for the same pair on Windows/Linux. Left off
+          // macOS, where Alt+Shift+Arrow is native select-word-left/right.
+          { win: 'Alt-Shift-ArrowLeft', linux: 'Alt-Shift-ArrowLeft', preventDefault: true, run: expandSelection },
+          { win: 'Alt-Shift-ArrowRight', linux: 'Alt-Shift-ArrowRight', preventDefault: true, run: shrinkSelection },
           ...defaultKeymap,
           ...historyKeymap,
           ...searchKeymap,
           ...foldKeymap,
           { key: 'Alt-z', preventDefault: true, run: (vw) => { toggleWrap(vw); return true; } },
+          // VS Code's Format Document chord, same on every platform.
+          { key: 'Shift-Alt-f', preventDefault: true, run: formatDocument },
         ]),
         EditorView.updateListener.of((u) => {
           if (u.docChanged) {
             value = u.state.doc.toString();
             pushOutline(u.view);
+            // The ladder holds document offsets; an edit invalidates them.
+            resetSelectionHistory(u.view);
           }
           if (
             u.docChanged || u.selectionSet || u.viewportChanged || u.geometryChanged ||
@@ -310,6 +351,54 @@
             fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
             overflow: 'auto',
           },
+          // Float the find box instead of docking it. Left in the flex flow a
+          // panel shrinks .cm-scroller, which both pushes the text down and
+          // desyncs the tick rail: docPosToGutterY scales by scroller
+          // clientHeight while the rail spans the full container, so every tick
+          // lands short by the panel's height. Out of flow fixes both at once.
+          // Ported from the markdown pane, which has floated since v0.7.0.
+          // Colors live in editor-theme.ts (Compartment-swapped light/dark).
+          '.cm-panels': { backgroundColor: 'transparent', border: 'none' },
+          '.cm-panels.cm-panels-top': { borderBottom: 'none' },
+          '.cm-panel.cm-search': {
+            position: 'absolute',
+            top: '8px',
+            right: '30px',
+            maxWidth: '460px',
+            padding: '6px 8px',
+            backdropFilter: 'blur(8px)',
+            WebkitBackdropFilter: 'blur(8px)',
+            borderRadius: '6px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.12)',
+            display: 'flex',
+            flexWrap: 'wrap',
+            alignItems: 'center',
+            gap: '4px',
+            fontSize: '12px',
+            zIndex: '15',
+          },
+          '.cm-panel.cm-search input.cm-textfield': {
+            padding: '2px 6px',
+            fontSize: '12px',
+            minWidth: '180px',
+            borderRadius: '4px',
+          },
+          '.cm-panel.cm-search button[name]': {
+            padding: '2px 8px',
+            fontSize: '11px',
+            border: '1px solid transparent',
+            borderRadius: '3px',
+            background: 'transparent',
+            cursor: 'pointer',
+            color: 'inherit',
+          },
+          '.cm-panel.cm-search label': {
+            fontSize: '11px',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '2px',
+          },
+          '.cm-panel.cm-search br': { display: 'none' },
         }),
       ],
     });
@@ -349,7 +438,7 @@
   $effect(() => {
     const name = filename;
     if (!untrack(() => view)) return;
-    const detected = LanguageDescription.matchFilename(languages, name);
+    const detected = LanguageDescription.matchFilename(LANGS, name);
     untrack(() => {
       selectedLanguage = detected ? detected.name : PLAIN;
       void applyLanguage(selectedLanguage).then(() => {
@@ -365,7 +454,20 @@
     if (!r || !v) return;
     const doc = v.state.doc;
     const pos = doc.line(Math.min(Math.max(1, r.line), doc.lines)).from;
-    v.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: 'center' }) });
+    if (r.select) {
+      // Clamp: the outline is pushed asynchronously, so its offsets can
+      // describe a document that has since shrunk.
+      const from = Math.min(Math.max(0, r.select.from), doc.length);
+      const to = Math.min(Math.max(from, r.select.to), doc.length);
+      v.dispatch({
+        selection: EditorSelection.single(from, to),
+        // Anchor on the start: for a long declaration, seeing where it begins
+        // is more useful than seeing where it ends.
+        effects: EditorView.scrollIntoView(from, { y: 'center' }),
+      });
+    } else {
+      v.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: 'center' }) });
+    }
     v.focus();
     // A view created in this same tick has not measured its viewport yet, so
     // the scroll above can leave CodeMirror painting stranded rows from the
@@ -412,6 +514,7 @@
   </div>
   <select
     class="lang-picker"
+    class:hidden={searchOpen}
     bind:value={selectedLanguage}
     onchange={() => void applyLanguage(selectedLanguage)}
     title="Syntax language"
@@ -422,6 +525,9 @@
     {/each}
   </select>
 </div>
+{#if notice}
+  <div class="notice">{notice}</div>
+{/if}
 
 <style>
   .code-container {
@@ -458,7 +564,21 @@
     height: 3px;
     border-radius: 1px;
   }
-  .editor-tick-rail .tick.word { background: rgba(56, 139, 253, 0.9); }
+  .notice {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    background: #272727;
+    border: 1px solid #505050;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: #c5c8c6;
+    z-index: 120;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
+  .editor-tick-rail .tick.word { background: rgba(84, 122, 255, 0.9); }
   .editor-tick-rail .tick.match { background: rgba(255, 195, 0, 0.85); }
   .editor-tick-rail .tick.current {
     background: #ff6b00;
@@ -474,9 +594,13 @@
     font-size: 11px;
     padding: 2px 4px;
     border-radius: 4px;
-    border: 1px solid rgba(48, 54, 61, 0.7);
-    background: rgba(22, 27, 34, 0.9);
-    color: #c9d1d9;
+    border: 1px solid rgba(64, 64, 64, 0.7);
+    background: rgba(39, 39, 39, 0.9);
+    color: #c5c8c6;
     max-width: 160px;
+  }
+  /* The find box claims the same corner — yield to it, come back on Escape. */
+  .lang-picker.hidden {
+    display: none;
   }
 </style>

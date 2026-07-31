@@ -3,10 +3,11 @@
 // Two variants — light and dark — surfaced as Extension[] tuples ready to drop
 // into a Compartment so Editor.svelte can hot-swap them when the user toggles.
 //
-// Dark palette is GitHub's 'primer' dark scheme (#0d1117 surface, c9d1d9 fg,
-// ff7b72 / 79c0ff / d2a8ff / ffa657 token hues) — matches what
-// github-markdown-dark.css renders in the preview pane, so both panes feel
-// like the same editor when set to dark.
+// Light palette is GitHub's 'primer' light scheme. Dark is Monokai Dimmed,
+// defined once in monokai-dimmed.ts and shared with the server-mode code
+// editor so a fenced block here and the same file opened as a tab look alike.
+// (The preview pane still renders through github-markdown-css, a separate
+// engine with its own dark sheet — it does not follow this palette.)
 //
 // Why this file exists: pre-v0.7 the Editor declared only the LIGHT highlight
 // hex colors and relied on the browser's auto color-scheme to flip the editor
@@ -17,6 +18,7 @@ import { EditorView } from '@codemirror/view';
 import { HighlightStyle, syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language';
 import type { Extension } from '@codemirror/state';
 import { tags as t } from '@lezer/highlight';
+import { monokaiChrome, monokaiMarkdownHighlight } from './monokai-dimmed';
 
 export const lightHighlight = HighlightStyle.define([
   // Markdown-level tags
@@ -69,54 +71,8 @@ export const lightHighlight = HighlightStyle.define([
   { tag: t.invalid, color: '#cf222e', textDecoration: 'underline wavy' },
 ]);
 
-export const darkHighlight = HighlightStyle.define([
-  { tag: t.heading1, color: '#ff7b72', fontWeight: '700', fontSize: '1.18em' },
-  { tag: t.heading2, color: '#79c0ff', fontWeight: '700', fontSize: '1.10em' },
-  { tag: t.heading3, color: '#d2a8ff', fontWeight: '600' },
-  { tag: t.heading4, color: '#ffa657', fontWeight: '600' },
-  { tag: t.heading5, color: '#a5d6ff', fontWeight: '500' },
-  { tag: t.heading6, color: '#ffdfb6', fontWeight: '500' },
-  { tag: t.strong, color: '#c9d1d9', fontWeight: '700' },
-  { tag: t.emphasis, color: '#c9d1d9', fontStyle: 'italic' },
-  { tag: t.monospace, color: '#ffa657', backgroundColor: 'rgba(110,118,129,0.30)' },
-  { tag: t.link, color: '#58a6ff', textDecoration: 'underline' },
-  { tag: t.url, color: '#58a6ff' },
-  { tag: t.meta, color: '#8b949e' },
-  { tag: t.quote, color: '#8b949e', fontStyle: 'italic' },
-  { tag: t.list, color: '#c9d1d9' },
-  { tag: t.keyword, color: '#ff7b72', fontWeight: '600' },
-  { tag: t.controlKeyword, color: '#ff7b72', fontWeight: '600' },
-  { tag: t.operatorKeyword, color: '#ff7b72' },
-  { tag: t.definitionKeyword, color: '#ff7b72', fontWeight: '600' },
-  { tag: t.modifier, color: '#ff7b72' },
-  { tag: t.string, color: '#a5d6ff' },
-  { tag: t.special(t.string), color: '#a5d6ff' },
-  { tag: t.regexp, color: '#a5d6ff' },
-  { tag: t.number, color: '#79c0ff' },
-  { tag: t.atom, color: '#79c0ff' },
-  { tag: t.bool, color: '#79c0ff' },
-  { tag: t.null, color: '#79c0ff' },
-  { tag: t.comment, color: '#8b949e', fontStyle: 'italic' },
-  { tag: t.lineComment, color: '#8b949e', fontStyle: 'italic' },
-  { tag: t.blockComment, color: '#8b949e', fontStyle: 'italic' },
-  { tag: t.typeName, color: '#79c0ff' },
-  { tag: t.className, color: '#79c0ff', fontWeight: '500' },
-  { tag: t.variableName, color: '#c9d1d9' },
-  { tag: t.propertyName, color: '#d2a8ff' },
-  { tag: t.function(t.variableName), color: '#d2a8ff' },
-  { tag: t.function(t.propertyName), color: '#d2a8ff' },
-  { tag: t.definition(t.variableName), color: '#c9d1d9' },
-  { tag: t.standard(t.variableName), color: '#79c0ff' },
-  { tag: t.attributeName, color: '#d2a8ff' },
-  { tag: t.attributeValue, color: '#a5d6ff' },
-  { tag: t.tagName, color: '#7ee787' },
-  { tag: t.namespace, color: '#79c0ff' },
-  { tag: t.operator, color: '#ff7b72' },
-  { tag: t.punctuation, color: '#c9d1d9' },
-  { tag: t.bracket, color: '#c9d1d9' },
-  { tag: t.escape, color: '#79c0ff' },
-  { tag: t.invalid, color: '#ff7b72', textDecoration: 'underline wavy' },
-]);
+// Re-exported under the old names so every import site stays put.
+export const darkHighlight = monokaiMarkdownHighlight;
 
 // Editor chrome (surface, gutter, cursor, selection, search panel) per theme.
 // dark:true / dark:false signals to CM6 which default extension colors to use
@@ -152,35 +108,7 @@ export const lightEditorTheme = EditorView.theme({
   },
 }, { dark: false });
 
-export const darkEditorTheme = EditorView.theme({
-  '&': { backgroundColor: '#0d1117', color: '#c9d1d9' },
-  '.cm-content': { caretColor: '#c9d1d9' },
-  '.cm-gutters': {
-    backgroundColor: '#0d1117',
-    color: '#6e7681',
-    border: 'none',
-    borderRight: '1px solid #21262d',
-  },
-  '.cm-activeLine': { backgroundColor: 'rgba(56,139,253,0.10)' },
-  '.cm-activeLineGutter': { backgroundColor: 'rgba(56,139,253,0.18)' },
-  '.cm-selectionBackground, ::selection': { backgroundColor: 'rgba(56,139,253,0.40) !important' },
-  '.cm-focused .cm-selectionBackground': { backgroundColor: 'rgba(56,139,253,0.40) !important' },
-  '.cm-cursor': { borderLeftColor: '#c9d1d9' },
-  '.cm-panel.cm-search': {
-    background: 'rgba(22,27,34,0.96)',
-    border: '1px solid #30363d',
-    color: '#c9d1d9',
-  },
-  '.cm-panel.cm-search input.cm-textfield': {
-    background: '#0d1117',
-    border: '1px solid #30363d',
-    color: '#c9d1d9',
-  },
-  '.cm-panel.cm-search button[name]:hover': {
-    background: 'rgba(56,139,253,0.16)',
-    borderColor: '#30363d',
-  },
-}, { dark: true });
+export const darkEditorTheme = monokaiChrome;
 
 export function editorThemeExtensions(theme: 'light' | 'dark'): Extension[] {
   if (theme === 'dark') {

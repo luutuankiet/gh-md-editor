@@ -326,6 +326,7 @@
   // extra server round-trip needed.
   function absPath(rel: string): string {
     if (!rootInfo) return rel;
+    if (rel.startsWith('/')) return rel; // outside-root anchor: already absolute
     if (!rel) return rootInfo.root;
     return rootInfo.root + rootInfo.sep + rel.split('/').join(rootInfo.sep);
   }
@@ -522,8 +523,8 @@
     overflow: auto;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
     font-size: 13px;
-    background: #0d1117;
-    color: #c9d1d9;
+    background: #1e1e1e;
+    color: #c5c8c6;
     padding: 4px 0;
     box-sizing: border-box;
   }
@@ -544,23 +545,23 @@
     overflow: hidden;
     line-height: 20px;
   }
-  .row:hover { background: rgba(56, 139, 253, 0.12); }
-  .row.selected { background: rgba(56, 139, 253, 0.22); }
-  .row.active { background: rgba(56, 139, 253, 0.16); }
+  .row:hover { background: rgba(255, 255, 255, 0.07); }
+  .row.selected { background: rgba(229, 133, 32, 0.25); }
+  .row.active { background: rgba(255, 255, 255, 0.08); }
   .guide {
     position: absolute;
     top: 0;
     bottom: 0;
     width: 1px;
-    background: #21262d;
+    background: #353535;
     pointer-events: none;
   }
-  .guide.lit { background: #58a6ff; }
+  .guide.lit { background: #e58520; }
   .chevron {
     width: 12px;
     flex: 0 0 12px;
     display: inline-block;
-    color: #8b949e;
+    color: #949494;
   }
   .icon {
     width: 16px;
@@ -572,7 +573,7 @@
     text-overflow: ellipsis;
   }
   .name.dir { font-weight: 600; }
-  .loading { color: #8b949e; }
+  .loading { color: #949494; }
   .error {
     padding: 8px 12px;
     color: #ff7b72;
@@ -581,8 +582,8 @@
   .ctx-menu {
     position: fixed;
     z-index: 100;
-    background: #161b22;
-    border: 1px solid #30363d;
+    background: #272727;
+    border: 1px solid #404040;
     border-radius: 6px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
     padding: 4px;
@@ -601,18 +602,18 @@
     border-radius: 4px;
     cursor: pointer;
   }
-  .ctx-item:hover { background: rgba(56, 139, 253, 0.15); }
+  .ctx-item:hover { background: #444444; }
   .toast {
     position: fixed;
     left: 50%;
     bottom: 24px;
     transform: translateX(-50%);
-    background: #161b22;
-    border: 1px solid #30363d;
+    background: #272727;
+    border: 1px solid #404040;
     border-radius: 6px;
     padding: 6px 14px;
     font-size: 12px;
-    color: #c9d1d9;
+    color: #c5c8c6;
     z-index: 120;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
   }

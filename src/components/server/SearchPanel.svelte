@@ -227,7 +227,7 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
-    background: #0d1117;
+    background: #1e1e1e;
   }
   .sbar {
     flex: 0 0 auto;
@@ -240,12 +240,12 @@
     font-size: 11px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: #8b949e;
+    color: #949494;
   }
   .sbar-gap { flex: 1 1 auto; }
   .sbar-sub {
     font-size: 11px;
-    color: #6e7681;
+    color: #8a8a8a;
     white-space: nowrap;
   }
   .sfields {
@@ -258,18 +258,18 @@
   .sinput {
     display: flex;
     align-items: center;
-    background: #0d1117;
-    border: 1px solid #30363d;
+    background: #1e1e1e;
+    border: 1px solid #404040;
     border-radius: 4px;
   }
-  .sinput:focus-within { border-color: #58a6ff; }
+  .sinput:focus-within { border-color: #e58520; }
   .sinput input {
     flex: 1 1 auto;
     min-width: 0;
     padding: 3px 6px;
     border: none;
     background: transparent;
-    color: #c9d1d9;
+    color: #c5c8c6;
     font-size: 12px;
     outline: none;
   }
@@ -286,27 +286,27 @@
     border: none;
     border-radius: 3px;
     background: transparent;
-    color: #6e7681;
+    color: #8a8a8a;
     font-size: 11px;
     font-family: ui-monospace, Menlo, monospace;
     cursor: pointer;
   }
-  .sopts button:hover { background: #21262d; color: #c9d1d9; }
+  .sopts button:hover { background: #353535; color: #c5c8c6; }
   .sopts button.on {
-    background: #1f6feb55;
-    color: #c9d1d9;
-    box-shadow: inset 0 0 0 1px #58a6ff;
+    background: #3655b555;
+    color: #c5c8c6;
+    box-shadow: inset 0 0 0 1px #e58520;
   }
   .sglob {
     padding: 3px 6px;
-    border: 1px solid #30363d;
+    border: 1px solid #404040;
     border-radius: 4px;
     background: transparent;
-    color: #c9d1d9;
+    color: #c5c8c6;
     font-size: 12px;
     outline: none;
   }
-  .sglob:focus { border-color: #58a6ff; }
+  .sglob:focus { border-color: #e58520; }
   .sresults {
     flex: 1 1 0;
     min-height: 0;
@@ -316,7 +316,7 @@
   .smsg {
     padding: 6px 12px;
     font-size: 12px;
-    color: #8b949e;
+    color: #949494;
   }
   .smsg.err { color: #f85149; }
   .sfile-head {
@@ -327,17 +327,17 @@
     padding: 2px 8px 2px 4px;
     border: none;
     background: transparent;
-    color: #c9d1d9;
+    color: #c5c8c6;
     font-size: 12px;
     text-align: left;
     cursor: pointer;
   }
-  .sfile-head:hover { background: #161b22; }
+  .sfile-head:hover { background: #272727; }
   .chev {
     flex: 0 0 auto;
     width: 12px;
     height: 12px;
-    fill: #8b949e;
+    fill: #949494;
     transition: transform 0.1s linear;
   }
   .chev.open { transform: rotate(90deg); }
@@ -357,15 +357,15 @@
     direction: rtl;
     text-align: left;
     font-size: 11px;
-    color: #6e7681;
+    color: #8a8a8a;
   }
   .sfile-count {
     flex: 0 0 auto;
     min-width: 16px;
     padding: 0 5px;
     border-radius: 8px;
-    background: #21262d;
-    color: #8b949e;
+    background: #353535;
+    color: #949494;
     font-size: 10px;
     line-height: 15px;
     text-align: center;
@@ -383,17 +383,17 @@
     padding: 1px 8px 1px 20px;
     border: none;
     background: transparent;
-    color: #8b949e;
+    color: #949494;
     font-family: ui-monospace, Menlo, monospace;
     font-size: 11.5px;
     text-align: left;
     cursor: pointer;
   }
-  .shit:hover { background: #161b22; color: #c9d1d9; }
+  .shit:hover { background: #272727; color: #c5c8c6; }
   .shit-ln {
     flex: 0 0 auto;
     min-width: 26px;
-    color: #6e7681;
+    color: #8a8a8a;
     text-align: right;
   }
   .shit-text {
@@ -404,7 +404,7 @@
     white-space: pre;
   }
   mark {
-    background: #1f6feb66;
+    background: #3655b566;
     color: inherit;
     border-radius: 2px;
   }

@@ -51,6 +51,12 @@ export default defineConfig({
   build: {
     outDir: path.join(__dirname, 'dist', 'web'),
     emptyOutDir: true,
+    // Never inline an asset into the JS chunk. The file-icon set is ~1200
+    // SVGs; at the 4 KB default most of them were base64'd into the critical
+    // bundle, which every client pays for on first paint even though only a
+    // dozen icons are ever visible. As separate files they are fetched lazily
+    // and cached individually by the browser.
+    assetsInlineLimit: 0,
   },
   optimizeDeps: {
     // Pre-bundle the whole CM graph together so esbuild dedupes it into one

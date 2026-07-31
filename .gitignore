@@ -6,6 +6,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 gsd-lite/
+.env
+.env.*
+!.env.example
 .svelte-kit/
 .vite/
 .claude/

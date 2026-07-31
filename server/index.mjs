@@ -94,14 +94,33 @@ for (let i = 0; i < argv.length; i++) {
 // bare `--tunnel` can never ship an unauthenticated public shell.
 if (tunnel && !auth) auth = crypto.randomBytes(16).toString('base64url');
 const ROOT = path.resolve(process.cwd(), rootArg);
+// Shipped alongside this file and prepended to every integrated shell's PATH,
+// which is what makes `code-gh` resolve inside the terminal and nowhere else.
+const BIN_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), 'bin');
 
 // --- helpers ---------------------------------------------------------------
 
-// Resolve a client-supplied relative path against ROOT, rejecting escapes.
-// Returns null for any path that would land outside the served root.
+// Resolve a client-supplied path. Relative paths resolve against ROOT and
+// reject escapes; absolute paths pass through (see note in the body).
 function resolveSafe(rel) {
+  // Absolute paths pass through on purpose: the workspace browser anchors
+  // sessions anywhere on the machine, and the terminal is already a full
+  // shell as the running user — the root jail guards against *accidental*
+  // escapes, so it keeps applying to relative paths only.
+  if (typeof rel === 'string' && path.isAbsolute(rel)) return path.resolve(rel);
   const abs = path.resolve(ROOT, rel ?? '.');
   if (abs !== ROOT && !abs.startsWith(ROOT + path.sep)) return null;
+  return abs;
+}
+
+// The shape a path takes on its way back to the browser. Inside the served
+// root it stays relative, so URLs and session keys match every workspace that
+// already exists; outside it stays absolute, because the relative form would
+// be '../..' — exactly the shape resolveSafe rejects the moment the client
+// sends it back, which turned an outside-root open into a dead tab.
+function toClientPath(abs) {
+  if (abs === ROOT) return '.';
+  if (abs.startsWith(ROOT + path.sep)) return path.relative(ROOT, abs);
   return abs;
 }
 
@@ -191,6 +210,36 @@ async function apiTree(res, params) {
     a.name.localeCompare(b.name)
   );
   sendJson(res, 200, { entries: out });
+}
+
+// Directory listing for the workspace browser. Unlike /api/tree this speaks
+// ABSOLUTE paths and may leave the served root — its whole job is picking
+// the next anchor. Dotfolders are listed, as VS Code's remote dialog does.
+async function apiBrowse(res, params) {
+  const raw = params.get('path') || ROOT;
+  const abs = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(ROOT, raw);
+  let dirents;
+  try {
+    dirents = await fs.readdir(abs, { withFileTypes: true });
+  } catch (e) {
+    return sendJson(res, e.code === 'ENOENT' ? 404 : 500, { error: String(e.message ?? e), path: abs });
+  }
+  const out = [];
+  for (const e of dirents) {
+    let type = e.isDirectory() ? 'dir' : 'file';
+    // A symlinked directory must be descendable, so links resolve to what
+    // they point at (broken ones degrade to plain files).
+    if (e.isSymbolicLink()) {
+      try { type = (await fs.stat(path.join(abs, e.name))).isDirectory() ? 'dir' : 'file'; } catch { type = 'file'; }
+    }
+    out.push({ name: e.name, type });
+  }
+  out.sort((a, b) =>
+    (a.type === 'dir' ? 0 : 1) - (b.type === 'dir' ? 0 : 1) ||
+    a.name.localeCompare(b.name)
+  );
+  const parent = path.dirname(abs);
+  sendJson(res, 200, { path: abs, parent: parent === abs ? null : parent, sep: path.sep, entries: out });
 }
 
 async function apiFileGet(res, params) {
@@ -536,6 +585,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url.pathname === '/api/root' && req.method === 'GET') return await apiRoot(res);
     if (url.pathname === '/api/tree' && req.method === 'GET') return await apiTree(res, url.searchParams);
+    if (url.pathname === '/api/browse' && req.method === 'GET') return await apiBrowse(res, url.searchParams);
     if (url.pathname === '/api/file' && req.method === 'GET') return await apiFileGet(res, url.searchParams);
     if (url.pathname === '/api/file' && req.method === 'PUT') return await apiFilePut(req, res);
     if (url.pathname === '/api/search' && req.method === 'GET') return apiSearch(req, res, url.searchParams);
@@ -563,6 +613,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, ok ? 200 : 404, ok ? { ok: true } : { error: 'no such terminal' });
     }
     if (url.pathname === '/api/quickopen' && req.method === 'GET') return await apiQuickOpen(res, url.searchParams);
+    if (url.pathname === '/api/open' && req.method === 'POST') return await apiOpen(req, res);
     if (url.pathname === '/api/entry' && req.method === 'DELETE') return await apiDeleteEntry(res, url.searchParams);
     if (url.pathname === '/api/ports' && req.method === 'GET') return await apiPorts(res);
     if (url.pathname.startsWith('/api/')) return sendJson(res, 404, { error: 'unknown endpoint' });
@@ -671,7 +722,7 @@ function apiSearch(req, res, params) {
       if (ev.type === 'begin') {
         // Held back until the first match actually lands, so the client never
         // renders an empty file header.
-        pendingFile = path.relative(ROOT, rgText(ev.data.path));
+        pendingFile = toClientPath(path.resolve(ROOT, rgText(ev.data.path)));
       } else if (ev.type === 'match') {
         if (pendingFile !== null) {
           send({ t: 'f', path: pendingFile });
@@ -740,9 +791,10 @@ function cleanRepoPath(p) {
 // so the panel lists what the folder in view actually contains. Descending
 // alone is not enough: anchoring *inside* a checkout (~/dev/repo/src) finds
 // nothing below it, so the enclosing checkout is located by climbing first and
-// listed ahead of the rest. The climb stops at the start directory — every
-// other endpoint resolves repo ids against it, so a repo above it is
-// unaddressable and must not be offered.
+// listed ahead of the rest. For a workspace inside the start directory the
+// climb stops there — repo ids are relative to it, so a repo above would be
+// unaddressable. A workspace outside it addresses repos absolutely instead,
+// so that one climbs all the way to the filesystem root.
 async function findRepos(baseAbs = ROOT, depth = 2) {
   const found = [];
   const seen = new Set();
@@ -751,7 +803,7 @@ async function findRepos(baseAbs = ROOT, depth = 2) {
     seen.add(abs);
     found.push(abs);
   };
-  for (let abs = baseAbs; ; abs = path.dirname(abs)) {
+  for (let abs = baseAbs; ; ) {
     try {
       await fs.stat(path.join(abs, '.git'));
       add(abs);
@@ -759,7 +811,10 @@ async function findRepos(baseAbs = ROOT, depth = 2) {
     } catch {
       // not a checkout — keep climbing
     }
-    if (abs === ROOT || !abs.startsWith(ROOT)) break;
+    if (abs === ROOT) break;
+    const up = path.dirname(abs);
+    if (up === abs) break; // filesystem root — dirname('/') is '/'
+    abs = up;
   }
   async function walk(abs, d) {
     let entries;
@@ -779,7 +834,7 @@ async function findRepos(baseAbs = ROOT, depth = 2) {
     }
   }
   await walk(baseAbs, depth);
-  return found.map((a) => path.relative(ROOT, a) || '.');
+  return found.map(toClientPath);
 }
 
 // `## main...origin/main [ahead 1, behind 2]`, or `## HEAD (no branch)`, or
@@ -921,13 +976,14 @@ function rawDiff(repoAbs, rel, staged, untracked) {
 async function apiGitRepos(res, params) {
   // `base` is the workspace the client has open (the same value the explorer
   // and quick-open are anchored to). Absent means the whole start directory.
-  // Repo ids stay relative to the start directory whatever the base is —
-  // status, diff and action all resolve them that way.
+  // Repo ids take whatever shape toClientPath gives them — relative to the
+  // start directory inside it, absolute outside — and status, diff and action
+  // all resolve them back through resolveSafe, which accepts both.
   const baseAbs = resolveSafe(params?.get('base') || '.');
   if (!baseAbs) return sendJson(res, 400, { error: 'base escapes root' });
   const repos = [];
   for (const rel of await findRepos(baseAbs)) {
-    const abs = path.join(ROOT, rel === '.' ? '' : rel);
+    const abs = resolveSafe(rel) ?? ROOT;
     const st = git(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--branch'], abs);
     if (st.code !== 0 && !st.out) {
       repos.push({ repo: rel, error: st.err || 'git status failed' });
@@ -1093,7 +1149,46 @@ async function apiGitAction(req, res) {
 //   DELETE /api/terminals?id=x  → {ok:true}  kill the process
 // Data plane (WS): /api/pty?id=<id>, JSON envelopes both ways:
 //   client → server: {t:'d', d:string} stdin, {t:'r', cols, rows} resize
-//   server → client: {t:'d', d:string} output, {t:'x', code} shell exited
+//   server → client: {t:'d', d:string} output, {t:'x', code} shell exited,
+//                    {t:'open', kind, path, reuse} — `code-gh` asking the tab
+//                    that owns this shell to open something
+
+// POST /api/open {path, reuse, term} — the endpoint `code-gh` posts to.
+// Resolves the path inside the served root, decides file vs folder, then
+// pushes the request down the sockets of the terminal that asked, so the open
+// lands in the browser tab the command was actually typed in.
+async function apiOpen(req, res) {
+  let body;
+  try {
+    body = JSON.parse(String(await readBody(req)) || '{}');
+  } catch {
+    return sendJson(res, 400, { error: 'invalid JSON body' });
+  }
+  const rel = typeof body.path === 'string' && body.path ? body.path : '.';
+  const abs = resolveSafe(rel);
+  if (!abs) return sendJson(res, 400, { error: `path is outside the served root: ${rel}` });
+  let st;
+  try {
+    st = await fs.stat(abs);
+  } catch {
+    return sendJson(res, 404, { error: `no such file or directory: ${rel}` });
+  }
+  const s = sessions.get(String(body.term ?? ''));
+  if (!s) return sendJson(res, 404, { error: 'unknown terminal session' });
+  const kind = st.isDirectory() ? 'folder' : 'file';
+  const clientPath = toClientPath(abs);
+  const frame = JSON.stringify({ t: 'open', kind, path: clientPath, reuse: !!body.reuse });
+  let delivered = 0;
+  for (const ws of s.sockets) {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(frame);
+      delivered += 1;
+    }
+  }
+  if (!delivered) return sendJson(res, 409, { error: 'this terminal has no browser tab attached' });
+  return sendJson(res, 200, { ok: true, kind, path: clientPath });
+}
+
 const wss = new WebSocketServer({ noServer: true });
 
 // Per-session replay buffer. Enough to repaint a full screen plus history
@@ -1106,6 +1201,10 @@ let termSeq = 0;
 function createSession(cwd) {
   if (!pty) throw new Error(`terminal unavailable — node-pty is not installed (${ptyError})`);
   const shell = process.env.SHELL || '/bin/bash';
+  // Assigned before the spawn, not after, because the shell needs it in its
+  // environment: `code-gh` posts the id back, and that is how the server knows
+  // which browser tab asked for the open.
+  const id = `t${++termSeq}`;
   // Login shell so the user's rc/profile chain loads — same feel as the
   // VS Code integrated terminal.
   const p = pty.spawn(shell, ['-l'], {
@@ -1113,10 +1212,19 @@ function createSession(cwd) {
     cols: 80,
     rows: 24,
     cwd: cwd ?? ROOT,
-    env: { ...process.env, TERM: 'xterm-256color' },
+    env: {
+      ...process.env,
+      TERM: 'xterm-256color',
+      // Prepended rather than appended so the shim wins, but a user who ships
+      // their own `code-gh` earlier in PATH still gets theirs.
+      PATH: `${BIN_DIR}${path.delimiter}${process.env.PATH ?? ''}`,
+      GMD_TERM_ID: id,
+      GMD_PORT: String(port),
+      ...(auth ? { GMD_TOKEN: auth } : {}),
+    },
   });
   const s = {
-    id: `t${++termSeq}`,
+    id,
     // "Open new terminal here" labels the tab with the folder it starts in.
     title: cwd && cwd !== ROOT ? `${path.basename(shell)} — ${path.basename(cwd)}` : path.basename(shell),
     pty: p,

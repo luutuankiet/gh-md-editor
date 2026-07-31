@@ -75,8 +75,8 @@
     height: 100%;
     display: flex;
     flex-direction: column;
-    background: #0d1117;
-    color: #c9d1d9;
+    background: #1e1e1e;
+    color: #c5c8c6;
     font-size: 12px;
   }
   .bar {
@@ -85,29 +85,29 @@
     align-items: center;
     gap: 6px;
     padding: 6px 10px;
-    border-bottom: 1px solid #30363d;
+    border-bottom: 1px solid #404040;
   }
   .bar input {
     width: 140px;
-    background: #010409;
-    border: 1px solid #30363d;
+    background: #1e1e1e;
+    border: 1px solid #404040;
     border-radius: 4px;
-    color: #c9d1d9;
+    color: #c5c8c6;
     font-size: 12px;
     padding: 2px 8px;
   }
-  .bar input:focus { outline: none; border-color: #58a6ff; }
+  .bar input:focus { outline: none; border-color: #e58520; }
   .bar button, .btnlike {
-    border: 1px solid #30363d;
-    background: #21262d;
-    color: #c9d1d9;
+    border: 1px solid #404040;
+    background: #353535;
+    color: #c5c8c6;
     border-radius: 4px;
     font-size: 11px;
     padding: 2px 8px;
     cursor: pointer;
     text-decoration: none;
   }
-  .bar button:hover, .btnlike:hover { background: #30363d; }
+  .bar button:hover, .btnlike:hover { background: #404040; }
   .bar button.ghost { background: transparent; }
   .err { color: #f28b82; }
   .list {
@@ -122,40 +122,40 @@
     gap: 10px;
     padding: 3px 10px;
   }
-  .portrow:hover { background: rgba(56, 139, 253, 0.08); }
+  .portrow:hover { background: rgba(255, 255, 255, 0.05); }
   .pnum {
     flex: 0 0 48px;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
     color: #79c0ff;
   }
   .purl {
-    color: #8b949e;
+    color: #949494;
     text-decoration: none;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .purl:hover { color: #58a6ff; text-decoration: underline; }
+  .purl:hover { color: #e58520; text-decoration: underline; }
   .spacer { flex: 1 1 0; }
   .portrow button {
-    border: 1px solid #30363d;
+    border: 1px solid #404040;
     background: transparent;
-    color: #8b949e;
+    color: #949494;
     border-radius: 4px;
     font-size: 11px;
     padding: 1px 8px;
     cursor: pointer;
   }
-  .portrow button:hover { color: #c9d1d9; background: #21262d; }
+  .portrow button:hover { color: #c5c8c6; background: #353535; }
   .empty {
     padding: 20px;
     text-align: center;
-    color: #8b949e;
+    color: #949494;
   }
   .hint {
     flex: 0 0 auto;
     padding: 4px 10px 6px;
-    color: #6e7681;
+    color: #8a8a8a;
     font-size: 11px;
   }
 </style>

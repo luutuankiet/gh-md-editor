@@ -5,6 +5,7 @@
   import SourceControlPanel from './server/SourceControlPanel.svelte';
   import DiffTab from './server/DiffTab.svelte';
   import SaveAsModal from './server/SaveAsModal.svelte';
+  import WorkspaceBrowser from './server/WorkspaceBrowser.svelte';
 
   interface Tab {
     path: string;
@@ -20,7 +21,7 @@
     // `untitled:` key until Save As assigns a real one.
     untitled?: boolean;
     // Set by a search-result click; consumed by CodeTab to scroll + select.
-    reveal?: { line: number; seq: number };
+    reveal?: { line: number; seq: number; select?: { from: number; to: number } };
     // Present on kind === 'diff' tabs: which repo/file/side the tab shows.
     git?: { repo: string; path: string; staged: boolean; untracked: boolean };
   }
@@ -56,11 +57,14 @@
   // Which view the bottom panel shows; the terminal keeps running when hidden.
   let bottomView = $state<'terminal' | 'ports'>('terminal');
 
-  // ---- Quick open: header-center box, Ctrl/Cmd+Shift+F, fuzzy file dropdown ----
-  let qoInput: HTMLInputElement | null = null;
+  // ---- Quick open: centred modal, Ctrl/Cmd+Shift+F files, Ctrl/Cmd+Shift+X commands ----
   let qoQuery = $state('');
   let qoOpen = $state(false);
   let qoResults = $state<{ path: string }[]>([]);
+  // Surfaced in the modal instead of being swallowed: a failed lookup used to
+  // leave an empty dropdown that was indistinguishable from "no matches".
+  let qoError = $state('');
+  let qoLoading = $state(false);
   // Which mode the current results were fetched under. The mode flips the
   // instant the query string changes, but results arrive a round-trip later —
   // without this tag, files left over from the previous query paint under the
@@ -69,53 +73,241 @@
   let qoSel = $state(0);
   let qoSeq = 0;
 
-  // The header box does triple duty, VS Code style: bare text searches files,
-  // a leading `>` turns it into the command palette, a leading `#` into the
-  // folder picker (which the palette's Open Folder commands switch it to).
+  // One modal, four modes, chosen by prefix — VS Code's scheme: bare text
+  // searches files, `>` is the command palette, `#` the folder picker (which
+  // the palette's Open Folder commands switch it to), `@` the symbol list of
+  // whatever file is on screen.
   let qoFolderAction = $state<'same' | 'tab' | 'window'>('same');
-  let qoMode = $derived(qoQuery.startsWith('>') ? 'cmd' : qoQuery.startsWith('#') ? 'folder' : 'file');
-  let qoTerm = $derived(qoQuery.replace(/^[>#]\s*/, '').trim());
+  let qoMode = $derived(
+    qoQuery.startsWith('>')
+      ? 'cmd'
+      : qoQuery.startsWith('#')
+        ? 'folder'
+        : qoQuery.startsWith('@')
+          ? 'symbol'
+          : 'file'
+  );
+  let qoTerm = $derived(qoQuery.replace(/^[>#@]\s*/, '').trim());
   // Never show results that belong to a mode other than the one being typed.
   let qoShown = $derived(qoResultsMode === qoMode ? qoResults : []);
 
   const COMMANDS: { label: string; hint?: string; run: () => void }[] = [
-    { label: 'Open Folder…', hint: 'this tab', run: () => startFolderMode('same') },
-    { label: 'Open Folder in New Tab', run: () => startFolderMode('tab') },
-    { label: 'Open Folder in New Window', run: () => startFolderMode('window') },
+    { label: 'Open Workspace…', hint: 'this tab', run: () => { browse = { mode: 'workspace', action: 'same' }; } },
+    { label: 'Open Workspace in New Tab', run: () => { browse = { mode: 'workspace', action: 'tab' }; } },
+    { label: 'Open Workspace in New Window', run: () => { browse = { mode: 'workspace', action: 'window' }; } },
+    { label: 'Open File…', run: () => { browse = { mode: 'file', action: 'same' }; } },
     { label: 'Close All Editor Tabs', run: closeAllTabs },
     { label: 'Close Other Editor Tabs', run: closeOtherTabs },
     { label: 'Refresh Explorer', run: () => window.dispatchEvent(new CustomEvent('gmd:refresh-explorer')) },
+    { label: 'Refresh Outline', run: refreshOutline },
     { label: 'Show Outline', run: () => { layout.showLeft = true; sideView = 'explorer'; toggleOutline(true); } },
     { label: 'New Untitled File', hint: 'Alt+N', run: () => newUntitledTab() },
+    { label: 'Format Document', hint: 'Shift+Alt+F', run: () => window.dispatchEvent(new CustomEvent('gmd:format-document')) },
   ];
   let qoCommands = $derived(
     qoTerm ? COMMANDS.filter((c) => c.label.toLowerCase().includes(qoTerm.toLowerCase())) : COMMANDS
   );
 
   async function qoSearch() {
-    if (qoMode === 'cmd') { qoSel = 0; return; }
+    // Commands and symbols are filtered in memory; only files and folders
+    // involve the server.
+    if (qoMode === 'cmd' || qoMode === 'symbol') { qoSel = 0; return; }
     // Pin the mode at request time: the box can flip between send and receive.
     const mode = qoMode === 'folder' ? 'folder' : 'file';
+    if (!qoTerm) {
+      qoResults = [];
+      qoResultsMode = mode;
+      qoError = '';
+      qoLoading = false;
+      qoSel = 0;
+      return;
+    }
     const seq = ++qoSeq;
+    qoLoading = true;
     const qs = new URLSearchParams({ q: qoTerm, path: folder || '.' });
     // Folder mode reuses the same endpoint; the server derives the directory
     // set from its cached file list rather than spawning a second scan.
-    if (qoMode === 'folder') qs.set('dirs', '1');
+    if (mode === 'folder') qs.set('dirs', '1');
     try {
       const r = await fetch(`/api/quickopen?${qs}`);
+      if (!r.ok) throw new Error(`server returned ${r.status}`);
       const d = await r.json();
-      if (seq !== qoSeq) return; // a newer keystroke owns the dropdown
+      if (seq !== qoSeq) return; // a newer keystroke owns the list
       qoResults = d.files ?? [];
       qoResultsMode = mode;
+      qoError = '';
       qoSel = 0;
-    } catch { /* dropdown keeps last results */ }
+    } catch (err) {
+      if (seq !== qoSeq) return;
+      qoResults = [];
+      qoResultsMode = mode;
+      qoError = err instanceof Error ? err.message : String(err);
+    } finally {
+      if (seq === qoSeq) qoLoading = false;
+    }
+  }
+
+  // ---- Recently opened, so an empty query still offers somewhere to go ----
+  const RECENT_FILES_KEY = 'ghmd.recentFiles';
+  const RECENT_WS_KEY = 'ghmd.recentWorkspaces';
+  function readList<T>(key: string): T[] {
+    try {
+      const v = JSON.parse(localStorage.getItem(key) ?? '[]');
+      return Array.isArray(v) ? (v as T[]) : [];
+    } catch {
+      return [];
+    }
+  }
+  // Files are recorded with the workspace they were opened from, so switching
+  // workspaces does not offer paths that no longer resolve.
+  let recentFiles = $state<{ folder: string; path: string }[]>(readList(RECENT_FILES_KEY));
+  let recentWorkspaces = $state<string[]>(readList(RECENT_WS_KEY));
+
+  function noteRecentFile(path: string) {
+    const home = folder || '.';
+    const next = [{ folder: home, path }, ...recentFiles.filter((r) => r.path !== path || r.folder !== home)];
+    recentFiles = next.slice(0, 40);
+    localStorage.setItem(RECENT_FILES_KEY, JSON.stringify(recentFiles));
+  }
+
+  // Last five workspaces, most recent first. Reads the stored list rather than
+  // the reactive one so writing the result cannot re-trigger this effect.
+  let notedWorkspace = false;
+  $effect(() => {
+    const home = folder;
+    if (!home || notedWorkspace) return;
+    notedWorkspace = true;
+    const next = [home, ...readList<string>(RECENT_WS_KEY).filter((w) => w !== home)].slice(0, 5);
+    recentWorkspaces = next;
+    localStorage.setItem(RECENT_WS_KEY, JSON.stringify(next));
+  });
+
+  function flattenOutline(
+    list: OutlineNode[],
+    depth = 0,
+    out: { node: OutlineNode; depth: number }[] = []
+  ): { node: OutlineNode; depth: number }[] {
+    for (const n of list) {
+      out.push({ node: n, depth });
+      flattenOutline(n.children, depth + 1, out);
+    }
+    return out;
+  }
+
+  // Every mode reduces to the same row shape, so the modal renders one list
+  // and never has to know which mode produced it.
+  let qoItems = $derived.by<QoItem[]>(() => {
+    if (qoMode === 'cmd') {
+      return qoCommands.map((c) => ({
+        key: `cmd:${c.label}`,
+        label: c.label,
+        detail: c.hint,
+        glyph: '›',
+        run: c.run,
+      }));
+    }
+    if (qoMode === 'symbol') {
+      const needle = qoTerm.toLowerCase();
+      return flattenOutline(outlineNodes)
+        .filter(({ node }) => !needle || node.text.toLowerCase().includes(needle))
+        .slice(0, 200)
+        .map(({ node, depth }) => ({
+          key: `sym:${node.line}:${node.text}`,
+          label: `${'  '.repeat(depth)}${node.text}`,
+          detail: `line ${node.line}`,
+          glyph: '#',
+          run: () => outlineSelect(node),
+        }));
+    }
+    if (qoMode === 'folder') {
+      if (!qoTerm) {
+        return recentWorkspaces.map((p) => ({
+          key: `ws:${p}`,
+          label: baseName(p) || p,
+          detail: p,
+          glyph: '▸',
+          run: () => openWorkspaceIn(p, qoFolderAction),
+        }));
+      }
+      return qoShown.map((r) => ({
+        key: `dir:${r.path}`,
+        label: r.path,
+        glyph: '▸',
+        run: () => {
+          // Quick-open paths are relative to the anchored workspace; '.' is
+          // the anchor itself.
+          const target = r.path === '.' ? folder : folder ? `${folder}/${r.path}` : r.path;
+          openWorkspaceIn(target, qoFolderAction);
+        },
+      }));
+    }
+    if (!qoTerm) {
+      const home = folder || '.';
+      return recentFiles
+        .filter((r) => r.folder === home)
+        .slice(0, 20)
+        .map((r) => ({
+          key: `recent:${r.path}`,
+          label: baseName(r.path),
+          detail: r.path,
+          icon: fileIconUrl(baseName(r.path)),
+          run: () => void openFile(r.path, { pinned: false }),
+        }));
+    }
+    return qoShown.map((r) => ({
+      key: `file:${r.path}`,
+      label: baseName(r.path),
+      detail: r.path,
+      icon: fileIconUrl(baseName(r.path)),
+      run: () => void openFile(folder ? `${folder}/${r.path}` : r.path, { pinned: false }),
+    }));
+  });
+
+  let qoPlaceholder = $derived(
+    qoMode === 'cmd'
+      ? 'Type a command name'
+      : qoMode === 'folder'
+        ? 'Type a folder path to open as a workspace'
+        : qoMode === 'symbol'
+          ? 'Type a symbol name from the active file'
+          : 'Search files by name — > commands, # folders, @ symbols'
+  );
+
+  // Never a blank panel: every empty-list case says why it is empty.
+  let qoStatus = $derived(
+    qoError
+      ? `Search failed: ${qoError}`
+      : qoLoading
+        ? 'Searching…'
+        : qoMode === 'symbol'
+          ? 'No symbols in the active file'
+          : qoTerm
+            ? 'No matching results'
+            : qoMode === 'folder'
+              ? 'No recent workspaces yet — type a path'
+              : 'No recently opened files yet — type to search'
+  );
+
+  function qoShow(prefix: string) {
+    qoQuery = prefix;
+    qoResults = [];
+    qoError = '';
+    qoSel = 0;
+    qoOpen = true;
+    void qoSearch();
   }
 
   function qoClose() {
     qoOpen = false;
     qoQuery = '';
     qoResults = [];
-    qoInput?.blur();
+    qoError = '';
+    qoSel = 0;
+  }
+
+  function qoPickItem(item: QoItem) {
+    qoClose();
+    item.run();
   }
 
   function workspaceUrl(path: string) {
@@ -131,45 +323,45 @@
     else location.href = url;
   }
 
+  // The palette's three Open Folder entries differ only in where the chosen
+  // folder lands, so they all reopen the modal in folder mode with that intent
+  // remembered.
   function startFolderMode(how: 'same' | 'tab' | 'window') {
     qoFolderAction = how;
-    qoQuery = '#';
-    qoOpen = true;
-    qoInput?.focus();
-    void qoSearch();
+    qoShow('#');
   }
 
-  function qoPick(p: string, how: 'same' | 'tab' | 'window' = qoFolderAction) {
-    if (qoMode === 'folder') {
-      // Quick-open paths are relative to the anchored workspace; '.' is the
-      // anchor itself.
-      const target = p === '.' ? folder : folder ? `${folder}/${p}` : p;
-      qoClose();
-      openWorkspaceIn(target, how);
-      return;
-    }
-    qoClose();
-    void openFile(folder ? `${folder}/${p}` : p, { pinned: false });
+  // VS Code-style workspace browser: absolute-path navigation that can leave
+  // the served root (that is the point — /api/browse exists for it).
+  let browse = $state<{ mode: 'workspace' | 'file'; action: 'same' | 'tab' | 'window' } | null>(null);
+
+  function browseStartPath(): string {
+    if (folder.startsWith('/')) return folder; // already an absolute anchor
+    const r = rootInfo?.root;
+    if (!r) return folder || '/';
+    const s = rootInfo?.sep ?? '/';
+    return folder ? r + s + folder.split('/').join(s) : r;
   }
 
-  function qoRun(i: number) {
-    const c = qoCommands[i];
-    if (!c) return;
-    qoClose();
-    c.run();
+  // Inside the served root the short relative form keeps URLs and session
+  // keys identical to what every existing workspace uses; outside it stays
+  // absolute, which the server accepts everywhere.
+  function toWorkspacePath(abs: string): string {
+    const r = rootInfo?.root;
+    if (!r) return abs;
+    if (abs === r) return '';
+    const s = rootInfo?.sep ?? '/';
+    if (abs.startsWith(r + s)) return abs.slice(r.length + 1).split(s).join('/');
+    return abs;
   }
 
-  function qoKeydown(e: KeyboardEvent) {
-    const len = qoMode === 'cmd' ? qoCommands.length : qoShown.length;
-    if (e.key === 'ArrowDown') { e.preventDefault(); qoSel = Math.min(qoSel + 1, len - 1); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); qoSel = Math.max(qoSel - 1, 0); }
-    else if (e.key === 'Enter') {
-      e.preventDefault();
-      if (qoMode === 'cmd') { qoRun(qoSel); return; }
-      const hit = qoShown[qoSel];
-      if (hit) qoPick(hit.path, e.metaKey || e.ctrlKey ? 'tab' : e.shiftKey ? 'window' : qoFolderAction);
-    }
-    else if (e.key === 'Escape') { qoOpen = false; qoInput?.blur(); }
+  function browsePick(abs: string) {
+    const b = browse;
+    browse = null;
+    if (!b) return;
+    const p = toWorkspacePath(abs);
+    if (b.mode === 'workspace') openWorkspaceIn(p, b.action);
+    else void openFile(p, { pinned: true });
   }
 
   // ---- Sidebar outline ----
@@ -232,6 +424,33 @@
     if (t) t.reveal = { line, seq: ++revealSeq };
   }
 
+  // Double-click selects the whole declaration rather than parking the cursor
+  // on its first line — the offsets ride along on the node the panel drew.
+  function outlineSelect(node: OutlineNode) {
+    const t = activeTab;
+    if (t) t.reveal = { line: node.line, seq: ++revealSeq, select: { from: node.from, to: node.to } };
+  }
+
+  function refreshOutline() {
+    window.dispatchEvent(new CustomEvent('gmd:outline-request'));
+  }
+
+  // `code-gh` in the integrated terminal, relayed here by the terminal view.
+  // A folder replaces the workspace (in this tab with -r, a new one without);
+  // a file opens pinned, since asking for it by name is a deliberate act.
+  $effect(() => {
+    const onOpenRequest = (e: Event) => {
+      const d = (e as CustomEvent).detail as { kind?: string; path?: string; reuse?: boolean } | null;
+      if (!d?.path) return;
+      if (d.kind === 'folder') openWorkspaceIn(d.path, d.reuse ? 'same' : 'tab');
+      else void openFile(d.path, { pinned: true });
+    };
+    window.addEventListener('gmd:open-request', onOpenRequest);
+    return () => window.removeEventListener('gmd:open-request', onOpenRequest);
+  });
+
+  import QuickOpen from './server/QuickOpen.svelte';
+  import type { QoItem } from '../lib/quickopen';
   import TerminalPanel from './server/TerminalPanel.svelte';
   import SearchPanel from './server/SearchPanel.svelte';
   import PortsPanel from './server/PortsPanel.svelte';
@@ -243,12 +462,13 @@
     leftW: number;
     rightW: number;
     bottomH: number;
+    outlineH: number;
     showLeft: boolean;
     showRight: boolean;
     showBottom: boolean;
   }
   const LAYOUT_KEY = 'ghmd.layout';
-  const layoutDefaults: LayoutState = { leftW: 260, rightW: 320, bottomH: 220, showLeft: true, showRight: false, showBottom: false };
+  const layoutDefaults: LayoutState = { leftW: 260, rightW: 320, bottomH: 220, outlineH: 240, showLeft: true, showRight: false, showBottom: false };
   function loadLayout(): LayoutState {
     try {
       return { ...layoutDefaults, ...JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? '{}') };
@@ -263,17 +483,21 @@
 
   // One drag handler for edges AND the corner joint: the dims flags pick which
   // dimensions follow the pointer (corner = right + bottom simultaneously).
-  function startDrag(e: PointerEvent, dims: { left?: boolean; right?: boolean; bottom?: boolean }) {
+  function startDrag(e: PointerEvent, dims: { left?: boolean; right?: boolean; bottom?: boolean; outline?: boolean }) {
     e.preventDefault();
     const startX = e.clientX;
     const startY = e.clientY;
-    const { leftW, rightW, bottomH } = layout;
-    document.body.style.cursor = dims.right && dims.bottom ? 'nwse-resize' : dims.bottom ? 'row-resize' : 'col-resize';
+    const { leftW, rightW, bottomH, outlineH } = layout;
+    document.body.style.cursor =
+      dims.right && dims.bottom ? 'nwse-resize' : dims.bottom || dims.outline ? 'row-resize' : 'col-resize';
     document.body.style.userSelect = 'none';
     const onMove = (ev: PointerEvent) => {
       if (dims.left) layout.leftW = clamp(leftW + (ev.clientX - startX), 140, window.innerWidth * 0.5);
       if (dims.right) layout.rightW = clamp(rightW - (ev.clientX - startX), 160, window.innerWidth * 0.6);
       if (dims.bottom) layout.bottomH = clamp(bottomH - (ev.clientY - startY), 80, window.innerHeight * 0.8);
+      // The outline sits below the tree, so dragging the handle down gives it
+      // less height, not more.
+      if (dims.outline) layout.outlineH = clamp(outlineH - (ev.clientY - startY), 80, window.innerHeight * 0.7);
     };
     const onUp = () => {
       window.removeEventListener('pointermove', onMove);
@@ -310,8 +534,16 @@
   }
 
   let activeTab = $derived(activeGroup.tabs.find((t) => t.path === activeGroup.activePath) ?? null);
+  // A workspace outside the served root is already an absolute path, so
+  // prefixing the root again would print /served/root//home/ken/dev.
   let title = $derived(
-    rootInfo ? (folder ? `${rootInfo.root}/${folder}` : rootInfo.root) : folder
+    folder && folder.startsWith('/')
+      ? folder
+      : rootInfo
+        ? folder
+          ? `${rootInfo.root}/${folder}`
+          : rootInfo.root
+        : folder
   );
 
   $effect(() => {
@@ -451,6 +683,7 @@
         if (opts.line) existing.reveal = { line: opts.line, seq: ++revealSeq };
         activeGroupId = g.id;
         g.activePath = path;
+        noteRecentFile(path);
         return;
       }
     }
@@ -495,6 +728,7 @@
     }
     home.activePath = tab.path;
     activeGroupId = home.id;
+    noteRecentFile(tab.path);
   }
 
   // A diff tab is keyed by repo+side+path so the staged and working-tree
@@ -803,18 +1037,13 @@
         layout.showBottom = !layout.showBottom;
       } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'KeyF') {
         // Quick open (user-chosen binding — find-in-files moved to the
-        // activity-bar icon). Focus the header box, select any old query.
+        // activity-bar icon).
         e.preventDefault();
-        qoOpen = true;
-        qoInput?.focus();
-        qoInput?.select();
-        void qoSearch();
+        qoShow('');
       } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'KeyX') {
-        // Command palette — same box, `>` prefix, VS Code's binding.
+        // Command palette — same modal, `>` prefix.
         e.preventDefault();
-        qoQuery = '>';
-        qoOpen = true;
-        qoInput?.focus();
+        qoShow('>');
       } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'Backquote') {
         // VS Code's new-terminal binding. Reveal the panel first, then let the
         // terminal panel (always mounted) do the spawn.
@@ -851,53 +1080,17 @@
   <header class="titlebar">
     <span class="app-name">gh-md-editor</span>
     <span class="root-path" title={title}>{title}</span>
-    <div class="quickopen">
-      <input
-        bind:this={qoInput}
-        class="qo-input"
-        placeholder="Go to file… (Ctrl+Shift+F) — type &gt; for commands"
-        bind:value={qoQuery}
-        onfocus={() => { qoOpen = true; void qoSearch(); }}
-        onblur={() => { qoOpen = false; }}
-        oninput={() => void qoSearch()}
-        onkeydown={qoKeydown}
-      />
-      {#if qoOpen && qoMode === 'cmd' && qoCommands.length}
-        <div class="qo-drop">
-          {#each qoCommands as c, i (c.label)}
-            <button
-              type="button"
-              class="qo-item"
-              class:sel={i === qoSel}
-              onmousedown={(e) => { e.preventDefault(); qoRun(i); }}
-            >
-              <span class="qo-glyph">›</span>
-              <span class="qo-name">{c.label}</span>
-              {#if c.hint}<span class="qo-path">{c.hint}</span>{/if}
-            </button>
-          {/each}
-        </div>
-      {:else if qoOpen && qoShown.length}
-        <div class="qo-drop">
-          {#each qoShown as r, i (r.path)}
-            <button
-              type="button"
-              class="qo-item"
-              class:sel={i === qoSel}
-              onmousedown={(e) => { e.preventDefault(); qoPick(r.path, e.metaKey || e.ctrlKey ? 'tab' : e.shiftKey ? 'window' : qoFolderAction); }}
-            >
-              {#if qoMode === 'folder'}
-                <span class="qo-glyph">▸</span>
-              {:else}
-                <img class="qo-icon" alt="" src={fileIconUrl(baseName(r.path))} />
-              {/if}
-              <span class="qo-name">{qoMode === 'folder' ? r.path : baseName(r.path)}</span>
-              {#if qoMode !== 'folder'}<span class="qo-path">{r.path}</span>{/if}
-            </button>
-          {/each}
-        </div>
-      {/if}
-    </div>
+    <!-- Command centre: opens the modal, the way VS Code's title-bar box does.
+         Not an input itself — typing happens in the modal. -->
+    <button
+      type="button"
+      class="cmd-center"
+      title="Go to file (Ctrl+Shift+F) — type &gt; for commands"
+      onclick={() => qoShow('')}
+    >
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="4.5" stroke="currentColor" /><path d="M10.5 10.5 14 14" stroke="currentColor" /></svg>
+      <span class="cmd-center-label">{folder ? baseName(folder) : 'Search'}</span>
+    </button>
     <div class="layout-toggles">
       <button type="button" class:on={layout.showLeft} title="Toggle explorer (Ctrl+B)" aria-pressed={layout.showLeft} onclick={() => { layout.showLeft = !layout.showLeft; }}>
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" stroke="currentColor" /><path d="M6 3v10" stroke="currentColor" />{#if layout.showLeft}<rect x="2.75" y="3.75" width="2.25" height="8.5" fill="currentColor" />{/if}</svg>
@@ -910,6 +1103,19 @@
       </button>
     </div>
   </header>
+
+  <QuickOpen
+    open={qoOpen}
+    bind:query={qoQuery}
+    bind:sel={qoSel}
+    items={qoItems}
+    term={qoTerm}
+    placeholder={qoPlaceholder}
+    status={qoStatus}
+    onclose={qoClose}
+    onpick={qoPickItem}
+    oninput={() => void qoSearch()}
+  />
   <div class="body">
     <nav class="activitybar">
       <button
@@ -936,8 +1142,21 @@
         <div class="stack-item grow">
           <FileTree {folder} {rootInfo} activePath={activeGroup.activePath ?? ''} onOpen={openFile} onOpenWorkspace={openWorkspace} onNewTerminal={newTerminalAt} />
         </div>
-        <!-- Outline: collapsed by default, expands into the lower half. -->
-        <div class="stack-item outline" class:open={outlineOpen}>
+        <!-- Outline: collapsed by default, expands into a draggable lower pane. -->
+        {#if outlineOpen}
+          <div
+            class="resizer h"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize outline"
+            onpointerdown={(e) => startDrag(e, { outline: true })}
+          ></div>
+        {/if}
+        <div
+          class="stack-item outline"
+          class:open={outlineOpen}
+          style={outlineOpen ? `flex-basis: ${layout.outlineH}px` : ''}
+        >
           <div class="section-head">
             <button type="button" class="sec-main" onclick={() => toggleOutline()}>
               <span class="sec-chev">{outlineOpen ? '▾' : '▸'}</span>
@@ -945,6 +1164,15 @@
               {#if outlineOpen && outlineSubject}<span class="sec-sub" title={outlineSubject}>{outlineSubject}</span>{/if}
             </button>
             {#if outlineOpen}
+              <button
+                type="button"
+                class="sec-btn"
+                title="Rebuild the outline from the current file contents"
+                aria-label="Refresh outline"
+                onclick={refreshOutline}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6" /><path d="M13 2.5V5h-2.5" /></svg>
+              </button>
               <button
                 type="button"
                 class="sec-btn"
@@ -958,7 +1186,7 @@
           </div>
           {#if outlineOpen}
             <div class="section-body">
-              <OutlinePanel bind:this={outlinePanel} nodes={outlineNodes} onJump={outlineJump} />
+              <OutlinePanel bind:this={outlinePanel} nodes={outlineNodes} onJump={outlineJump} onSelect={outlineSelect} />
             </div>
           {/if}
         </div>
@@ -1097,6 +1325,18 @@
     onSave={saveAsCommit}
   />
 {/if}
+{#if browse}
+  <WorkspaceBrowser
+    mode={browse.mode}
+    title={browse.mode === 'file' ? 'Open File'
+      : browse.action === 'tab' ? 'Open Workspace in New Tab'
+      : browse.action === 'window' ? 'Open Workspace in New Window'
+      : 'Open Workspace'}
+    start={browseStartPath()}
+    onCancel={() => { browse = null; }}
+    onPick={browsePick}
+  />
+{/if}
 
 <style>
   .app {
@@ -1105,8 +1345,8 @@
     height: 100vh;
     width: 100vw;
     overflow: hidden;
-    background: #0d1117;
-    color: #c9d1d9;
+    background: #1e1e1e;
+    color: #c5c8c6;
     font-family: system-ui, -apple-system, sans-serif;
   }
   .titlebar {
@@ -1116,15 +1356,15 @@
     gap: 10px;
     padding: 4px 12px;
     font-size: 12px;
-    border-bottom: 1px solid #30363d;
-    background: #161b22;
+    border-bottom: 1px solid #404040;
+    background: #272727;
     white-space: nowrap;
     overflow: hidden;
   }
   .app-name { font-weight: 700; }
   .root-path {
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-    color: #8b949e;
+    color: #949494;
     overflow: hidden;
     text-overflow: ellipsis;
   }
@@ -1140,7 +1380,7 @@
     overflow: hidden;
     display: flex;
     flex-direction: column;
-    border-right: 1px solid #30363d;
+    border-right: 1px solid #404040;
   }
   .side-view {
     flex: 1 1 0;
@@ -1155,8 +1395,8 @@
     flex-direction: column;
     gap: 2px;
     padding: 4px 0;
-    background: #0d1117;
-    border-right: 1px solid #30363d;
+    background: #1e1e1e;
+    border-right: 1px solid #404040;
   }
   .activitybar button {
     display: flex;
@@ -1168,13 +1408,13 @@
     border: none;
     border-left: 2px solid transparent;
     background: transparent;
-    color: #6e7681;
+    color: #8a8a8a;
     cursor: pointer;
   }
-  .activitybar button:hover { color: #c9d1d9; }
+  .activitybar button:hover { color: #c5c8c6; }
   .activitybar button.on {
-    color: #c9d1d9;
-    border-left-color: #58a6ff;
+    color: #c5c8c6;
+    border-left-color: #e58520;
   }
   .activitybar svg {
     width: 19px;
@@ -1195,7 +1435,7 @@
     z-index: 2;
   }
   .resizer:hover,
-  .resizer:active { background: #58a6ff; }
+  .resizer:active { background: #e58520; }
   .resizer.v { cursor: col-resize; position: relative; }
   .resizer.h { cursor: row-resize; }
   .corner {
@@ -1211,16 +1451,16 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
-    border-top: 1px solid #30363d;
-    background: #0d1117;
+    border-top: 1px solid #404040;
+    background: #1e1e1e;
   }
   .rightpanel {
     flex: 0 0 auto;
     min-width: 0;
     display: flex;
     flex-direction: column;
-    border-left: 1px solid #30363d;
-    background: #0d1117;
+    border-left: 1px solid #404040;
+    background: #1e1e1e;
   }
   .panel-title {
     flex: 0 0 auto;
@@ -1228,7 +1468,7 @@
     font-size: 11px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: #8b949e;
+    color: #949494;
   }
   .layout-toggles {
     margin-left: auto;
@@ -1238,67 +1478,42 @@
   .layout-toggles button {
     border: none;
     background: transparent;
-    color: #8b949e;
+    color: #949494;
     padding: 2px 4px;
     border-radius: 4px;
     cursor: pointer;
     display: flex;
     align-items: center;
   }
-  .layout-toggles button:hover { background: rgba(56, 139, 253, 0.15); }
-  .layout-toggles button.on { color: #c9d1d9; }
-  .quickopen {
-    position: relative;
+  .layout-toggles button:hover { background: #444444; }
+  .layout-toggles button.on { color: #c5c8c6; }
+  .cmd-center {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
     flex: 0 1 440px;
     min-width: 120px;
     margin: 0 auto;
-  }
-  .qo-input {
-    width: 100%;
     box-sizing: border-box;
-    background: #010409;
-    border: 1px solid #30363d;
+    background: #1e1e1e;
+    border: 1px solid #404040;
     border-radius: 6px;
-    color: #c9d1d9;
+    color: #949494;
     font-size: 12px;
     padding: 2px 10px;
-  }
-  .qo-input:focus { outline: none; border-color: #58a6ff; }
-  .qo-drop {
-    position: absolute;
-    top: calc(100% + 4px);
-    left: 0;
-    right: 0;
-    max-height: 320px;
-    overflow-y: auto;
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 6px;
-    box-shadow: 0 8px 24px rgba(1, 4, 9, 0.85);
-    z-index: 50;
-  }
-  .qo-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    border: none;
-    background: transparent;
-    color: #c9d1d9;
-    font-size: 12px;
-    padding: 4px 10px;
     cursor: pointer;
-    text-align: left;
   }
-  .qo-item.sel, .qo-item:hover { background: rgba(56, 139, 253, 0.15); }
-  .qo-icon { width: 16px; height: 16px; flex: 0 0 16px; }
-  .qo-glyph { width: 16px; flex: 0 0 16px; text-align: center; color: #8b949e; }
+  .cmd-center:hover { border-color: #e58520; color: #c5c8c6; }
+  .cmd-center-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* Explorer sidebar = stacked sections (tree + outline), VS Code style. */
   .side-view.stack { display: flex; flex-direction: column; min-height: 0; }
   .stack-item { display: flex; flex-direction: column; min-height: 0; }
   .stack-item.grow { flex: 1 1 auto; }
-  .stack-item.outline { flex: 0 0 auto; border-top: 1px solid #30363d; }
-  .stack-item.outline.open { flex: 0 1 45%; }
+  .stack-item.outline { flex: 0 0 auto; border-top: 1px solid #404040; }
+  /* Height comes from the inline flex-basis the resizer writes; shrinking is
+     allowed so a short window cannot push the tree out entirely. */
+  .stack-item.outline.open { flex-grow: 0; flex-shrink: 1; min-height: 60px; }
   .section-head {
     display: flex;
     align-items: center;
@@ -1357,27 +1572,18 @@
     white-space: nowrap;
   }
   .section-body { flex: 1; min-height: 0; overflow: hidden; }
-  .qo-name { flex: 0 0 auto; white-space: nowrap; }
-  .qo-path {
-    color: #8b949e;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-    font-size: 11px;
-  }
   .panel-tabs {
     flex: 0 0 auto;
     display: flex;
     gap: 2px;
     padding: 2px 8px 0;
-    border-bottom: 1px solid #30363d;
-    background: #161b22;
+    border-bottom: 1px solid #404040;
+    background: #272727;
   }
   .panel-tabs button {
     border: none;
     background: transparent;
-    color: #8b949e;
+    color: #949494;
     font-size: 11px;
     letter-spacing: 0.06em;
     text-transform: uppercase;
@@ -1385,7 +1591,7 @@
     cursor: pointer;
     border-bottom: 1px solid transparent;
   }
-  .panel-tabs button.on { color: #c9d1d9; border-bottom-color: #58a6ff; }
+  .panel-tabs button.on { color: #c5c8c6; border-bottom-color: #e58520; }
   .panel-view {
     flex: 1 1 0;
     min-height: 0;
@@ -1406,8 +1612,8 @@
   .drop-overlay {
     position: absolute;
     inset: 0;
-    background: rgba(88, 166, 255, 0.12);
-    border: 1px solid rgba(88, 166, 255, 0.4);
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(229, 133, 32, 0.45);
     pointer-events: none;
     z-index: 5;
   }
@@ -1425,8 +1631,8 @@
     display: flex;
     align-items: stretch;
     overflow-x: auto;
-    border-bottom: 1px solid #30363d;
-    background: #161b22;
+    border-bottom: 1px solid #404040;
+    background: #272727;
     min-height: 30px;
   }
   .tab {
@@ -1435,19 +1641,19 @@
     gap: 6px;
     padding: 0 8px 0 12px;
     font-size: 12px;
-    border-right: 1px solid #30363d;
+    border-right: 1px solid #404040;
     cursor: pointer;
     user-select: none;
     white-space: nowrap;
     background: transparent;
   }
   .tab.active {
-    background: #0d1117;
-    box-shadow: inset 0 -2px 0 #58a6ff;
+    background: #1e1e1e;
+    box-shadow: inset 0 -2px 0 #e58520;
   }
   .tab.preview .tab-name { font-style: italic; }
   .tab-dir {
-    color: #6e7681;
+    color: #8a8a8a;
     font-size: 10.5px;
     max-width: 180px;
     overflow: hidden;
@@ -1455,7 +1661,7 @@
     direction: rtl;
   }
   .dirty-dot {
-    color: #58a6ff;
+    color: #e58520;
     font-size: 10px;
     line-height: 1;
   }
@@ -1469,7 +1675,7 @@
     padding: 2px 4px;
     border-radius: 4px;
   }
-  .tab-close:hover { background: rgba(56, 139, 253, 0.15); }
+  .tab-close:hover { background: #444444; }
   .content {
     flex: 1 1 0;
     min-height: 0;
@@ -1481,7 +1687,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    color: #8b949e;
+    color: #949494;
     font-size: 13px;
     padding: 20px;
     text-align: center;

@@ -165,11 +165,11 @@
     font-size: 11px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: #8b949e;
+    color: #949494;
   }
   .tbar-sub {
     font-size: 11px;
-    color: #6e7681;
+    color: #8a8a8a;
   }
   .tbar-gap {
     flex: 1 1 auto;
@@ -184,12 +184,12 @@
     border: none;
     border-radius: 5px;
     background: transparent;
-    color: #8b949e;
+    color: #949494;
     cursor: pointer;
   }
   .tbar-btn:hover:not(:disabled) {
-    background: #21262d;
-    color: #c9d1d9;
+    background: #353535;
+    color: #c5c8c6;
   }
   .tbar-btn:disabled {
     opacity: 0.35;
@@ -221,19 +221,19 @@
     align-items: center;
     justify-content: center;
     font-size: 12px;
-    color: #8b949e;
+    color: #949494;
   }
   .tempty button {
-    background: #21262d;
-    color: #c9d1d9;
-    border: 1px solid #30363d;
+    background: #353535;
+    color: #c5c8c6;
+    border: 1px solid #404040;
     border-radius: 6px;
     padding: 3px 10px;
     font-size: 12px;
     cursor: pointer;
   }
   .tempty button:hover {
-    border-color: #58a6ff;
+    border-color: #e58520;
   }
   .tlist {
     flex: 0 0 auto;
@@ -242,7 +242,7 @@
     padding: 2px 0;
     list-style: none;
     overflow-y: auto;
-    border-left: 1px solid #30363d;
+    border-left: 1px solid #404040;
   }
   .tlist-row {
     display: flex;
@@ -253,18 +253,18 @@
     border: none;
     border-left: 2px solid transparent;
     background: transparent;
-    color: #8b949e;
+    color: #949494;
     font-size: 12px;
     text-align: left;
     cursor: pointer;
   }
   .tlist-row:hover {
-    background: #161b22;
+    background: #272727;
   }
   .tlist-row.active {
-    background: #1f242c;
-    border-left-color: #58a6ff;
-    color: #c9d1d9;
+    background: #232323;
+    border-left-color: #e58520;
+    color: #c5c8c6;
   }
   .tlist-icon {
     flex: 0 0 auto;
@@ -294,7 +294,7 @@
     opacity: 0.7;
   }
   .tlist-kill:hover {
-    background: #30363d;
+    background: #404040;
     opacity: 1;
   }
 </style>

@@ -5,9 +5,10 @@
   // headings for markdown, declarations for code. Deliberately slim; the
   // markdown cockpit's own Outline.svelte carries theme/help chrome this
   // sidebar must not inherit.
-  let { nodes = [], onJump }: {
+  let { nodes = [], onJump, onSelect }: {
     nodes?: OutlineNode[];
     onJump: (line: number) => void;
+    onSelect: (node: OutlineNode) => void;
   } = $props();
 
   let folded = $state<Set<number>>(new Set());
@@ -71,7 +72,13 @@
         onclick={() => toggle(node.line)}
       >{node.children.length ? (folded.has(node.line) ? '▸' : '▾') : ''}</button>
       {@render sym(node)}
-      <button type="button" class="label" title={node.text} onclick={() => onJump(node.line)}>
+      <button
+        type="button"
+        class="label"
+        title={node.text}
+        onclick={() => onJump(node.line)}
+        ondblclick={() => onSelect(node)}
+      >
         <span class="text">{node.text}</span>
         <span class="ln">{node.line}</span>
       </button>
@@ -121,7 +128,7 @@
   .guide {
     width: 12px;
     flex: 0 0 12px;
-    border-left: 1px solid #30363d;
+    border-left: 1px solid #404040;
   }
   .ic {
     width: 14px;
@@ -134,7 +141,7 @@
   .cls { color: #ee9d28; }
   .iface { color: #75beff; }
   .enum { color: #ee9d28; }
-  .mod { color: #8b949e; }
+  .mod { color: #949494; }
   .rule { color: #4ec9b0; }
   .hx {
     font-size: 9px;

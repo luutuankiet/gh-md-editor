@@ -250,10 +250,10 @@
   /* starry-night ships style/both, whose palette flips with
      prefers-color-scheme. The diff chrome is hard-coded dark, so on a
      light-mode OS the tokens came out GitHub-light (near-black text on
-     #0d1117). Pin the GitHub-dark palette here, scoped to .difftab, so the
+     #1e1e1e). Pin the GitHub-dark palette here, scoped to .difftab, so the
      preview pane's code blocks stay system-following. Two classes beat the
      package's single-class rules on specificity, no !important needed. */
-  .difftab :global(.pl-c) { color: #8b949e; font-style: italic; }
+  .difftab :global(.pl-c) { color: #949494; font-style: italic; }
   .difftab :global(.pl-k) { color: #ff7b72; }
   .difftab :global(.pl-s),
   .difftab :global(.pl-pds),
@@ -273,20 +273,20 @@
   .difftab :global(.pl-smw) { color: #ffa657; }
   .difftab :global(.pl-smi),
   .difftab :global(.pl-s .pl-s1),
-  .difftab :global(.pl-vpf) { color: #c9d1d9; }
+  .difftab :global(.pl-vpf) { color: #c5c8c6; }
   .difftab :global(.pl-bu),
   .difftab :global(.pl-ii) { color: #f85149; }
-  .difftab :global(.pl-mh) { color: #1f6feb; font-weight: 600; }
+  .difftab :global(.pl-mh) { color: #3655b5; font-weight: 600; }
   .difftab :global(.pl-ml) { color: #f2cc60; }
-  .difftab :global(.pl-mb) { color: #c9d1d9; font-weight: 600; }
-  .difftab :global(.pl-mi) { color: #c9d1d9; font-style: italic; }
+  .difftab :global(.pl-mb) { color: #c5c8c6; font-weight: 600; }
+  .difftab :global(.pl-mi) { color: #c5c8c6; font-style: italic; }
 
   .difftab {
     height: 100%;
     display: flex;
     flex-direction: column;
-    background: #0d1117;
-    color: #c9d1d9;
+    background: #1e1e1e;
+    color: #c5c8c6;
   }
   .diff-head {
     flex: 0 0 auto;
@@ -294,8 +294,8 @@
     align-items: center;
     gap: 8px;
     padding: 4px 10px;
-    border-bottom: 1px solid #30363d;
-    background: #161b22;
+    border-bottom: 1px solid #404040;
+    background: #272727;
     font-size: 12px;
   }
   .diff-path {
@@ -306,9 +306,9 @@
   }
   .diff-side {
     flex: 0 0 auto;
-    color: #8b949e;
+    color: #949494;
     font-size: 11px;
-    border: 1px solid #30363d;
+    border: 1px solid #404040;
     border-radius: 8px;
     padding: 0 8px;
   }
@@ -334,9 +334,9 @@
     align-items: center;
     gap: 8px;
     padding: 3px 10px;
-    background: rgba(56, 139, 253, 0.08);
-    border-top: 1px solid #30363d;
-    border-bottom: 1px solid #30363d;
+    background: rgba(255, 255, 255, 0.05);
+    border-top: 1px solid #404040;
+    border-bottom: 1px solid #404040;
     position: sticky;
     top: 0;
     z-index: 2;
@@ -356,18 +356,18 @@
     flex: 0 0 auto;
   }
   .hunk-actions button {
-    border: 1px solid #30363d;
-    background: #21262d;
-    color: #c9d1d9;
+    border: 1px solid #404040;
+    background: #353535;
+    color: #c5c8c6;
     border-radius: 4px;
     font-size: 11px;
     padding: 1px 8px;
     cursor: pointer;
     white-space: nowrap;
   }
-  .hunk-actions button:hover { background: #30363d; }
+  .hunk-actions button:hover { background: #404040; }
   .hunk-actions button.danger { color: #f28b82; }
-  .selcount { color: #58a6ff; font-size: 11px; }
+  .selcount { color: #e58520; font-size: 11px; }
   /* One horizontal scroller per hunk: a long line in hunk 3 must not widen
      hunk 1, and clipping (the old overflow:hidden) hid code outright. */
   .linewrap { overflow-x: auto; }
@@ -387,13 +387,13 @@
   .dline.del { background: rgba(248, 81, 73, 0.15); }
   .dline.add .mark { color: #81c995; }
   .dline.del .mark { color: #f28b82; }
-  .dline.selected { outline: 1px solid #58a6ff; outline-offset: -1px; }
-  .dline.meta { color: #8b949e; font-style: italic; }
+  .dline.selected { outline: 1px solid #e58520; outline-offset: -1px; }
+  .dline.meta { color: #949494; font-style: italic; }
   .gut {
     flex: 0 0 44px;
     text-align: right;
     padding-right: 8px;
-    color: #6e7681;
+    color: #8a8a8a;
     user-select: none;
   }
   .mark {
@@ -407,32 +407,32 @@
   .icon-btn {
     border: none;
     background: transparent;
-    color: #8b949e;
+    color: #949494;
     cursor: pointer;
     border-radius: 4px;
     padding: 1px 5px;
     font-size: 13px;
   }
-  .icon-btn:hover { background: rgba(56, 139, 253, 0.15); color: #c9d1d9; }
+  .icon-btn:hover { background: #444444; color: #c5c8c6; }
   .viewtoggle {
     display: flex;
     flex: 0 0 auto;
     margin-left: auto;
-    border: 1px solid #30363d;
+    border: 1px solid #404040;
     border-radius: 6px;
     overflow: hidden;
   }
   .viewtoggle button {
     border: none;
     background: transparent;
-    color: #8b949e;
+    color: #949494;
     font-size: 11px;
     padding: 1px 8px;
     cursor: pointer;
   }
   .viewtoggle button.on {
-    background: #21262d;
-    color: #c9d1d9;
+    background: #353535;
+    color: #c5c8c6;
   }
   /* Each side is its own horizontal scroller, VS Code style. A grid with
      max-content tracks does NOT work here: the tracks can never exceed the
@@ -450,7 +450,7 @@
     min-width: 0;
     overflow-x: auto;
   }
-  .splitcol + .splitcol { border-left: 1px solid #30363d; }
+  .splitcol + .splitcol { border-left: 1px solid #404040; }
   .scell {
     display: flex;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
@@ -469,12 +469,12 @@
   .scell.del { background: rgba(248, 81, 73, 0.15); }
   .scell.add .mark { color: #81c995; }
   .scell.del .mark { color: #f28b82; }
-  .scell.selected { outline: 1px solid #58a6ff; outline-offset: -1px; }
+  .scell.selected { outline: 1px solid #e58520; outline-offset: -1px; }
   .scell.blank { background: rgba(110, 118, 129, 0.06); }
   .scell .gut { flex: 0 0 40px; }
   .empty {
     padding: 24px;
-    color: #8b949e;
+    color: #949494;
     text-align: center;
     font-size: 13px;
   }

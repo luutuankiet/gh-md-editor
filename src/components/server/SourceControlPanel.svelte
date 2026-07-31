@@ -131,7 +131,7 @@
   });
 
   const COLORS: Record<string, string> = { M: '#e2c08d', A: '#81c995', D: '#f28b82', R: '#79c0ff', C: '#79c0ff', U: '#81c995' };
-  const color = (s: string) => COLORS[s] ?? '#c9d1d9';
+  const color = (s: string) => COLORS[s] ?? '#c5c8c6';
 
   // --- tree view (default, explorer-style) ---------------------------------
   // Flat porcelain paths grouped into a dir tree; single-child dir chains
@@ -339,9 +339,9 @@
   .scm-top select {
     flex: 1 1 0;
     min-width: 0;
-    background: #0d1117;
-    color: #c9d1d9;
-    border: 1px solid #30363d;
+    background: #1e1e1e;
+    color: #c5c8c6;
+    border: 1px solid #404040;
     border-radius: 4px;
     font-size: 12px;
     padding: 2px 4px;
@@ -351,14 +351,14 @@
     display: flex;
     gap: 8px;
     padding: 4px 10px 0;
-    color: #8b949e;
+    color: #949494;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
     font-size: 11px;
     white-space: nowrap;
     overflow: hidden;
   }
   .branch { overflow: hidden; text-overflow: ellipsis; }
-  .ab { color: #58a6ff; }
+  .ab { color: #e58520; }
   .commitbox {
     flex: 0 0 auto;
     padding: 6px 8px;
@@ -368,15 +368,15 @@
   }
   .commitbox textarea {
     resize: vertical;
-    background: #0d1117;
-    color: #c9d1d9;
-    border: 1px solid #30363d;
+    background: #1e1e1e;
+    color: #c5c8c6;
+    border: 1px solid #404040;
     border-radius: 4px;
     font-family: inherit;
     font-size: 12px;
     padding: 4px 6px;
   }
-  .commitbox textarea:focus { outline: 1px solid #58a6ff; }
+  .commitbox textarea:focus { outline: 1px solid #e58520; }
   .commit-row {
     display: flex;
     align-items: center;
@@ -384,7 +384,7 @@
     gap: 6px;
   }
   .amend {
-    color: #8b949e;
+    color: #949494;
     display: flex;
     align-items: center;
     gap: 4px;
@@ -425,10 +425,10 @@
     font-size: 11px;
     letter-spacing: 0.06em;
     text-transform: uppercase;
-    color: #8b949e;
+    color: #949494;
   }
   .section-head .count {
-    background: #30363d;
+    background: #404040;
     border-radius: 8px;
     padding: 0 6px;
     font-size: 10px;
@@ -449,7 +449,7 @@
     top: 0;
     bottom: 0;
     width: 1px;
-    background: #21262d;
+    background: #353535;
     pointer-events: none;
   }
   .fname {
@@ -473,24 +473,24 @@
   .icon-btn {
     border: none;
     background: transparent;
-    color: #8b949e;
+    color: #949494;
     cursor: pointer;
     border-radius: 4px;
     padding: 1px 5px;
     font-size: 13px;
     line-height: 1.2;
   }
-  .icon-btn:hover { background: rgba(56, 139, 253, 0.15); color: #c9d1d9; }
+  .icon-btn:hover { background: #444444; color: #c5c8c6; }
   .empty {
     padding: 16px;
-    color: #8b949e;
+    color: #949494;
     text-align: center;
   }
   .chevron {
     width: 12px;
     flex: 0 0 12px;
     display: inline-block;
-    color: #8b949e;
+    color: #949494;
     font-size: 10px;
   }
   .ficon {
@@ -503,7 +503,7 @@
     direction: ltr;
   }
   .dcount {
-    color: #8b949e;
+    color: #949494;
     font-size: 11px;
     margin-left: 2px;
   }

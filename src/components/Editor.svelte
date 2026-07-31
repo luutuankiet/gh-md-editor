@@ -4,7 +4,8 @@
   import { EditorState, EditorSelection, Compartment } from '@codemirror/state';
   import { history, historyKeymap, defaultKeymap, indentWithTab, selectParentSyntax } from '@codemirror/commands';
   import { indentOnInput, bracketMatching, syntaxTree, LanguageDescription } from '@codemirror/language';
-  import { searchKeymap, search, getSearchQuery } from '@codemirror/search';
+  import { searchKeymap, search, getSearchQuery, searchPanelOpen } from '@codemirror/search';
+  import { recordExpansion, shrinkSelection, resetSelectionHistory } from '../lib/expand-selection';
   import { wordHighlight, wordMatchRanges } from '../lib/word-highlight';
   import { markdown as markdownLang, markdownLanguage } from '@codemirror/lang-markdown';
   import { languages as codeLanguages } from '@codemirror/language-data';
@@ -228,6 +229,16 @@
     return { from: start, to: end };
   }
 
+  // Same chord as the code editor, so the two panes agree: Left grows the
+  // selection, Right walks it back. This pane grows by heading section rather
+  // than by syntax node, but it feeds the shared ladder so Right still works.
+  function expandHere(vw: EditorView): boolean {
+    const before = vw.state.selection.main;
+    const grew = selectParentOrSection(vw);
+    if (grew) recordExpansion(vw, { from: before.from, to: before.to });
+    return grew;
+  }
+
   function selectParentOrSection(vw: EditorView): boolean {
     const state = vw.state;
     const before = state.selection.main;
@@ -283,7 +294,12 @@
   }
 
   function recomputeMatchTicks(vw: EditorView) {
-    const q = getSearchQuery(vw.state);
+    // Same panel gate as the code pane: CodeMirror drops its inline match
+    // decorations when the panel unmounts but keeps the query, so ticks keyed
+    // off the query alone linger after Escape. Double-click word highlights are
+    // a separate layer and stay put.
+    const panelOpen = searchPanelOpen(vw.state);
+    const q = panelOpen ? getSearchQuery(vw.state) : null;
     if (!q || !q.search || !q.valid) {
       matchTicks = [];
       currentTickY = null;
@@ -451,10 +467,14 @@
           { key: 'Mod--', preventDefault: true, run: (vw) => { bumpFontSize(vw, -1); return true; } },
           { key: 'Mod-Minus', preventDefault: true, run: (vw) => { bumpFontSize(vw, -1); return true; } },
           { key: 'Mod-0', preventDefault: true, run: (vw) => { resetFontSize(vw); return true; } },
-          { key: 'Mod-Shift-ArrowRight', preventDefault: true, run: selectParentOrSection },
-          // v0.5.1: literal Ctrl variant for Mac users with VS Code muscle
-          // memory who reach for Ctrl+Shift+→ rather than Cmd+Shift+→.
-          { key: 'Ctrl-Shift-ArrowRight', preventDefault: true, run: selectParentOrSection },
+          // Deliberately NOT bound to Mod-, which is Cmd on macOS and would
+          // shadow the platform-native select-to-line-start/end.
+          { key: 'Ctrl-Shift-ArrowLeft', preventDefault: true, run: expandHere },
+          { key: 'Ctrl-Shift-ArrowRight', preventDefault: true, run: shrinkSelection },
+          // VS Code's own chord for the same pair on Windows/Linux. Left off
+          // macOS, where Alt+Shift+Arrow is native select-word-left/right.
+          { win: 'Alt-Shift-ArrowLeft', linux: 'Alt-Shift-ArrowLeft', preventDefault: true, run: expandHere },
+          { win: 'Alt-Shift-ArrowRight', linux: 'Alt-Shift-ArrowRight', preventDefault: true, run: shrinkSelection },
           ...defaultKeymap,
           ...historyKeymap,
           ...searchKeymap,
@@ -463,6 +483,8 @@
         EditorView.updateListener.of((u) => {
           if (u.docChanged) {
             value = u.state.doc.toString();
+            // The ladder holds document offsets; an edit invalidates them.
+            resetSelectionHistory(u.view);
           }
           if (
             u.docChanged || u.selectionSet || u.viewportChanged || u.geometryChanged ||

@@ -416,7 +416,7 @@
     width: 100%;
     box-sizing: border-box;
   }
-  .sticky-header:hover { background: rgba(9, 105, 218, 0.10); }
+  .sticky-header:hover { background: rgba(255, 255, 255, 0.06); }
   .sticky-header.level-1 { color: #cf222e; font-weight: 700; }
   .sticky-header.level-2 { color: #0550ae; font-weight: 700; }
   .sticky-header.level-3 { color: #6639ba; font-weight: 600; }
@@ -424,15 +424,15 @@
   .sticky-header.level-5 { color: #0a3069; font-weight: 500; }
   .sticky-header.level-6,
   .sticky-header.level-7,
-  .sticky-header.level-8 { color: #1f2328; font-weight: 500; }
+  .sticky-header.level-8 { color: #232323; font-weight: 500; }
 
   /* Sticky-header dark variant keyed off the editor pane's theme class,
      mirroring the per-pane toggle. */
   .editor-pane.theme-dark .sticky-header {
-    background: rgba(13, 17, 23, 0.86);
-    border-bottom-color: rgba(48, 54, 61, 0.5);
+    background: rgba(30, 30, 30, 0.86);
+    border-bottom-color: rgba(64, 64, 64, 0.5);
   }
-  .editor-pane.theme-dark .sticky-header:hover { background: rgba(56, 139, 253, 0.12); }
+  .editor-pane.theme-dark .sticky-header:hover { background: rgba(255, 255, 255, 0.07); }
   .editor-pane.theme-dark .sticky-header.level-1 { color: #ff7b72; }
   .editor-pane.theme-dark .sticky-header.level-2 { color: #79c0ff; }
   .editor-pane.theme-dark .sticky-header.level-3 { color: #d2a8ff; }
@@ -440,5 +440,5 @@
   .editor-pane.theme-dark .sticky-header.level-5 { color: #a5d6ff; }
   .editor-pane.theme-dark .sticky-header.level-6,
   .editor-pane.theme-dark .sticky-header.level-7,
-  .editor-pane.theme-dark .sticky-header.level-8 { color: #c9d1d9; }
+  .editor-pane.theme-dark .sticky-header.level-8 { color: #c5c8c6; }
 </style>

@@ -35,10 +35,10 @@
       fontSize: 13,
       cursorBlink: true,
       theme: {
-        background: '#0d1117',
-        foreground: '#c9d1d9',
-        cursor: '#58a6ff',
-        selectionBackground: 'rgba(56, 139, 253, 0.4)',
+        background: '#1e1e1e',
+        foreground: '#c5c8c6',
+        cursor: '#e58520',
+        selectionBackground: 'rgba(229, 133, 32, 0.45)',
       },
     });
     const f = new FitAddon();
@@ -59,6 +59,12 @@
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
       if (msg.t === 'd') t.write(msg.d);
+      else if (msg.t === 'open') {
+        // `code-gh` ran in this shell and the server pushed the request back
+        // down this socket. The editor shell owns tabs and workspaces, so hand
+        // it over as an event rather than reaching across from here.
+        window.dispatchEvent(new CustomEvent('gmd:open-request', { detail: msg }));
+      }
       else if (msg.t === 'x') {
         status = 'gone';
         onexit?.(msg.code ?? null);
@@ -117,7 +123,7 @@
     position: absolute;
     inset: 0;
     overflow: hidden;
-    background: #0d1117;
+    background: #1e1e1e;
   }
   .term-wrap.hidden {
     display: none;
@@ -136,8 +142,8 @@
     align-items: center;
     justify-content: center;
     font-size: 12px;
-    color: #8b949e;
-    background: rgba(13, 17, 23, 0.85);
+    color: #949494;
+    background: rgba(30, 30, 30, 0.85);
     z-index: 2;
   }
 </style>

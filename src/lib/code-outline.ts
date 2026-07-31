@@ -20,6 +20,11 @@ export interface OutlineNode {
   level: number;
   text: string;
   line: number;
+  // Document offsets spanning the whole declaration, not just its header —
+  // what a double-click in the panel selects. Every builder already knows
+  // these bounds; carrying them costs nothing and saves a re-parse.
+  from: number;
+  to: number;
   kind?: SymbolKind;
   children: OutlineNode[];
 }
@@ -142,8 +147,20 @@ function fallbackOutline(state: EditorState): OutlineNode[] {
     const kind = refine(KIND_BY_KEYWORD[keyword], body);
     const indent = line.text.length - body.length;
     while (stack.length && indent <= stack[stack.length - 1].indent) stack.pop();
-    const node: OutlineNode = { level: stack.length + 1, text, line: i, kind, children: [] };
+    // No parse tree here, so the block is the run of deeper-indented lines
+    // that follows — resolved once the scan reaches a shallower line below.
+    const node: OutlineNode = {
+      level: stack.length + 1,
+      text,
+      line: i,
+      from: line.from,
+      to: line.to,
+      kind,
+      children: [],
+    };
     (stack.length ? stack[stack.length - 1].node.children : roots).push(node);
+    // Every open ancestor now extends at least to the end of this line.
+    for (const s of stack) s.node.to = line.to;
     stack.push({ indent, node });
     count += 1;
   }
@@ -183,6 +200,8 @@ function jsonOutline(state: EditorState, tree: Tree): OutlineNode[] {
         level: stack.length + 1,
         text,
         line: state.doc.lineAt(n.from).number,
+        from: n.from,
+        to: n.to,
         kind,
         children: [],
       };
@@ -220,6 +239,8 @@ export function outlineFromState(state: EditorState): OutlineNode[] {
         level: stack.length + 1,
         text,
         line: state.doc.lineAt(n.from).number,
+        from: n.from,
+        to: n.to,
         kind,
         children: [],
       };

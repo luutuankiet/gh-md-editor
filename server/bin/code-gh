@@ -1,0 +1,73 @@
+#!/bin/sh
+# Open a file or folder from the integrated terminal in the browser tab that
+# owns this shell — the terminal-side counterpart of VS Code's `code`.
+#
+#   code-gh .              open this folder as a workspace, in a new browser tab
+#   code-gh -r .           reuse the current browser tab instead
+#   code-gh src/app.ts     open a file in the editor
+#
+# Relative and absolute paths both work, and an absolute target may live
+# anywhere the server process can read — outside the folder it was started on
+# included. Every shell the editor spawns gets GMD_PORT,
+# GMD_TERM_ID and (when auth is on) GMD_TOKEN in its environment — their
+# absence is what tells us this is an ordinary shell, not an integrated one.
+set -eu
+
+reuse=false
+
+usage() {
+  echo "usage: code-gh [-r|--reuse] [--] <path>" >&2
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -r|--reuse) reuse=true ;;
+    -h|--help) usage ;;
+    --) shift; break ;;
+    -*) echo "code-gh: unknown option $1" >&2; usage ;;
+    *) break ;;
+  esac
+  shift
+done
+
+target="${1:-.}"
+
+if [ -z "${GMD_PORT:-}" ] || [ -z "${GMD_TERM_ID:-}" ]; then
+  echo "code-gh: not running inside a gh-md-editor terminal" >&2
+  exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "code-gh: curl is required" >&2
+  exit 1
+fi
+
+if [ ! -e "$target" ]; then
+  echo "code-gh: no such file or directory: $target" >&2
+  exit 1
+fi
+
+# Absolute path without realpath/readlink -f, neither of which is portable.
+if [ -d "$target" ]; then
+  abs=$(cd "$target" && pwd)
+else
+  abs="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+fi
+
+# Hand-rolled JSON: three fields of known shape, and depending on a JSON tool
+# here would break the command on minimal images.
+esc=$(printf '%s' "$abs" | sed 's/\\/\\\\/g; s/"/\\"/g')
+body="{\"path\":\"$esc\",\"reuse\":$reuse,\"term\":\"$GMD_TERM_ID\"}"
+
+# Built positionally so the auth header stays one argument — an unquoted
+# conditional expansion would split it on the space and confuse curl.
+set -- -fsS -X POST -H 'content-type: application/json' --data "$body"
+if [ -n "${GMD_TOKEN:-}" ]; then
+  set -- "$@" -H "x-auth-token: $GMD_TOKEN"
+fi
+
+if ! out=$(curl "$@" "http://127.0.0.1:$GMD_PORT/api/open" 2>&1); then
+  echo "code-gh: $out" >&2
+  exit 1
+fi

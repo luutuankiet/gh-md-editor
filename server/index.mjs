@@ -540,7 +540,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/file' && req.method === 'PUT') return await apiFilePut(req, res);
     if (url.pathname === '/api/search' && req.method === 'GET') return apiSearch(req, res, url.searchParams);
     if (url.pathname === '/api/context' && req.method === 'GET') return await apiContext(res, url.searchParams);
-    if (url.pathname === '/api/git/repos' && req.method === 'GET') return await apiGitRepos(res);
+    if (url.pathname === '/api/git/repos' && req.method === 'GET') return await apiGitRepos(res, url.searchParams);
     if (url.pathname === '/api/git/status' && req.method === 'GET') return await apiGitStatus(res, url.searchParams);
     if (url.pathname === '/api/git/diff' && req.method === 'GET') return await apiGitDiff(res, url.searchParams);
     if (url.pathname === '/api/git/action' && req.method === 'POST') return await apiGitAction(req, res);
@@ -731,12 +731,36 @@ function cleanRepoPath(p) {
   return p;
 }
 
-// Depth-2 scan rather than a single `rev-parse`: the workspace root is often a
+// Depth-2 scan rather than a single `rev-parse`: the anchor is often a
 // container of sibling checkouts (~/dev), not a repo itself. A directory that
 // IS a repo is not descended into — anything below it is a submodule, which
 // deserves its own treatment and would otherwise pollute the list.
-async function findRepos(depth = 2) {
+//
+// The scan starts at the open workspace, not at the server's start directory,
+// so the panel lists what the folder in view actually contains. Descending
+// alone is not enough: anchoring *inside* a checkout (~/dev/repo/src) finds
+// nothing below it, so the enclosing checkout is located by climbing first and
+// listed ahead of the rest. The climb stops at the start directory — every
+// other endpoint resolves repo ids against it, so a repo above it is
+// unaddressable and must not be offered.
+async function findRepos(baseAbs = ROOT, depth = 2) {
   const found = [];
+  const seen = new Set();
+  const add = (abs) => {
+    if (seen.has(abs)) return;
+    seen.add(abs);
+    found.push(abs);
+  };
+  for (let abs = baseAbs; ; abs = path.dirname(abs)) {
+    try {
+      await fs.stat(path.join(abs, '.git'));
+      add(abs);
+      break;
+    } catch {
+      // not a checkout — keep climbing
+    }
+    if (abs === ROOT || !abs.startsWith(ROOT)) break;
+  }
   async function walk(abs, d) {
     let entries;
     try {
@@ -745,7 +769,7 @@ async function findRepos(depth = 2) {
       return;
     }
     if (entries.some((e) => e.name === '.git')) {
-      found.push(abs);
+      add(abs);
       return;
     }
     if (d <= 0) return;
@@ -754,7 +778,7 @@ async function findRepos(depth = 2) {
       await walk(path.join(abs, e.name), d - 1);
     }
   }
-  await walk(ROOT, depth);
+  await walk(baseAbs, depth);
   return found.map((a) => path.relative(ROOT, a) || '.');
 }
 
@@ -894,9 +918,15 @@ function rawDiff(repoAbs, rel, staged, untracked) {
   return git(['diff', ...common, ...(staged ? ['--cached'] : []), '--', rel], repoAbs);
 }
 
-async function apiGitRepos(res) {
+async function apiGitRepos(res, params) {
+  // `base` is the workspace the client has open (the same value the explorer
+  // and quick-open are anchored to). Absent means the whole start directory.
+  // Repo ids stay relative to the start directory whatever the base is —
+  // status, diff and action all resolve them that way.
+  const baseAbs = resolveSafe(params?.get('base') || '.');
+  if (!baseAbs) return sendJson(res, 400, { error: 'base escapes root' });
   const repos = [];
-  for (const rel of await findRepos()) {
+  for (const rel of await findRepos(baseAbs)) {
     const abs = path.join(ROOT, rel === '.' ? '' : rel);
     const st = git(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--branch'], abs);
     if (st.code !== 0 && !st.out) {

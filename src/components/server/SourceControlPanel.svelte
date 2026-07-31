@@ -23,17 +23,30 @@
 
   const folder = new URLSearchParams(location.search).get('folder') ?? '';
 
+  // Scans for repositories under the open workspace and re-anchors the picker
+  // to what it finds. The list is deliberately limited to the anchor: a
+  // workspace with no checkout in it shows an empty picker rather than falling
+  // back to a scan of the server's start directory, which is what used to
+  // mount the panel on an unrelated repo. The server puts the checkout that
+  // encloses the anchor first, so the default selection is the repo the open
+  // folder belongs to even when the anchor is a subdirectory of it.
   async function loadRepos() {
     try {
-      const r = await fetch('/api/git/repos');
+      const r = await fetch(`/api/git/repos?base=${encodeURIComponent(folder || '.')}`);
       const d = await r.json();
       repos = d.repos ?? [];
       loaded = true;
-      if (!repo) {
-        const match = repos.find((x) => x.repo === folder && !x.error) ?? repos.find((x) => !x.error);
-        repo = match?.repo ?? '';
+      // A repo selected under a previous anchor is dropped once it is no longer
+      // in range, so the header can never show a repo outside the workspace.
+      if (!repo || !repos.some((x) => x.repo === repo && !x.error)) {
+        repo = repos.find((x) => !x.error)?.repo ?? '';
+        status = null;
       }
       if (repo) await refresh();
+      else {
+        status = null;
+        error = repos.length ? '' : 'no git repository in this folder';
+      }
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -254,7 +267,7 @@
         <option value={r.repo} disabled={!!r.error}>{r.repo}{r.error ? ' ⚠' : ''}</option>
       {/each}
     </select>
-    <button type="button" class="icon-btn" title="Refresh" onclick={() => void refresh()}>⟳</button>
+    <button type="button" class="icon-btn" title="Refresh" onclick={() => void loadRepos()}>⟳</button>
   </div>
   {#if status}
     <div class="branchline" title={status.upstream ? `upstream ${status.upstream}` : 'no upstream'}>

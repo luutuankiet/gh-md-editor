@@ -650,6 +650,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/git/repos' && req.method === 'GET') return await apiGitRepos(res, url.searchParams);
     if (url.pathname === '/api/git/status' && req.method === 'GET') return await apiGitStatus(res, url.searchParams);
     if (url.pathname === '/api/git/diff' && req.method === 'GET') return await apiGitDiff(res, url.searchParams);
+    if (url.pathname === '/api/diff/compare' && req.method === 'POST') return await apiDiffCompare(req, res);
     if (url.pathname === '/api/git/action' && req.method === 'POST') return await apiGitAction(req, res);
     if (url.pathname === '/api/terminals' && req.method === 'GET') {
       return sendJson(res, 200, { terminals: [...sessions.values()].map(sessionInfo) });
@@ -816,6 +817,7 @@ function apiSearch(req, res, params) {
 //   GET  /api/git/repos            repos under the workspace (depth-2 scan)
 //   GET  /api/git/status?repo=     branch/ahead/behind + staged & unstaged files
 //   GET  /api/git/diff?repo=&path=&staged=1   parsed hunks for one file
+//   POST /api/diff/compare         {leftPath, rightPath|rightText} → same hunks
 //   POST /api/git/action           {op: stage|unstage|discard|apply|commit}
 const GIT_MAX = 16 * 1024 * 1024;
 const GIT_SKIP = new Set(['node_modules', 'dist', 'build', 'target', 'vendor', '__pycache__']);
@@ -1103,6 +1105,53 @@ async function apiGitDiff(res, params) {
     return sendJson(res, 200, { path: rel, staged, tooBig: true, hunks: [] });
   }
   return sendJson(res, 200, { path: rel, staged, untracked, hunks: parseDiff(d.out) });
+}
+
+// Compare two arbitrary inputs. There is no repo and no index here, so this
+// leans on `git diff --no-index` — the exact call an untracked file already
+// goes through, which means the output lands in parseDiff unchanged and the
+// browser renders it with the component it already has. --no-index exits 1
+// whenever the inputs differ, so the exit code is not an error signal.
+async function apiDiffCompare(req, res) {
+  let body;
+  try {
+    body = JSON.parse((await readBody(req)).toString('utf8'));
+  } catch {
+    return sendJson(res, 400, { error: 'invalid JSON body' });
+  }
+  const leftAbs = resolveSafe(body.leftPath);
+  if (!leftAbs) return sendJson(res, 400, { error: 'left path escapes root' });
+
+  let rightAbs;
+  let tmpDir = null;
+  if (typeof body.rightText === 'string') {
+    // Pasted text exists nowhere on disk, so give it a file for the length of
+    // one diff. It borrows the left side's basename so any tooling keying off
+    // the extension treats both columns as the same kind of document.
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gmd-cmp-'));
+    rightAbs = path.join(tmpDir, path.basename(leftAbs));
+    await fs.writeFile(rightAbs, body.rightText, 'utf8');
+  } else {
+    rightAbs = resolveSafe(body.rightPath);
+    if (!rightAbs) return sendJson(res, 400, { error: 'right path escapes root' });
+  }
+
+  try {
+    const d = git(
+      ['diff', '--no-index', '--no-color', '--no-ext-diff', '-U3', '--', leftAbs, rightAbs],
+      path.dirname(leftAbs),
+    );
+    if (d.code === -1) return sendJson(res, 500, { error: d.err });
+    if (/^Binary files /m.test(d.out) || /^GIT binary patch/m.test(d.out)) {
+      return sendJson(res, 200, { path: body.leftPath, binary: true, hunks: [] });
+    }
+    if (d.out.length > 2 * 1024 * 1024) {
+      return sendJson(res, 200, { path: body.leftPath, tooBig: true, hunks: [] });
+    }
+    return sendJson(res, 200, { path: body.leftPath, hunks: parseDiff(d.out) });
+  } finally {
+    if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function apiGitAction(req, res) {

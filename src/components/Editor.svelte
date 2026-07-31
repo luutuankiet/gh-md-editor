@@ -475,9 +475,16 @@
           // macOS, where Alt+Shift+Arrow is native select-word-left/right.
           { win: 'Alt-Shift-ArrowLeft', linux: 'Alt-Shift-ArrowLeft', preventDefault: true, run: expandHere },
           { win: 'Alt-Shift-ArrowRight', linux: 'Alt-Shift-ArrowRight', preventDefault: true, run: shrinkSelection },
+          // macOS swallows Ctrl+Shift+Arrow at the window-server level; adding
+          // Cmd clears it while keeping left = expand on every platform.
+          { mac: 'Cmd-Ctrl-Shift-ArrowLeft', preventDefault: true, run: expandHere },
+          { mac: 'Cmd-Ctrl-Shift-ArrowRight', preventDefault: true, run: shrinkSelection },
           ...defaultKeymap,
           ...historyKeymap,
-          ...searchKeymap,
+          // Mod-g / Shift-Mod-g dropped — see the note in CodeTab: CodeMirror
+          // preventDefaults them without stopping propagation, which would let
+          // find-next and the panel toggle both fire on one keystroke.
+          ...searchKeymap.filter((b) => b.key !== 'Mod-g' && b.key !== 'Shift-Mod-g'),
           indentWithTab,
         ]),
         EditorView.updateListener.of((u) => {

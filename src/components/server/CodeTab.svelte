@@ -2,7 +2,7 @@
   import { untrack } from 'svelte';
   import { EditorView, lineNumbers, drawSelection, highlightActiveLine, keymap } from '@codemirror/view';
   import { EditorState, EditorSelection, Compartment } from '@codemirror/state';
-  import { history, historyKeymap, defaultKeymap } from '@codemirror/commands';
+  import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands';
   import {
     indentOnInput,
     bracketMatching,
@@ -323,9 +323,24 @@
           // macOS, where Alt+Shift+Arrow is native select-word-left/right.
           { win: 'Alt-Shift-ArrowLeft', linux: 'Alt-Shift-ArrowLeft', preventDefault: true, run: expandSelection },
           { win: 'Alt-Shift-ArrowRight', linux: 'Alt-Shift-ArrowRight', preventDefault: true, run: shrinkSelection },
+          // macOS swallows Ctrl+Shift+Arrow at the window-server level, so the
+          // chord above never reaches the page there. Adding Cmd clears it
+          // while keeping left = expand on every platform — deliberately the
+          // inverse of VS Code's mac default, because one mental model across
+          // three operating systems beats matching each one's local habit.
+          { mac: 'Cmd-Ctrl-Shift-ArrowLeft', preventDefault: true, run: expandSelection },
+          { mac: 'Cmd-Ctrl-Shift-ArrowRight', preventDefault: true, run: shrinkSelection },
+          // Tab indents, Shift-Tab outdents. Without this nothing consumes Tab,
+          // so the browser falls back to native focus traversal and lands on the
+          // language picker in the corner instead of touching the document.
+          indentWithTab,
           ...defaultKeymap,
           ...historyKeymap,
-          ...searchKeymap,
+          // Mod-g / Shift-Mod-g are dropped: CodeMirror calls preventDefault on
+          // them but never stops propagation, so the window-level panel toggle
+          // would fire in the same keystroke. Enter and Shift-Enter inside the
+          // find field still step through matches, so nothing is lost.
+          ...searchKeymap.filter((b) => b.key !== 'Mod-g' && b.key !== 'Shift-Mod-g'),
           ...foldKeymap,
           { key: 'Alt-z', preventDefault: true, run: (vw) => { toggleWrap(vw); return true; } },
           // VS Code's Format Document chord, same on every platform.

@@ -24,6 +24,10 @@
     reveal?: { line: number; seq: number; select?: { from: number; to: number } };
     // Present on kind === 'diff' tabs: which repo/file/side the tab shows.
     git?: { repo: string; path: string; staged: boolean; untracked: boolean };
+    // Present on kind === 'diff' tabs opened by a compare command: two
+    // arbitrary inputs instead of a git side. rightText holds pasted content,
+    // which lives in memory only.
+    cmp?: { leftPath: string; rightPath?: string; rightText?: string; rightLabel: string };
   }
 
   import OutlinePanel from './server/OutlinePanel.svelte';
@@ -103,6 +107,8 @@
     { label: 'Show Outline', run: () => { layout.showLeft = true; sideView = 'explorer'; toggleOutline(true); } },
     { label: 'New Untitled File', hint: 'Alt+N', run: () => newUntitledTab() },
     { label: 'Format Document', hint: 'Shift+Alt+F', run: () => window.dispatchEvent(new CustomEvent('gmd:format-document')) },
+    { label: 'Compare Active File With…', run: () => { if (compareSource()) browse = { mode: 'compare', action: 'same' }; } },
+    { label: 'Compare Active File With Clipboard', run: () => void compareWithClipboard() },
   ];
   let qoCommands = $derived(
     qoTerm ? COMMANDS.filter((c) => c.label.toLowerCase().includes(qoTerm.toLowerCase())) : COMMANDS
@@ -333,7 +339,7 @@
 
   // VS Code-style workspace browser: absolute-path navigation that can leave
   // the served root (that is the point — /api/browse exists for it).
-  let browse = $state<{ mode: 'workspace' | 'file'; action: 'same' | 'tab' | 'window' } | null>(null);
+  let browse = $state<{ mode: 'workspace' | 'file' | 'compare'; action: 'same' | 'tab' | 'window' } | null>(null);
 
   function browseStartPath(): string {
     if (folder.startsWith('/')) return folder; // already an absolute anchor
@@ -361,7 +367,10 @@
     if (!b) return;
     const p = toWorkspacePath(abs);
     if (b.mode === 'workspace') openWorkspaceIn(p, b.action);
-    else void openFile(p, { pinned: true });
+    else if (b.mode === 'compare') {
+      const t = compareSource();
+      if (t) openCompare({ leftPath: t.path, rightPath: p, rightLabel: baseName(p) });
+    } else void openFile(p, { pinned: true });
   }
 
   // ---- Sidebar outline ----
@@ -579,6 +588,9 @@
           kind: t.kind,
           pinned: t.pinned,
           git: t.git,
+          // A pasted compare holds its right side in memory only — nothing on
+          // disk can re-derive it, so it deliberately does not survive a reload.
+          cmp: t.cmp?.rightPath ? t.cmp : undefined,
           untitled: t.untitled,
           // Untitled buffers live nowhere else; dirty files carry their draft.
           content: t.untitled && t.content.length <= DRAFT_CAP ? t.content : undefined,
@@ -616,6 +628,8 @@
         let tab: Tab | null = null;
         if (st.untitled) {
           tab = { path: st.path, name: st.name ?? st.path, kind: 'code', pinned: true, content: st.content ?? '', savedContent: '', mtimeMs: 0, untitled: true };
+        } else if (st.kind === 'diff' && st.cmp) {
+          tab = { path: st.path, name: st.name ?? st.path, kind: 'diff', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0, cmp: st.cmp };
         } else if (st.kind === 'diff' && st.git) {
           // Diff tabs own no content — DiffTab re-derives from git on mount.
           tab = { path: st.path, name: st.name ?? st.path, kind: 'diff', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0, git: st.git };
@@ -760,6 +774,76 @@
     else home.tabs.push(tab);
     home.activePath = key;
     activeGroupId = home.id;
+  }
+
+  // Compare two inputs. Unlike openDiff there is no repo and no index: the
+  // server shells `git diff --no-index`, so the hunks arrive in the shape
+  // DiffTab already renders.
+  function openCompare(cmp: { leftPath: string; rightPath?: string; rightText?: string; rightLabel: string }) {
+    const key = `gmd-cmp:${cmp.leftPath}:${cmp.rightPath ?? cmp.rightLabel}`;
+    for (const g of groups) {
+      const existing = g.tabs.find((t) => t.path === key);
+      if (existing) {
+        // Every pasted compare shares one key, so refresh the payload — the
+        // same tab pointed at newly pasted text must show the new text.
+        existing.cmp = cmp;
+        activeGroupId = g.id;
+        g.activePath = key;
+        return;
+      }
+    }
+    const tab: Tab = {
+      path: key,
+      name: `${baseName(cmp.leftPath)} ↔ ${cmp.rightLabel}`,
+      kind: 'diff',
+      pinned: false,
+      content: '',
+      savedContent: '',
+      mtimeMs: 0,
+      cmp,
+    };
+    const home = groups.includes(activeGroup) ? activeGroup : groups[0];
+    const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
+    if (previewIdx >= 0) home.tabs[previewIdx] = tab;
+    else home.tabs.push(tab);
+    home.activePath = key;
+    activeGroupId = home.id;
+  }
+
+  // The left side of a compare is whatever real file is on screen. A diff tab
+  // and an unsaved buffer have no path to hand to git.
+  function compareSource(): Tab | null {
+    const t = activeTab;
+    if (!t || t.untitled || t.binary || t.kind === 'diff') return null;
+    return t;
+  }
+
+  let pasteCompare = $state(false);
+  let pasteText = $state('');
+
+  async function compareWithClipboard() {
+    const t = compareSource();
+    if (!t) return;
+    // readText() needs a secure context, and this app is routinely served over
+    // plain http on a LAN — so the API being missing or rejecting is the
+    // ordinary case here, not the exceptional one.
+    try {
+      const text = await navigator.clipboard?.readText();
+      if (typeof text === 'string' && text.length) {
+        openCompare({ leftPath: t.path, rightText: text, rightLabel: 'clipboard' });
+        return;
+      }
+    } catch { /* fall through to the paste box */ }
+    pasteText = '';
+    pasteCompare = true;
+  }
+
+  function runPasteCompare() {
+    const t = compareSource();
+    const text = pasteText;
+    pasteCompare = false;
+    pasteText = '';
+    if (t && text) openCompare({ leftPath: t.path, rightText: text, rightLabel: 'pasted text' });
   }
 
   let saveAs = $state<{ tab: Tab } | null>(null);
@@ -1028,10 +1112,19 @@
       } else if ((e.metaKey || e.ctrlKey) && e.code === 'KeyB') {
         e.preventDefault();
         layout.showLeft = !layout.showLeft;
-      } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'KeyG') {
-        // VS Code's source-control binding — ours lives in the right panel.
+      } else if ((e.metaKey || e.ctrlKey) && e.code === 'KeyG') {
+        // Source control, with or without Shift: VS Code ships Cmd+Shift+G and
+        // the bare chord is ours. CodeMirror's find-next binding for Mod-g is
+        // filtered out of both editor keymaps precisely so it cannot fire
+        // alongside this one — it preventDefaults but never stops propagation.
         e.preventDefault();
         layout.showRight = !layout.showRight;
+      } else if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.code === 'KeyL') {
+        // Explorer toggle, twin of Cmd+B. Firefox lets a page cancel the
+        // address-bar focus this would otherwise trigger; Chrome does not,
+        // which is why Cmd+B stays as the portable binding.
+        e.preventDefault();
+        layout.showLeft = !layout.showLeft;
       } else if ((e.metaKey || e.ctrlKey) && e.code === 'Digit1') {
         e.preventDefault();
         layout.showBottom = !layout.showBottom;
@@ -1258,6 +1351,8 @@
                     <div class="placeholder">Cannot open {at.name}: {at.error}</div>
                   {:else if at.binary}
                     <div class="placeholder">{at.name} is a binary file.</div>
+                  {:else if at.kind === 'diff' && at.cmp}
+                    <DiffTab compare={at.cmp} />
                   {:else if at.kind === 'diff' && at.git}
                     <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} />
                   {:else if at.kind === 'md'}
@@ -1327,8 +1422,9 @@
 {/if}
 {#if browse}
   <WorkspaceBrowser
-    mode={browse.mode}
-    title={browse.mode === 'file' ? 'Open File'
+    mode={browse.mode === 'workspace' ? 'workspace' : 'file'}
+    title={browse.mode === 'compare' ? 'Compare With File'
+      : browse.mode === 'file' ? 'Open File'
       : browse.action === 'tab' ? 'Open Workspace in New Tab'
       : browse.action === 'window' ? 'Open Workspace in New Window'
       : 'Open Workspace'}
@@ -1337,8 +1433,85 @@
     onPick={browsePick}
   />
 {/if}
+{#if pasteCompare}
+  <!-- The clipboard read needs a secure context that plain-http LAN serving
+       does not provide, but a paste event always carries its data — so the
+       textarea is the reliable path rather than the consolation prize. -->
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="paste-back" onclick={() => { pasteCompare = false; pasteText = ''; }}>
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="paste-box" onclick={(e) => e.stopPropagation()}>
+      <strong>Compare {activeTab?.name ?? ''} with pasted text</strong>
+      <!-- svelte-ignore a11y_autofocus -->
+      <textarea bind:value={pasteText} autofocus placeholder="Paste here, then press Compare…"></textarea>
+      <div class="paste-actions">
+        <button type="button" onclick={() => { pasteCompare = false; pasteText = ''; }}>Cancel</button>
+        <button type="button" disabled={!pasteText} onclick={runPasteCompare}>Compare</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
+  .paste-back {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.45);
+  }
+  .paste-box {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: min(680px, 90vw);
+    padding: 14px;
+    border: 1px solid #505050;
+    border-radius: 6px;
+    background: #232323;
+    color: #c5c8c6;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+    font-size: 13px;
+  }
+  .paste-box textarea {
+    height: 40vh;
+    box-sizing: border-box;
+    resize: vertical;
+    padding: 6px;
+    border: 1px solid #505050;
+    border-radius: 3px;
+    background: #1e1e1e;
+    color: #c5c8c6;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .paste-box textarea:focus {
+    outline: none;
+    border-color: #e58520;
+  }
+  .paste-actions button {
+    padding: 4px 12px;
+    font-size: 12px;
+    border: 1px solid #505050;
+    border-radius: 3px;
+    background: #2d2d2d;
+    color: #c5c8c6;
+    cursor: pointer;
+  }
+  .paste-actions button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .paste-actions button:not(:disabled):hover { background: #3a3a3a; }
+  .paste-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+
   .app {
     display: flex;
     flex-direction: column;

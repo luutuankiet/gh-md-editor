@@ -22,7 +22,7 @@
     { pane: 'Editor', keys: 'Alt / Opt + Left-click', description: 'Multi-cursor — drop an additional caret at the click point. Combine with Cmd+D for free-form multi-cursor editing.', highlight: true },
     { pane: 'Editor', keys: 'Cmd/Ctrl + = / -', description: 'Zoom editor pane font size (preview unaffected — heading hierarchy stays readable while you bump editor text). Persisted across reloads. Range 9–32 px.', highlight: true },
     { pane: 'Editor', keys: 'Cmd/Ctrl + 0', description: 'Reset editor pane font size to default (13 px).', highlight: true },
-    { pane: 'Editor', keys: 'Cmd/Ctrl + Shift + →', description: 'Expand selection: token → expression → fence → MARKDOWN SECTION → ENCLOSING PARENT SECTION → document. Mac Ctrl+Shift+→ also bound for muscle-memory parity.' },
+    { pane: 'Editor', keys: 'Cmd/Ctrl + Shift + →', description: 'Expand selection: token → expression → fence → MARKDOWN SECTION → ENCLOSING PARENT SECTION → document. Mac Ctrl+Shift+→ also bound for muscle-memory parity, plus Cmd+Ctrl+Shift+→ for when macOS claims the plain chord.' },
     { pane: 'Editor', keys: '` * _ ~ ( [ { " \'', description: 'Wrap selection with the pair (markdown auto-pair)' },
     { pane: 'Editor', keys: 'Tab / Shift+Tab', description: 'Indent / outdent' },
     { pane: 'Preview', keys: 'Cmd/Ctrl + F', description: 'Find in preview (overlay top-right). Scrollbar match ticks; Enter / Shift+Enter to step through; Esc to close.', highlight: true },

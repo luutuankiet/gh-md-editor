@@ -1,15 +1,23 @@
 <script lang="ts">
-  let { repo, path, staged, untracked = false }: {
-    repo: string;
-    path: string;
-    staged: boolean;
+  let { repo = '', path = '', staged = false, untracked = false, compare = null }: {
+    repo?: string;
+    path?: string;
+    staged?: boolean;
     untracked?: boolean;
+    // Set instead of repo/path when the tab came from a compare command: two
+    // arbitrary inputs, no repo, no index side. rightText carries pasted
+    // content, which has no path of its own.
+    compare?: { leftPath: string; rightPath?: string; rightText?: string; rightLabel: string } | null;
   } = $props();
 
   import { scopeForFilename, highlightToLines, type Tok } from '../../lib/diff-highlight';
 
   interface DiffLine { t: '+' | '-' | ' ' | '\\'; n: number | null; o: number | null; text: string }
   interface Hunk { oldStart: number; oldLines: number; newStart: number; newLines: number; section: string; lines: DiffLine[] }
+
+  // What the diff is *about* — drives the header and the grammar pick. A
+  // compare has no repo-relative path, so its left input names the tab.
+  const subject = $derived(compare ? compare.leftPath : path);
 
   let hunks = $state<Hunk[]>([]);
   let flags = $state<{ binary?: boolean; tooBig?: boolean }>({});
@@ -33,7 +41,7 @@
 
   async function highlightHunks(hs: Hunk[]) {
     const total = hs.reduce((n, h) => n + h.lines.length, 0);
-    const scope = total > HL_LINE_CAP ? null : await scopeForFilename(path);
+    const scope = total > HL_LINE_CAP ? null : await scopeForFilename(subject);
     if (!scope) { hl = new Map(); return; }
     const map = new Map<string, Tok[]>();
     for (let hi = 0; hi < hs.length; hi++) {
@@ -90,9 +98,16 @@
 
   async function load() {
     loading = true;
-    const qs = new URLSearchParams({ repo, path, staged: staged ? '1' : '0', untracked: untracked ? '1' : '0' });
     try {
-      const r = await fetch(`/api/git/diff?${qs}`);
+      // Two request shapes, one response shape. A compare carries no repo and
+      // no side, and pasted text has no path at all — hence the POST.
+      const r = compare
+        ? await fetch('/api/diff/compare', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(compare),
+          })
+        : await fetch(`/api/git/diff?${new URLSearchParams({ repo, path, staged: staged ? '1' : '0', untracked: untracked ? '1' : '0' })}`);
       const d = await r.json();
       if (!r.ok) { error = d.error ?? `HTTP ${r.status}`; hunks = []; }
       else { error = ''; hunks = d.hunks ?? []; flags = { binary: d.binary, tooBig: d.tooBig }; }
@@ -138,8 +153,8 @@
 
 <div class="difftab">
   <div class="diff-head">
-    <span class="diff-path" title={path}>{path}</span>
-    <span class="diff-side">{staged ? 'staged' : untracked ? 'untracked' : 'working tree'}</span>
+    <span class="diff-path" title={subject}>{subject}</span>
+    <span class="diff-side">{compare ? `vs ${compare.rightLabel}` : staged ? 'staged' : untracked ? 'untracked' : 'working tree'}</span>
     <span class="viewtoggle">
       <button type="button" class:on={view === 'split'} onclick={() => setView('split')}>Split</button>
       <button type="button" class:on={view === 'inline'} onclick={() => setView('inline')}>Inline</button>
@@ -154,7 +169,7 @@
   {:else if flags.tooBig}
     <div class="empty">Diff exceeds 2 MB — open the file instead.</div>
   {:else if !hunks.length}
-    <div class="empty">No changes on this side.</div>
+    <div class="empty">{compare ? 'Both inputs are identical.' : 'No changes on this side.'}</div>
   {:else}
     <div class="hunks">
       {#each hunks as h, hi (hi)}
@@ -162,12 +177,16 @@
           <div class="hunk-head">
             <code>@@ -{h.oldStart},{h.oldLines} +{h.newStart},{h.newLines} @@ {h.section}</code>
             <span class="hunk-actions">
-              {#if sel[hi]?.size}<span class="selcount">{sel[hi].size} selected</span>{/if}
-              {#if staged}
-                <button type="button" onclick={() => void apply(hi, 'unstage')}>Unstage {sel[hi]?.size ? 'selected' : 'hunk'}</button>
-              {:else}
-                <button type="button" onclick={() => void apply(hi, 'stage')}>Stage {sel[hi]?.size ? 'selected' : 'hunk'}</button>
-                <button type="button" class="danger" onclick={() => void apply(hi, 'revert')}>Revert {sel[hi]?.size ? 'selected' : 'hunk'}</button>
+              <!-- A compare has no index and no working tree to write back to,
+                   so line-level staging has nowhere to land. -->
+              {#if !compare}
+                {#if sel[hi]?.size}<span class="selcount">{sel[hi].size} selected</span>{/if}
+                {#if staged}
+                  <button type="button" onclick={() => void apply(hi, 'unstage')}>Unstage {sel[hi]?.size ? 'selected' : 'hunk'}</button>
+                {:else}
+                  <button type="button" onclick={() => void apply(hi, 'stage')}>Stage {sel[hi]?.size ? 'selected' : 'hunk'}</button>
+                  <button type="button" class="danger" onclick={() => void apply(hi, 'revert')}>Revert {sel[hi]?.size ? 'selected' : 'hunk'}</button>
+                {/if}
               {/if}
             </span>
           </div>

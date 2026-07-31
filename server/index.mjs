@@ -24,25 +24,82 @@ import { registerServer, patchServer, unregisterServer, run as runDaemon } from 
     process.exit(await runDaemon(sub, process.argv.slice(3)));
   }
 }
-// node-pty is an OPTIONAL dependency, loaded lazily on purpose. It is a native
-// addon: when npm finds no prebuild for the running Node version it falls back
-// to node-gyp, which needs make/g++/python3 on the box. As a hard dependency
-// that failure aborted the entire install, and because npm hides install-script
-// output by default the symptom was brutal — `npx @luutuankiet/gh-md-editor`
-// printed NOTHING and exited 1 (measured on Node 24 + a host without make).
-// Every other feature works without a pty, so degrade instead of dying.
+// A pty and ripgrep are the two native pieces of this server, and both used to
+// be the user's problem: node-pty compiled from source (make/g++/python3, or
+// the whole install aborted) and ripgrep had to already be on PATH or search
+// silently found nothing. Both are now OPTIONAL dependencies whose packages
+// ship per-platform PREBUILT binaries — npm downloads only the one matching
+// this host, there is no compiler and no postinstall download, and a platform
+// nobody built for degrades instead of aborting. That last part is
+// load-bearing: as a hard dependency a failed native build killed
+// `npx @luutuankiet/gh-md-editor` outright, and because npm hides
+// install-script output the symptom was brutal — NOTHING printed, exit 1
+// (measured on Node 24 + a host without make).
+const require_ = createRequire(import.meta.url);
+
+// Prebuilt archives lose the executable bit distressingly often. Upstream
+// node-pty 1.1.0 publishes its macOS spawn-helper as 0644 inside the tarball
+// itself, which turns the terminal on every Mac into "posix_spawnp failed" —
+// verified by unpacking the published package. The binaries used here have
+// correct modes, so this is insurance: a couple of syscalls at boot against a
+// class of packaging bug that is invisible until a user hits it.
+async function ensureExec(file) {
+  try {
+    const st = await fs.stat(file);
+    if (!(st.mode & 0o111)) await fs.chmod(file, 0o755);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Prebuilts live in a sibling package named for the platform, resolved the
+// same way the loader itself resolves them.
+function nativePkgDir(name) {
+  try {
+    return path.dirname(require_.resolve(`${name}/package.json`));
+  } catch {
+    return null;
+  }
+}
+
 let pty = null;
 let ptyError = '';
 try {
-  pty = (await import('node-pty')).default;
+  // Heal before the first spawn, not after a user has already been told their
+  // terminal is broken.
+  const dir = nativePkgDir(`@lydell/node-pty-${process.platform}-${process.arch}`);
+  if (dir) await ensureExec(path.join(dir, 'spawn-helper'));
+  pty = (await import('@lydell/node-pty')).default;
 } catch (e) {
   ptyError = String(e?.message ?? e).split('\n')[0];
 }
+
+// Search and quick open are whole panels that go quietly empty without
+// ripgrep, which is the worst failure shape there is: nothing looks broken,
+// results just never appear. So it ships with the package. A host `rg` is the
+// fallback for platforms the prebuilt does not cover.
+let rgBin = '';
+try {
+  // import(), not require(): the package's loader is an ES module, and
+  // require()ing one throws ERR_REQUIRE_ESM on Node 20.12 while working fine
+  // on 22. Both are inside the >=20 range this package claims, and the throw
+  // is swallowed by the catch below — so the require() form fails invisibly on
+  // older-Node machines and quietly gives back the empty search panel this is
+  // meant to fix.
+  const mod = await import('@vscode/ripgrep');
+  const rgPath = mod.rgPath ?? mod.default?.rgPath;
+  if (rgPath && await ensureExec(rgPath)) rgBin = rgPath;
+} catch { /* no prebuilt for this platform — fall back below */ }
+if (!rgBin && onPath('rg')) rgBin = 'rg';
 import { spawn, spawnSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
+import https from 'node:https';
+import dns from 'node:dns';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -371,7 +428,7 @@ function listFiles(baseAbs) {
   const hit = fileListCache.get(baseAbs);
   if (hit && Date.now() - hit.at < FILELIST_TTL) return Promise.resolve(hit);
   return new Promise((resolve) => {
-    const child = spawn('rg', ['--files'], { cwd: baseAbs });
+    const child = spawn(rgBin || 'rg', ['--files'], { cwd: baseAbs });
     let buf = '';
     let truncated = false;
     // A missing rg used to resolve to an empty list with no error, so quick
@@ -688,7 +745,7 @@ function apiSearch(req, res, params) {
   }
   args.push('--', query, dir);
 
-  const rg = spawn('rg', args, { cwd: ROOT });
+  const rg = spawn(rgBin || 'rg', args, { cwd: ROOT });
 
   res.writeHead(200, {
     'content-type': 'application/x-ndjson; charset=utf-8',
@@ -1357,6 +1414,11 @@ server.on('upgrade', (req, socket, head) => {
 // stable hostname; note Funnel strips ?query on WS upgrades, so land on
 // /?token= first to pick up the auth cookie before the terminal connects.
 let tunnelChild = null;
+// Set while a tunnel is being deliberately torn down and replaced, so the
+// child's exit handler does not report a planned reroll as a failure.
+let tunnelReplacing = false;
+// The URL currently believed to work — what the heartbeat re-checks.
+let liveTunnelUrl = null;
 process.on('exit', () => { try { tunnelChild?.kill('SIGTERM'); } catch {} });
 
 // Is a binary usable? spawnSync is the portable probe — `which` and `where`
@@ -1460,8 +1522,12 @@ async function startTunnel(provider) {
     });
     child.on('exit', (code) => {
       if (!done) finish({ error: `${bin} exited ${code} before printing a URL${out ? `:\n${out.trim().split('\n').slice(-4).join('\n')}` : ''}` });
+      // A planned reroll kills this child on purpose; the flag is consumed
+      // here rather than cleared at kill time because `exit` lands a tick or
+      // more later, long after any synchronous reset would have run.
+      else if (tunnelReplacing) tunnelReplacing = false;
       else console.error(`  !! tunnel process exited (${code}) — the public URL is dead; local server still up.`);
-      tunnelChild = null;
+      if (tunnelChild === child) tunnelChild = null;
     });
     // No URL in 30s → give up but KEEP SERVING locally. Never exit non-zero
     // here — a missing tunnel binary must not reproduce the node-pty
@@ -1471,6 +1537,149 @@ async function startTunnel(provider) {
       finish({ error: 'no public URL after 30s — gave up (server keeps running locally)' });
     }, 30_000);
   });
+}
+
+// --- tunnel readiness -------------------------------------------------------
+// cloudflared prints its URL the moment the edge accepts the connection, but
+// the hostname's DNS record is created asynchronously and the wait is a
+// lottery: measured 15s on one run and still NXDOMAIN at 133s on the very next
+// run, same machine, same command. Printing that URL straight away is worse
+// than merely premature — clicking a name that does not exist yet makes the
+// resolver cache the negative answer, so the link keeps failing for minutes
+// AFTER it goes live, and the only "fix" a user finds is to wait and rerun.
+// Verify first, print second.
+const TUNNEL_VERIFY_MS = 75_000;
+const TUNNEL_ATTEMPTS = 3;
+const TUNNEL_HEARTBEAT_MS = 60_000;
+
+// Never ask the system resolver whether the hostname exists yet: on the
+// machine this was debugged, that resolver was the one holding the poisoned
+// negative entry. Public resolvers give an uncached second opinion.
+const publicDns = new dns.promises.Resolver({ timeout: 3000, tries: 1 });
+publicDns.setServers(['1.1.1.1', '8.8.8.8']);
+
+async function resolvePublic(hostname) {
+  try {
+    const [ip] = await publicDns.resolve4(hostname);
+    return ip ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Any HTTP status proves the entire path works: DNS → edge → this process. A
+// 401 from our own auth gate is a perfectly good yes.
+function probeVia(url, ip, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    try {
+      const req = https.request(url, {
+        method: 'GET',
+        timeout: timeoutMs,
+        // Dial the IP the public resolver just handed back. SNI and Host still
+        // carry the real hostname, so this is the same request a browser
+        // makes — minus any chance of a stale local DNS answer.
+        // Two callback shapes, not one: Node 20 turned on autoSelectFamily,
+        // which calls lookup with all:true and rejects a bare address string
+        // as an invalid IP. Getting this wrong fails every probe silently.
+        lookup: (_hostname, opts, cb) => (opts?.all
+          ? cb(null, [{ address: ip, family: 4 }])
+          : cb(null, ip, 4)),
+      }, (res) => { res.resume(); done(res.statusCode ?? 0); });
+      req.on('timeout', () => { req.destroy(); done(0); });
+      req.on('error', () => done(0));
+      req.end();
+    } catch {
+      done(0);
+    }
+  });
+}
+
+async function waitReachable(url, budgetMs) {
+  const hostname = new URL(url).hostname;
+  const started = Date.now();
+  while (Date.now() - started < budgetMs) {
+    const ip = await resolvePublic(hostname);
+    if (ip && (await probeVia(url, ip, 5000)) > 0) return { ok: true, ms: Date.now() - started };
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  return { ok: false, ms: Date.now() - started };
+}
+
+function killTunnel() {
+  const child = tunnelChild;
+  tunnelChild = null;
+  if (!child) return;
+  tunnelReplacing = true;
+  try { child.kill('SIGTERM'); } catch {}
+  // If that child somehow never reports its exit, the flag must not stay
+  // raised and swallow the next genuine tunnel death.
+  setTimeout(() => { tunnelReplacing = false; }, 5000).unref();
+}
+
+// Every cloudflared attempt draws a NEW random hostname, so a slow draw is
+// worth abandoning rather than waiting out — a reroll has beaten the wait in
+// every measurement. Funnel gets a single attempt: its hostname is fixed, so
+// retrying would only ask for the same name again.
+async function bringTunnelUp(provider) {
+  const attempts = provider === 'funnel' ? 1 : TUNNEL_ATTEMPTS;
+  for (let i = 1; i <= attempts; i++) {
+    const started = await startTunnel(provider);
+    // An error here is about the BINARY — missing, exited, never printed a
+    // URL. No number of retries fixes that, so surface it now.
+    if (started.error) return { error: started.error };
+    console.log(`  tunnel: got ${started.url} — checking it actually answers before handing it to you…`);
+    const seen = await waitReachable(started.url, TUNNEL_VERIFY_MS);
+    if (seen.ok) return { url: started.url, ms: seen.ms };
+    killTunnel();
+    if (i < attempts) {
+      console.warn(`  !! tunnel: that hostname never resolved after ${Math.round(seen.ms / 1000)}s — asking for a different one (${i + 1}/${attempts}).`);
+    }
+  }
+  return { error: `${attempts > 1 ? `${attempts} tunnels came` : 'the tunnel came'} up but never became reachable from the public internet` };
+}
+
+function announceTunnel(r) {
+  liveTunnelUrl = r.url;
+  // Land the public URL in the registry too — a detached server's stdout goes
+  // to a log file, so this is the only way `list-servers` can hand back a
+  // working link.
+  patchServer(port, { tunnelUrl: r.url });
+  console.log('');
+  console.log(`  PUBLIC: ${r.url}/?token=${auth}`);
+  console.log(`  verified reachable${r.ms == null ? '' : ` in ${Math.round(r.ms / 1000)}s`} — it works right now, no waiting.`);
+  console.log('  !! anyone with this full URL gets a shell as your user — share with care.');
+  console.log('  !! the tunnel dies when this process exits; the URL is not reusable.');
+}
+
+// A quick tunnel can die quietly hours later — process killed, edge drops the
+// connection, laptop slept. Re-roll and announce the replacement instead of
+// leaving a dead link sitting in the scrollback as the only thing the user has.
+function watchTunnel(provider) {
+  let strikes = 0;
+  const timer = setInterval(async () => {
+    if (!liveTunnelUrl) return;
+    const ip = await resolvePublic(new URL(liveTunnelUrl).hostname);
+    const code = ip && tunnelChild ? await probeVia(liveTunnelUrl, ip, 5000) : 0;
+    // Two misses before acting: one failed probe is usually this machine's
+    // network blinking, not the tunnel dying.
+    if (code > 0) { strikes = 0; return; }
+    if (++strikes < 2) return;
+    strikes = 0;
+    console.warn('  !! tunnel: the public URL stopped answering — bringing up a replacement…');
+    killTunnel();
+    liveTunnelUrl = null;
+    patchServer(port, { tunnelUrl: null });
+    const next = await bringTunnelUp(provider);
+    if (next.error) {
+      console.warn(`  !! tunnel: could not replace it (${next.error}). Local server still up; will keep trying.`);
+      return;
+    }
+    announceTunnel(next);
+  }, TUNNEL_HEARTBEAT_MS);
+  // Never hold the process open just to run a health check.
+  timer.unref();
 }
 
 server.listen(port, host, () => {
@@ -1494,19 +1703,22 @@ server.listen(port, host, () => {
   });
   if (!pty) {
     console.warn('');
-    console.warn('  !! terminal disabled: node-pty could not be loaded.');
+    console.warn('  !! terminal disabled — the prebuilt pty binary would not load:');
     console.warn(`  !!   ${ptyError}`);
     console.warn('  !! Editor, git, search and port forwarding all work regardless.');
-    console.warn('  !! To enable the terminal, install a toolchain and reinstall:');
-    console.warn('  !!   Debian/Ubuntu: apt-get install -y build-essential python3');
+    console.warn(`  !! No build tools are needed or wanted here: this is either a platform`);
+    console.warn(`  !! with no prebuilt (${process.platform}-${process.arch}) or an install run with --omit=optional.`);
     console.warn('');
   }
-  // Two host binaries are load-bearing for whole panels and neither can be an
-  // npm dependency. Say so at boot instead of letting a panel look broken.
-  const missing = ['rg', 'git'].filter((b) => !onPath(b));
+  // git stays a host binary by design — anyone opening a source-control panel
+  // has git. ripgrep no longer is: it ships with this package, so a warning
+  // here means no prebuilt for this platform AND no host copy either.
+  const missing = [];
+  if (!rgBin) missing.push('rg');
+  if (!onPath('git')) missing.push('git');
   if (missing.length) {
     console.warn('');
-    if (missing.includes('rg')) console.warn('  !! ripgrep (rg) is not on PATH — workspace search and quick open find nothing.');
+    if (missing.includes('rg')) console.warn('  !! ripgrep is unavailable — workspace search and quick open find nothing.');
     if (missing.includes('git')) console.warn('  !! git is not on PATH — the source-control panel stays empty.');
     console.warn(`  !!   Debian/Ubuntu: apt-get install -y ${missing.map((m) => (m === 'rg' ? 'ripgrep' : m)).join(' ')}`);
     console.warn(`  !!   macOS:         brew install ${missing.map((m) => (m === 'rg' ? 'ripgrep' : m)).join(' ')}`);
@@ -1523,20 +1735,14 @@ server.listen(port, host, () => {
   }
   if (tunnel) {
     console.log(`  tunnel: starting ${tunnel}…`);
-    startTunnel(tunnel).then((r) => {
+    bringTunnelUp(tunnel).then((r) => {
       if (r.error) {
         console.warn(`  !! tunnel failed: ${r.error}`);
-        console.warn('  !! local server unaffected — fix the tunnel binary and restart to retry.');
+        console.warn('  !! local server unaffected — the url above still works on this machine.');
         return;
       }
-      // Land the public URL in the registry too — a detached server's stdout
-      // goes to a log file, so this is the only way `list-servers` can hand
-      // back a working link.
-      patchServer(port, { tunnelUrl: r.url });
-      console.log('');
-      console.log(`  PUBLIC: ${r.url}/?token=${auth}`);
-      console.log('  !! anyone with this full URL gets a shell as your user — share with care.');
-      console.log('  !! the tunnel dies when this process exits; the URL is not reusable.');
+      announceTunnel(r);
+      watchTunnel(tunnel);
     });
   }
 });

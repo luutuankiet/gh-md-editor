@@ -55,20 +55,19 @@ npx -y @luutuankiet/gh-md-editor down                          # stop; picks whe
 
 ### What the host needs
 
-Only Node ≥ 20 is required. Everything below is optional, degrades loudly at startup rather than failing, and never blocks the rest of the editor:
+Node ≥ 20. That is the whole list — no compiler, no Python, no Xcode command line tools, nothing to `apt-get` or `brew install` first. The terminal and search both need native binaries, and both ship as prebuilts for macOS and Linux (x64 and arm64), so npm downloads the one matching the host and nothing gets built.
 
 | Want | Install on the host | Without it |
 |---|---|---|
-| Search + quick open (`Cmd/Ctrl+P`) | `ripgrep` | both come back empty, with the reason |
+| Search + quick open (`Cmd/Ctrl+P`) | nothing — ripgrep ships with the package | n/a |
+| Integrated terminal | nothing — a prebuilt pty ships with the package | on a platform with no prebuilt: terminal disabled, one warning at boot |
 | Source-control panel | `git` | the panel stays empty |
-| Integrated terminal | a C toolchain, so the optional `node-pty` can build: `build-essential python3` (Debian/Ubuntu) or Xcode CLT (macOS) | terminal disabled, one warning at boot |
 | `--tunnel` (public URL) | nothing — cloudflared is downloaded once into `~/.cache/gh-md-editor` | n/a |
 | `--tunnel funnel` | `tailscale`, running and logged in | falls back to a clear error; the local server keeps serving |
 
-A fully-loaded Debian/Ubuntu box is therefore:
+So a bare box is:
 
 ```bash
-apt-get install -y ripgrep git build-essential python3
 npx -y @luutuankiet/gh-md-editor . --host 0.0.0.0 --port 8790 --auth "$(openssl rand -hex 16)"
 ```
 
@@ -78,7 +77,9 @@ The listening-ports panel reads `/proc/net/tcp`, so it is Linux-only; elsewhere 
 
 It binds to loopback by default. `--host 0.0.0.0` opens it to the network, which also exposes the terminal — pair that with `--auth <token>` or an authenticating reverse proxy.
 
-`--tunnel` skips all of that: it starts a cloudflared quick tunnel and prints a public HTTPS URL that works from a phone with no router config, no account and no signup. Because that URL is reachable by the whole internet, auth is forced on with a server-minted token baked into the printed link. If the tunnel binary is missing or dies, the local server carries on serving regardless. `--tunnel funnel` uses Tailscale Funnel instead for a stable hostname, and `--tunnel-bin <path>` points at a binary you already have.
+`--tunnel` skips all of that: it starts a cloudflared quick tunnel and prints a public HTTPS URL that works from a phone with no router config, no account and no signup. Because that URL is reachable by the whole internet, auth is forced on with a server-minted token baked into the printed link. If the tunnel binary is missing or dies, the local server carries on serving regardless.
+
+The URL is printed only once it has been proven to answer. A quick tunnel's hostname exists at the edge before its DNS record does, and that gap is a lottery — measured at 4 seconds on one run and still unresolved past 76 on the next. Clicking too early is worse than waiting, because the resolver caches the "no such host" answer and the link then stays dead for minutes after it goes live. So the server checks the hostname against public resolvers, fetches the URL over the real edge, and only then hands it to you; a draw that stays dark is abandoned and a fresh one requested. A heartbeat keeps checking afterwards and replaces a tunnel that dies, printing the new link. `--tunnel funnel` uses Tailscale Funnel instead for a stable hostname, and `--tunnel-bin <path>` points at a binary you already have.
 
 ## Dev
 

@@ -12,6 +12,18 @@
 import http from 'node:http';
 import net from 'node:net';
 import { WebSocketServer } from 'ws';
+import { registerServer, patchServer, unregisterServer, run as runDaemon } from './daemon.mjs';
+
+// `up` / `down` / `list-servers` never touch the server itself, and node-pty
+// just below is a native addon. Dispatch before paying for it. Safe this
+// early because ESM evaluates every import in the file before any statement
+// in it, so daemon.mjs is already loaded here.
+{
+  const sub = process.argv[2];
+  if (sub === 'up' || sub === 'down' || sub === 'ls' || sub === 'list-servers') {
+    process.exit(await runDaemon(sub, process.argv.slice(3)));
+  }
+}
 // node-pty is an OPTIONAL dependency, loaded lazily on purpose. It is a native
 // addon: when npm finds no prebuild for the running Node version it falls back
 // to node-gyp, which needs make/g++/python3 on the box. As a hard dependency
@@ -49,7 +61,7 @@ let tunnelBin = null;   // explicit binary path override
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--host') host = argv[++i];
-  else if (a === '--port') port = Number(argv[++i]);
+  else if (a === '--port' || a === '-p') port = Number(argv[++i]);
   else if (a === '--auth') auth = argv[++i];
   else if (a === '--tunnel') {
     // Optional value: bare `--tunnel` means cloudflared — the zero-setup path
@@ -60,7 +72,13 @@ for (let i = 0; i < argv.length; i++) {
   }
   else if (a === '--tunnel-bin') tunnelBin = argv[++i];
   else if (a === '--help' || a === '-h') {
-    console.log('usage: node server/index.mjs [dir] [--host 127.0.0.1] [--port 8790] [--auth <token>] [--tunnel [cloudflared|funnel]] [--tunnel-bin <path>]');
+    console.log('usage: gh-md-editor [dir] [--host 127.0.0.1] [--port|-p 8790] [--auth <token>] [--tunnel [cloudflared|funnel]] [--tunnel-bin <path>]');
+    console.log('');
+    console.log('  background mode — outlives the ssh session that started it:');
+    console.log('    gh-md-editor up [dir] [-p PORT] […]   start detached, print the url, return');
+    console.log('    gh-md-editor list-servers             every running server + its url  (alias: ls)');
+    console.log('    gh-md-editor down [-p PORT] [--all]   stop one, pick from a list, or stop all');
+    console.log('    gh-md-editor up --help                more on background mode');
     console.log('');
     console.log('  --tunnel        public HTTPS URL, auth forced on. Downloads cloudflared once');
     console.log('                  into ~/.cache/gh-md-editor if it is not already installed.');
@@ -69,7 +87,7 @@ for (let i = 0; i < argv.length; i++) {
     console.log('  optional host tools: ripgrep (search + quick open), git (source control),');
     console.log('  a C toolchain (integrated terminal). Everything else works without them.');
     process.exit(0);
-  } else if (!a.startsWith('--')) rootArg = a;
+  } else if (!a.startsWith('-')) rootArg = a;
 }
 // A tunnel URL is reachable by the whole internet and /api/pty is a shell —
 // force auth on. The token is minted server-side (not user-supplied) so a
@@ -1134,6 +1152,9 @@ function killAllSessions() {
 }
 
 process.on('exit', killAllSessions);
+// Keep `list-servers` honest on a clean exit. A hard kill skips this and
+// leaves the file behind; the pid liveness check reaps it on the next read.
+process.on('exit', () => unregisterServer(port));
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) {
   process.on(sig, () => {
     if (shuttingDown) return;
@@ -1318,6 +1339,21 @@ server.listen(port, host, () => {
   console.log(`gh-md-editor server mode`);
   console.log(`  root: ${ROOT}`);
   console.log(`  url:  http://${host}:${port}/${auth ? `?token=${auth}` : ''}`);
+  // Register here and nowhere else: listen() succeeding is the first moment
+  // the port is confirmed bound AND the token is final (a bare --tunnel mints
+  // one above). This file is what `list-servers` reads and `down` signals.
+  registerServer({
+    pid: process.pid,
+    host,
+    port,
+    root: ROOT,
+    auth: auth ?? null,
+    tunnel: tunnel ?? null,
+    tunnelUrl: null,
+    daemon: process.env.GH_MD_EDITOR_DAEMON === '1',
+    log: process.env.GH_MD_EDITOR_LOG ?? null,
+    startedAt: Date.now(),
+  });
   if (!pty) {
     console.warn('');
     console.warn('  !! terminal disabled: node-pty could not be loaded.');
@@ -1355,6 +1391,10 @@ server.listen(port, host, () => {
         console.warn('  !! local server unaffected — fix the tunnel binary and restart to retry.');
         return;
       }
+      // Land the public URL in the registry too — a detached server's stdout
+      // goes to a log file, so this is the only way `list-servers` can hand
+      // back a working link.
+      patchServer(port, { tunnelUrl: r.url });
       console.log('');
       console.log(`  PUBLIC: ${r.url}/?token=${auth}`);
       console.log('  !! anyone with this full URL gets a shell as your user — share with care.');

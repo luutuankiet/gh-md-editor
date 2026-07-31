@@ -1,10 +1,10 @@
 {
   "name": "@luutuankiet/gh-md-editor",
-  "version": "0.11.1",
+  "version": "0.12.0",
   "description": "Lightweight browser editor served from any folder: markdown cockpit (editor + live preview + outline), code tabs with syntax highlight, git source control, integrated terminal, ripgrep search.",
   "type": "module",
   "bin": { "gh-md-editor": "index.mjs" },
-  "files": ["index.mjs", "dist/web"],
+  "files": ["index.mjs", "daemon.mjs", "dist/web"],
   "scripts": {
     "prepublishOnly": "test -f dist/web/index.html"
   },

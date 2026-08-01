@@ -369,6 +369,110 @@
     }
   }
 
+  // A plain <a download> offers no progress and no way out, which is the wrong
+  // trade when one right-click can pack a node_modules. Streaming the response
+  // through fetch buys both: bytes as they land, and an abort that propagates
+  // to the server — it awaits every socket write, so a cancelled reader stops
+  // the walk rather than leaving it zipping into the void.
+  interface DlJob {
+    id: number;
+    name: string;
+    got: number;
+    total: number;
+    // Zip size is measured uncompressed, so the bar is an approximation.
+    est: boolean;
+    state: 'active' | 'done' | 'error' | 'cancelled';
+    error?: string;
+    ctl: AbortController;
+  }
+  let dls = $state<DlJob[]>([]);
+  let dlSeq = 0;
+
+  function fmtBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1048576).toFixed(1)} MB`;
+    return `${(n / 1073741824).toFixed(2)} GB`;
+  }
+
+  function filenameFrom(cd: string | null): string {
+    if (!cd) return '';
+    const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+    if (star) { try { return decodeURIComponent(star[1]); } catch { /* fall through */ } }
+    return /filename="([^"]+)"/i.exec(cd)?.[1] ?? '';
+  }
+
+  function dropJob(job: DlJob, after: number) {
+    setTimeout(() => { dls = dls.filter((j) => j.id !== job.id); }, after);
+  }
+
+  async function download(paths: string[]) {
+    menu = null;
+    if (!paths.length) return;
+    const qs = paths.map((p) => `path=${encodeURIComponent(p)}`).join('&');
+    const ctl = new AbortController();
+    dls = [...dls, {
+      id: ++dlSeq,
+      name: paths.length === 1 ? paths[0].split('/').pop() ?? 'download' : `${paths.length} items`,
+      got: 0,
+      total: 0,
+      est: false,
+      state: 'active',
+      ctl,
+    }];
+    // Mutations have to go through the state proxy the array handed back, not
+    // the literal above, or the card never repaints.
+    const job = dls[dls.length - 1];
+    try {
+      const r = await fetch(`/api/download?${qs}&base=${encodeURIComponent(folder)}`, { signal: ctl.signal });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        throw new Error(d.error ?? `HTTP ${r.status}`);
+      }
+      const est = r.headers.get('x-gmd-bytes');
+      job.total = Number(est ?? r.headers.get('content-length') ?? 0) || 0;
+      job.est = est !== null;
+      job.name = filenameFrom(r.headers.get('content-disposition')) || job.name;
+      const reader = r.body?.getReader();
+      let blob: Blob;
+      if (reader) {
+        const chunks: BlobPart[] = [];
+        let got = 0;
+        let painted = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          got += value.length;
+          // Repainting per 64 KB chunk would spend more time on the card than
+          // on the download.
+          const now = Date.now();
+          if (now - painted > 80) { painted = now; job.got = got; }
+        }
+        job.got = got;
+        blob = new Blob(chunks);
+      } else {
+        blob = await r.blob();
+        job.got = blob.size;
+      }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = job.name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      job.state = 'done';
+      dropJob(job, 4000);
+    } catch (e) {
+      const aborted = ctl.signal.aborted;
+      job.state = aborted ? 'cancelled' : 'error';
+      if (!aborted) job.error = e instanceof Error ? e.message : String(e);
+      dropJob(job, aborted ? 2500 : 8000);
+    }
+  }
+
   function terminalHere(node: { path: string; type: EntryType }) {
     menu = null;
     // Files spawn the shell in their parent folder.
@@ -460,6 +564,9 @@
     <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && copyFullPath(menu.paths)}>
       Copy full path{#if menu.paths.length > 1}s&nbsp;({menu.paths.length}){/if}
     </button>
+    <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && download(menu.paths)}>
+      Download{#if menu.paths.length > 1}&nbsp;({menu.paths.length}&nbsp;as zip){:else if menu.type === 'dir'}&nbsp;as zip{/if}
+    </button>
     <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && terminalHere(menu)}>
       Open new terminal here
     </button>
@@ -471,6 +578,32 @@
 {/if}
 {#if toast}
   <div class="toast">{toast}</div>
+{/if}
+{#if dls.length}
+  <div class="dl-stack">
+    {#each dls as j (j.id)}
+      <div class="dl">
+        <div class="dl-top">
+          <span class="dl-name" title={j.name}>{j.name}</span>
+          {#if j.state === 'active'}
+            <button type="button" class="dl-x" title="Cancel download" aria-label="Cancel download" onclick={() => j.ctl.abort()}>✕</button>
+          {/if}
+        </div>
+        <div class="dl-bar" class:indet={j.state === 'active' && !j.total}>
+          <span
+            class:bad={j.state === 'error' || j.state === 'cancelled'}
+            style="width: {j.total ? Math.min(100, (j.got / j.total) * 100) : 100}%"
+          ></span>
+        </div>
+        <div class="dl-sub">
+          {#if j.state === 'error'}{j.error}
+          {:else if j.state === 'cancelled'}Cancelled.
+          {:else if j.state === 'done'}Saved · {fmtBytes(j.got)}
+          {:else}{fmtBytes(j.got)}{#if j.total}&nbsp;of {j.est ? '~' : ''}{fmtBytes(j.total)}{/if}{/if}
+        </div>
+      </div>
+    {/each}
+  </div>
 {/if}
 
 <style>
@@ -603,6 +736,72 @@
     cursor: pointer;
   }
   .ctx-item:hover { background: #444444; }
+  .dl-stack {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: 120;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 260px;
+  }
+  .dl {
+    background: #272727;
+    border: 1px solid #404040;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: #c5c8c6;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
+  .dl-top {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .dl-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dl-x {
+    border: 0;
+    background: none;
+    color: #949494;
+    cursor: pointer;
+    font: inherit;
+    line-height: 1;
+    padding: 0 2px;
+  }
+  .dl-x:hover { color: #f47067; }
+  .dl-bar {
+    height: 3px;
+    margin: 6px 0 4px;
+    border-radius: 2px;
+    background: #3a3a3a;
+    overflow: hidden;
+  }
+  .dl-bar span {
+    display: block;
+    height: 100%;
+    background: #e58520;
+  }
+  .dl-bar span.bad { background: #f47067; }
+  /* No length header means no honest fraction, so the bar sweeps instead of
+     inventing one. */
+  .dl-bar.indet span { animation: dl-sweep 1.1s ease-in-out infinite; }
+  @keyframes dl-sweep {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+  .dl-sub {
+    color: #949494;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .toast {
     position: fixed;
     left: 50%;

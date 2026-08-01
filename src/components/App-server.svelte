@@ -3,6 +3,7 @@
   import MarkdownTab from './server/MarkdownTab.svelte';
   import CodeTab from './server/CodeTab.svelte';
   import SourceControlPanel from './server/SourceControlPanel.svelte';
+  import TreeComparePanel from './server/TreeComparePanel.svelte';
   import DiffTab from './server/DiffTab.svelte';
   import SaveAsModal from './server/SaveAsModal.svelte';
   import WorkspaceBrowser from './server/WorkspaceBrowser.svelte';
@@ -23,7 +24,7 @@
     // Set by a search-result click; consumed by CodeTab to scroll + select.
     reveal?: { line: number; seq: number; select?: { from: number; to: number } };
     // Present on kind === 'diff' tabs: which repo/file/side the tab shows.
-    git?: { repo: string; path: string; staged: boolean; untracked: boolean };
+    git?: { repo: string; path: string; staged: boolean; untracked: boolean; base?: string; baseLabel?: string };
     // Present on kind === 'diff' tabs opened by a compare command: two
     // arbitrary inputs instead of a git side. rightText holds pasted content,
     // which lives in memory only.
@@ -37,7 +38,7 @@
 
   // Which view the left sidebar shows. Both stay mounted (CSS-hidden) so the
   // explorer keeps its expanded folders and search keeps its results.
-  let sideView = $state<'explorer' | 'search'>('explorer');
+  let sideView = $state<'explorer' | 'search' | 'compare'>('explorer');
 
   // Outline lives as a collapsible section at the bottom of the explorer, VS
   // Code style. Collapsed by default; the choice is remembered per workspace.
@@ -663,7 +664,7 @@
       nextGroupId = Math.max(...restored.map((g) => g.id)) + 1;
       activeGroupId = restored.some((g) => g.id === snap.activeGroupId) ? snap.activeGroupId : restored[0].id;
     }
-    if (snap.sideView === 'explorer' || snap.sideView === 'search') sideView = snap.sideView;
+    if (snap.sideView === 'explorer' || snap.sideView === 'search' || snap.sideView === 'compare') sideView = snap.sideView;
     if (snap.bottomView === 'terminal' || snap.bottomView === 'ports') bottomView = snap.bottomView;
     sessionRestored = true;
   }
@@ -748,8 +749,8 @@
   // A diff tab is keyed by repo+side+path so the staged and working-tree
   // views of the same file are two distinct tabs — exactly like VS Code's
   // "Index vs Working Tree" split.
-  function openDiff(repo: string, file: { path: string; staged: boolean; untracked?: boolean }) {
-    const key = `gmd-diff:${repo}:${file.staged ? 'S' : 'W'}:${file.path}`;
+  function openDiff(repo: string, file: { path: string; staged: boolean; untracked?: boolean; base?: string; baseLabel?: string }) {
+    const key = `gmd-diff:${repo}:${file.base ? `B:${file.base}` : file.staged ? 'S' : 'W'}:${file.path}`;
     for (const g of groups) {
       const existing = g.tabs.find((t) => t.path === key);
       if (existing) {
@@ -760,13 +761,13 @@
     }
     const tab: Tab = {
       path: key,
-      name: `${baseName(file.path)} (${file.staged ? 'staged' : 'changes'})`,
+      name: `${baseName(file.path)} (${file.base ? `vs ${file.baseLabel ?? 'base'}` : file.staged ? 'staged' : 'changes'})`,
       kind: 'diff',
       pinned: false,
       content: '',
       savedContent: '',
       mtimeMs: 0,
-      git: { repo, path: file.path, staged: file.staged, untracked: !!file.untracked },
+      git: { repo, path: file.path, staged: file.staged, untracked: !!file.untracked, base: file.base, baseLabel: file.baseLabel },
     };
     const home = groups.includes(activeGroup) ? activeGroup : groups[0];
     const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
@@ -833,17 +834,39 @@
         openCompare({ leftPath: t.path, rightText: text, rightLabel: 'clipboard' });
         return;
       }
-    } catch { /* fall through to the paste box */ }
+    } catch { /* fall through to the armed paste bar */ }
     pasteText = '';
     pasteCompare = true;
   }
 
-  function runPasteCompare() {
+  // Arming beats prompting: the bar focuses a catcher, and the first paste it
+  // sees opens the diff. No modal, no Compare click, no round-trip.
+  function pasteCapture(text: string) {
     const t = compareSource();
-    const text = pasteText;
     pasteCompare = false;
     pasteText = '';
-    if (t && text) openCompare({ leftPath: t.path, rightText: text, rightLabel: 'pasted text' });
+    if (t && text) openCompare({ leftPath: t.path, rightText: text, rightLabel: 'clipboard' });
+  }
+
+  function cancelPasteCompare() {
+    pasteCompare = false;
+    pasteText = '';
+  }
+
+  function onPasteEvent(e: ClipboardEvent) {
+    // Read the event's own payload rather than the field: this fires before
+    // the textarea sees the text, so nothing can be mangled on the way in.
+    const text = e.clipboardData?.getData('text/plain') ?? '';
+    if (!text) return;
+    e.preventDefault();
+    pasteCapture(text);
+  }
+
+  function onPasteInput(e: Event) {
+    // Touch "Paste" menus land as an input event with no paste event ahead of
+    // it; inputType is what separates that from someone typing.
+    const v = (e.target as HTMLTextAreaElement).value;
+    if ((e as InputEvent).inputType === 'insertFromPaste' && v) pasteCapture(v);
   }
 
   let saveAs = $state<{ tab: Tab } | null>(null);
@@ -1075,7 +1098,7 @@
 
   // Activity-bar click: switch view, or collapse the sidebar when the current
   // view is clicked again — VS Code's behaviour.
-  function pickSide(v: 'explorer' | 'search') {
+  function pickSide(v: 'explorer' | 'search' | 'compare') {
     if (layout.showLeft && sideView === v) {
       layout.showLeft = false;
       return;
@@ -1227,6 +1250,14 @@
       >
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.7 9.6a4.6 4.6 0 1 0-1.1 1.1l3.4 3.4 1.1-1.1zM3.1 6.7a3.3 3.3 0 1 1 6.6 0 3.3 3.3 0 0 1-6.6 0z" /></svg>
       </button>
+      <button
+        type="button"
+        class:on={layout.showLeft && sideView === 'compare'}
+        title="Tree Compare"
+        onclick={() => pickSide('compare')}
+      >
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.6 4.9a2 2 0 1 0-1.2 0v6.2a2 2 0 1 0 1.2 0zM4 13.8a.8.8 0 1 1 0-1.6.8.8 0 0 1 0 1.6zm0-9.9a.8.8 0 1 1 0-1.6.8.8 0 0 1 0 1.6zm8 7.2V6.9a2.4 2.4 0 0 0-2.4-2.4H8.3l1.3-1.3-.9-.9-2.8 2.8 2.8 2.8.9-.9-1.3-1.3h1.3c.7 0 1.2.5 1.2 1.2v4.2a2 2 0 1 0 1.2 0zm-.6 2.7a.8.8 0 1 1 0-1.6.8.8 0 0 1 0 1.6z"/></svg>
+      </button>
     </nav>
     <aside class="sidebar" class:hidden={!layout.showLeft} style="flex-basis: {layout.leftW}px">
       <!-- Both views stay mounted: remounting the explorer would collapse every
@@ -1286,6 +1317,9 @@
       </div>
       <div class="side-view" class:hidden={sideView !== 'search'}>
         <SearchPanel onOpen={(p, line) => openFile(p, { pinned: false, line })} />
+      </div>
+      <div class="side-view" class:hidden={sideView !== 'compare'}>
+        <TreeComparePanel visible={layout.showLeft && sideView === 'compare'} onOpenDiff={openDiff} />
       </div>
 
     </aside>
@@ -1354,7 +1388,7 @@
                   {:else if at.kind === 'diff' && at.cmp}
                     <DiffTab compare={at.cmp} />
                   {:else if at.kind === 'diff' && at.git}
-                    <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} />
+                    <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} />
                   {:else if at.kind === 'md'}
                     <MarkdownTab bind:value={at.content} name={at.name} reveal={at.reveal ?? null} />
                   {:else}
@@ -1434,66 +1468,74 @@
   />
 {/if}
 {#if pasteCompare}
-  <!-- The clipboard read needs a secure context that plain-http LAN serving
-       does not provide, but a paste event always carries its data — so the
-       textarea is the reliable path rather than the consolation prize. -->
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="paste-back" onclick={() => { pasteCompare = false; pasteText = ''; }}>
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="paste-box" onclick={(e) => e.stopPropagation()}>
-      <strong>Compare {activeTab?.name ?? ''} with pasted text</strong>
-      <!-- svelte-ignore a11y_autofocus -->
-      <textarea bind:value={pasteText} autofocus placeholder="Paste here, then press Compare…"></textarea>
-      <div class="paste-actions">
-        <button type="button" onclick={() => { pasteCompare = false; pasteText = ''; }}>Cancel</button>
-        <button type="button" disabled={!pasteText} onclick={runPasteCompare}>Compare</button>
-      </div>
-    </div>
+  <!-- Reading the clipboard needs a secure context that plain-http LAN serving
+       does not provide, but a paste event always carries its data — so the bar
+       arms a catcher and fires on the paste itself. The buttons are only there
+       for the hand-edited case. -->
+  <div class="paste-bar">
+    <span class="paste-hint">Paste (⌘V / Ctrl+V) to compare <strong>{activeTab?.name ?? ''}</strong> with the clipboard</span>
+    <!-- svelte-ignore a11y_autofocus -->
+    <textarea
+      class="paste-catch"
+      rows="1"
+      autofocus
+      bind:value={pasteText}
+      onpaste={onPasteEvent}
+      oninput={onPasteInput}
+      onkeydown={(e) => { if (e.key === 'Escape') cancelPasteCompare(); }}
+      placeholder="paste here…"
+    ></textarea>
+    <button type="button" disabled={!pasteText} onclick={() => pasteCapture(pasteText)}>Compare</button>
+    <button type="button" onclick={cancelPasteCompare}>Cancel</button>
   </div>
 {/if}
 
 <style>
-  .paste-back {
+  .paste-bar {
     position: fixed;
-    inset: 0;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
     z-index: 60;
     display: flex;
     align-items: center;
-    justify-content: center;
-    background: rgba(0, 0, 0, 0.45);
-  }
-  .paste-box {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    width: min(680px, 90vw);
-    padding: 14px;
+    gap: 8px;
+    width: min(720px, 92vw);
+    box-sizing: border-box;
+    padding: 8px 10px;
     border: 1px solid #505050;
     border-radius: 6px;
     background: #232323;
     color: #c5c8c6;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
-    font-size: 13px;
+    font-size: 12px;
   }
-  .paste-box textarea {
-    height: 40vh;
+  .paste-hint {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .paste-catch {
+    flex: 1;
+    min-width: 80px;
+    height: 24px;
     box-sizing: border-box;
-    resize: vertical;
-    padding: 6px;
+    resize: none;
+    overflow: hidden;
+    white-space: pre;
+    padding: 3px 6px;
     border: 1px solid #505050;
     border-radius: 3px;
     background: #1e1e1e;
     color: #c5c8c6;
-    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
   }
-  .paste-box textarea:focus {
+  .paste-catch:focus {
     outline: none;
     border-color: #e58520;
   }
-  .paste-actions button {
-    padding: 4px 12px;
+  .paste-bar button {
+    padding: 3px 10px;
     font-size: 12px;
     border: 1px solid #505050;
     border-radius: 3px;
@@ -1501,16 +1543,11 @@
     color: #c5c8c6;
     cursor: pointer;
   }
-  .paste-actions button:disabled {
+  .paste-bar button:disabled {
     opacity: 0.5;
     cursor: default;
   }
-  .paste-actions button:not(:disabled):hover { background: #3a3a3a; }
-  .paste-actions {
-    display: flex;
-    gap: 8px;
-    justify-content: flex-end;
-  }
+  .paste-bar button:not(:disabled):hover { background: #3a3a3a; }
 
   .app {
     display: flex;

@@ -93,10 +93,11 @@ try {
 } catch { /* no prebuilt for this platform — fall back below */ }
 if (!rgBin && onPath('rg')) rgBin = 'rg';
 import { spawn, spawnSync } from 'node:child_process';
-import { promises as fs } from 'node:fs';
+import { createReadStream, promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
+import zlib from 'node:zlib';
 import https from 'node:https';
 import dns from 'node:dns';
 import { createRequire } from 'node:module';
@@ -414,6 +415,231 @@ async function apiFilePut(req, res) {
   }
 }
 
+// --- download (raw file / zip) ----------------------------------------------
+//   GET /api/download?path=<rel>&path=<rel>&base=<rel>
+// One plain file streams as itself; anything else (a folder, or a multi-select)
+// is packed into a zip written straight to the socket. The archive is built by
+// hand because the server is deliberately dependency-free — a zip is a header,
+// the bytes, and a table of contents, and node:zlib already supplies the only
+// hard part.
+
+// No ZIP64 record is written, so these are the format's own ceilings rather
+// than arbitrary policy.
+const ZIP_MAX_ENTRIES = 65535;
+const ZIP_MAX_TOTAL = 2 * 1024 * 1024 * 1024;
+
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[i] = c;
+  }
+  return t;
+})();
+
+// zlib.crc32 landed in Node 20.15 / 22.2; the table above keeps older runtimes
+// producing valid archives instead of silently corrupt ones.
+function crc32(buf) {
+  if (typeof zlib.crc32 === 'function') return zlib.crc32(buf);
+  let c = -1;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
+}
+
+// Zip timestamps are MS-DOS: an epoch of 1980 and two-second resolution.
+function dosStamp(d) {
+  const y = d.getFullYear();
+  if (y < 1980) return { time: 0, date: 0x21 };
+  return {
+    time: (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1),
+    date: ((y - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
+  };
+}
+
+function zipLocal(name, m) {
+  const n = Buffer.from(name, 'utf8');
+  const h = Buffer.alloc(30 + n.length);
+  h.writeUInt32LE(0x04034b50, 0);
+  h.writeUInt16LE(20, 4);
+  h.writeUInt16LE(0x0800, 6); // names are UTF-8
+  h.writeUInt16LE(m.method, 8);
+  h.writeUInt16LE(m.time, 10);
+  h.writeUInt16LE(m.date, 12);
+  h.writeUInt32LE(m.crc, 14);
+  h.writeUInt32LE(m.csize, 18);
+  h.writeUInt32LE(m.usize, 22);
+  h.writeUInt16LE(n.length, 26);
+  h.writeUInt16LE(0, 28);
+  n.copy(h, 30);
+  return h;
+}
+
+function zipCentral(name, m) {
+  const n = Buffer.from(name, 'utf8');
+  const h = Buffer.alloc(46 + n.length);
+  h.writeUInt32LE(0x02014b50, 0);
+  h.writeUInt16LE(20, 4);
+  h.writeUInt16LE(20, 6);
+  h.writeUInt16LE(0x0800, 8);
+  h.writeUInt16LE(m.method, 10);
+  h.writeUInt16LE(m.time, 12);
+  h.writeUInt16LE(m.date, 14);
+  h.writeUInt32LE(m.crc, 16);
+  h.writeUInt32LE(m.csize, 20);
+  h.writeUInt32LE(m.usize, 24);
+  h.writeUInt16LE(n.length, 28);
+  h.writeUInt16LE(0, 30);
+  h.writeUInt16LE(0, 32);
+  h.writeUInt16LE(0, 34);
+  h.writeUInt16LE(0, 36);
+  // High word = unix mode, low bit 0x10 = the MS-DOS directory flag, so both
+  // unzip families see a folder as a folder.
+  h.writeUInt32LE(m.dir ? 0x41ed0010 : 0x81a40000, 38);
+  h.writeUInt32LE(m.offset, 42);
+  n.copy(h, 46);
+  return h;
+}
+
+// A non-ASCII name has no portable home in the plain `filename`, so send a
+// stripped copy for old clients plus the RFC 5987 form everything modern reads.
+function contentDisposition(name) {
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+async function apiDownload(res, params) {
+  const rels = params.getAll('path');
+  if (!rels.length) return sendJson(res, 400, { error: 'path required' });
+  const targets = [];
+  for (const rel of rels) {
+    const abs = resolveSafe(rel);
+    if (!abs) return sendJson(res, 400, { error: 'path escapes root' });
+    let st;
+    try { st = await fs.lstat(abs); } catch { return sendJson(res, 404, { error: `not found: ${rel}` }); }
+    targets.push({ abs, st });
+  }
+
+  // Zipping a lone file would only make the user unpack it again.
+  if (targets.length === 1 && targets[0].st.isFile()) {
+    const { abs, st } = targets[0];
+    res.writeHead(200, {
+      'content-type': 'application/octet-stream',
+      'content-length': String(st.size),
+      'content-disposition': contentDisposition(path.basename(abs)),
+      'cache-control': 'no-store',
+    });
+    await new Promise((resolve) => {
+      const s = createReadStream(abs);
+      s.on('error', () => { res.destroy(); resolve(); });
+      s.on('end', resolve);
+      s.pipe(res);
+    });
+    return;
+  }
+
+  // Walk before writing: a selection the format cannot express has to fail as
+  // JSON, while there are still no archive bytes on the wire to contradict.
+  const entries = [];
+  let total = 0;
+  const walk = async (abs, name) => {
+    let st;
+    try { st = await fs.lstat(abs); } catch { return; }
+    // Symlinks are never followed: they invite walk loops and can point clean
+    // out of the workspace.
+    if (st.isSymbolicLink()) return;
+    if (st.isDirectory()) {
+      entries.push({ abs, name: `${name}/`, st, dir: true });
+      let kids;
+      try { kids = await fs.readdir(abs); } catch { return; }
+      kids.sort((a, b) => a.localeCompare(b));
+      for (const k of kids) await walk(path.join(abs, k), `${name}/${k}`);
+    } else if (st.isFile()) {
+      total += st.size;
+      entries.push({ abs, name, st, dir: false });
+    }
+  };
+  for (const t of targets) await walk(t.abs, path.basename(t.abs) || 'root');
+
+  if (!entries.length) return sendJson(res, 404, { error: 'nothing to download' });
+  if (entries.length > ZIP_MAX_ENTRIES) {
+    return sendJson(res, 413, { error: `${entries.length} entries exceeds the ${ZIP_MAX_ENTRIES}-entry zip limit` });
+  }
+  if (total > ZIP_MAX_TOTAL) {
+    return sendJson(res, 413, {
+      error: `selection is ${Math.round(total / 1e6)} MB, over the ${Math.round(ZIP_MAX_TOTAL / 1e6)} MB download limit`,
+    });
+  }
+
+  const baseAbs = resolveSafe(params.get('base') ?? '.') ?? ROOT;
+  const zipName = targets.length === 1
+    ? `${path.basename(targets[0].abs) || 'workspace'}.zip`
+    : `${path.basename(baseAbs) || 'workspace'}-files.zip`;
+  res.writeHead(200, {
+    'content-type': 'application/zip',
+    'content-disposition': contentDisposition(zipName),
+    'cache-control': 'no-store',
+    // The archive is chunked, so the only size knowable up front is what the
+    // walk measured. The client shows it as an estimate and uses it to decide
+    // whether a selection is worth cancelling.
+    'x-gmd-bytes': String(total),
+    'x-gmd-entries': String(entries.length),
+  });
+
+  // Await each write so a slow client throttles the walk instead of the whole
+  // archive piling up in the socket buffer.
+  const write = (buf) => new Promise((resolve, reject) => { res.write(buf, (e) => (e ? reject(e) : resolve())); });
+  const central = [];
+  let offset = 0;
+  try {
+    for (const e of entries) {
+      const stamp = dosStamp(e.st.mtime);
+      let body = Buffer.alloc(0);
+      let meta;
+      if (e.dir) {
+        meta = { method: 0, crc: 0, csize: 0, usize: 0, dir: true, offset, ...stamp };
+      } else {
+        const raw = await fs.readFile(e.abs);
+        const packed = zlib.deflateRawSync(raw);
+        // Already-compressed assets grow under deflate, so store those verbatim.
+        const store = packed.length >= raw.length;
+        body = store ? raw : packed;
+        meta = {
+          method: store ? 0 : 8,
+          crc: crc32(raw),
+          csize: body.length,
+          usize: raw.length,
+          dir: false,
+          offset,
+          ...stamp,
+        };
+      }
+      const local = zipLocal(e.name, meta);
+      await write(local);
+      if (body.length) await write(body);
+      central.push(zipCentral(e.name, meta));
+      offset += local.length + body.length;
+    }
+    const cd = Buffer.concat(central);
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(0, 4);
+    eocd.writeUInt16LE(0, 6);
+    eocd.writeUInt16LE(central.length, 8);
+    eocd.writeUInt16LE(central.length, 10);
+    eocd.writeUInt32LE(cd.length, 12);
+    eocd.writeUInt32LE(offset, 16);
+    eocd.writeUInt16LE(0, 20);
+    await write(cd);
+    await write(eocd);
+    res.end();
+  } catch {
+    // The headers are long gone, so a truncated archive the browser refuses is
+    // the only honest signal left — cut the socket rather than end it cleanly.
+    res.destroy();
+  }
+}
+
 // --- quick open (fuzzy file list) ------------------------------------------
 //   GET /api/quickopen?q=<query>&path=<base>
 //   → {files:[{path}], truncated}
@@ -647,10 +873,14 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/file' && req.method === 'PUT') return await apiFilePut(req, res);
     if (url.pathname === '/api/search' && req.method === 'GET') return apiSearch(req, res, url.searchParams);
     if (url.pathname === '/api/context' && req.method === 'GET') return await apiContext(res, url.searchParams);
+    if (url.pathname === '/api/download' && req.method === 'GET') return await apiDownload(res, url.searchParams);
     if (url.pathname === '/api/git/repos' && req.method === 'GET') return await apiGitRepos(res, url.searchParams);
     if (url.pathname === '/api/git/status' && req.method === 'GET') return await apiGitStatus(res, url.searchParams);
     if (url.pathname === '/api/git/diff' && req.method === 'GET') return await apiGitDiff(res, url.searchParams);
     if (url.pathname === '/api/diff/compare' && req.method === 'POST') return await apiDiffCompare(req, res);
+    if (url.pathname === '/api/diff/apply' && req.method === 'POST') return await apiDiffApply(req, res);
+    if (url.pathname === '/api/git/refs' && req.method === 'GET') return await apiGitRefs(res, url.searchParams);
+    if (url.pathname === '/api/git/compare' && req.method === 'GET') return await apiGitCompare(res, url.searchParams);
     if (url.pathname === '/api/git/action' && req.method === 'POST') return await apiGitAction(req, res);
     if (url.pathname === '/api/terminals' && req.method === 'GET') {
       return sendJson(res, 200, { terminals: [...sessions.values()].map(sessionInfo) });
@@ -818,6 +1048,9 @@ function apiSearch(req, res, params) {
 //   GET  /api/git/status?repo=     branch/ahead/behind + staged & unstaged files
 //   GET  /api/git/diff?repo=&path=&staged=1   parsed hunks for one file
 //   POST /api/diff/compare         {leftPath, rightPath|rightText} → same hunks
+//   POST /api/diff/apply           apply one compare hunk onto either side
+//   GET  /api/git/refs?repo=       branch/tag names for the compare picker
+//   GET  /api/git/compare?repo=&base=&mode=   changed files vs a base ref
 //   POST /api/git/action           {op: stage|unstage|discard|apply|commit}
 const GIT_MAX = 16 * 1024 * 1024;
 const GIT_SKIP = new Set(['node_modules', 'dist', 'build', 'target', 'vendor', '__pycache__']);
@@ -1023,13 +1256,72 @@ function buildPatch(relPath, hunk, sel, reverse) {
   return `--- a/${relPath}\n+++ b/${relPath}\n${header}\n${body.join('\n')}\n`;
 }
 
-function rawDiff(repoAbs, rel, staged, untracked) {
+function rawDiff(repoAbs, rel, staged, untracked, base) {
   const common = ['--no-color', '--no-ext-diff', '-U3'];
   // An untracked file has nothing to diff against, so compare it to /dev/null
   // rather than synthesising a hunk by hand — this also gets binary detection
   // and the missing-trailing-newline marker for free. It exits 1 by design.
+  // This wins over `base` on purpose: a file absent from the base tree has
+  // the same whole-file-add shape whichever view asked for it.
   if (untracked) return git(['diff', '--no-index', ...common, '--', '/dev/null', rel], repoAbs);
+  // A base ref pins the old side to that commit's tree instead of the index —
+  // exactly what the tree-compare view shows.
+  if (base) return git(['diff', ...common, base, '--', rel], repoAbs);
   return git(['diff', ...common, ...(staged ? ['--cached'] : []), '--', rel], repoAbs);
+}
+
+// A ref is trusted only after git itself confirms it names a commit. The
+// leading-dash rejection is not redundant with --end-of-options: the resolved
+// ref is later spliced into OTHER argv positions (`git diff <ref>`) where a
+// dash-shaped name could read as a flag.
+function resolveRef(repoAbs, ref) {
+  if (typeof ref !== 'string' || !ref || ref.startsWith('-')) return null;
+  const r = git(['rev-parse', '--verify', '--quiet', '--end-of-options', `${ref}^{commit}`], repoAbs);
+  return r.code === 0 ? r.out.trim() : null;
+}
+
+async function apiGitRefs(res, params) {
+  const abs = resolveSafe(params.get('repo') ?? '.');
+  if (!abs) return sendJson(res, 400, { error: 'repo escapes root' });
+  const r = git(
+    ['for-each-ref', '--sort=-committerdate', '--format=%(refname:short)', 'refs/heads', 'refs/remotes', 'refs/tags'],
+    abs,
+  );
+  if (r.code !== 0) return sendJson(res, 500, { error: r.err || 'git for-each-ref failed' });
+  // `origin` alone is origin/HEAD's short name — an alias, not a pickable ref.
+  const refs = r.out.split('\n').filter((n) => n && n !== 'origin');
+  const head = git(['rev-parse', '--abbrev-ref', 'HEAD'], abs);
+  return sendJson(res, 200, { refs, head: head.code === 0 ? head.out.trim() : '' });
+}
+
+async function apiGitCompare(res, params) {
+  const abs = resolveSafe(params.get('repo') ?? '.');
+  if (!abs) return sendJson(res, 400, { error: 'repo escapes root' });
+  const baseSha = resolveRef(abs, params.get('base'));
+  if (!baseSha) return sendJson(res, 400, { error: 'unknown ref' });
+  // Merge-base by default mirrors a PR review: only this branch's own work
+  // shows up, not everything the base gained since. `mode=direct` compares
+  // the trees head-on instead. The resolved sha is returned so every later
+  // call (per-file diff, restore) pins to the SAME tree even if HEAD moves.
+  let base = baseSha;
+  if (params.get('mode') !== 'direct') {
+    const mb = git(['merge-base', baseSha, 'HEAD'], abs);
+    if (mb.code === 0) base = mb.out.trim();
+  }
+  const d = git(['diff', '--no-color', '--no-renames', '--name-status', '-z', base, '--'], abs);
+  if (d.code !== 0) return sendJson(res, 500, { error: d.err || 'git diff failed' });
+  const files = [];
+  const parts = d.out.split('\0');
+  for (let i = 0; i + 1 < parts.length && parts[i]; i += 2) {
+    files.push({ status: parts[i][0], path: parts[i + 1] });
+  }
+  // Untracked files never show in a ref diff but ARE part of "my tree vs
+  // base", so they are appended with the panel's usual U badge.
+  const u = git(['ls-files', '--others', '--exclude-standard', '-z'], abs);
+  if (u.code === 0) {
+    for (const p of u.out.split('\0')) if (p) files.push({ status: 'U', path: p });
+  }
+  return sendJson(res, 200, { base: params.get('base'), resolved: base, files });
 }
 
 async function apiGitRepos(res, params) {
@@ -1095,8 +1387,13 @@ async function apiGitDiff(res, params) {
   if (!rel) return sendJson(res, 400, { error: 'bad path' });
   const staged = params.get('staged') === '1';
   const untracked = params.get('untracked') === '1';
+  let base;
+  if (params.get('base')) {
+    base = resolveRef(abs, params.get('base'));
+    if (!base) return sendJson(res, 400, { error: 'unknown ref' });
+  }
 
-  const d = rawDiff(abs, rel, staged, untracked);
+  const d = rawDiff(abs, rel, staged, untracked, base);
   if (d.code === -1) return sendJson(res, 500, { error: d.err });
   if (/^Binary files /m.test(d.out) || /^GIT binary patch/m.test(d.out)) {
     return sendJson(res, 200, { path: rel, staged, binary: true, hunks: [] });
@@ -1154,6 +1451,73 @@ async function apiDiffCompare(req, res) {
   }
 }
 
+// Apply one hunk (or the selected lines of it) of an arbitrary compare onto
+// one of its own sides — VS Code's per-change arrows. The diff is recomputed
+// here so the patch always matches the files as they are right now; a stale
+// browser view surfaces as git rejecting the patch, never as silent
+// corruption.
+async function apiDiffApply(req, res) {
+  let body;
+  try {
+    body = JSON.parse((await readBody(req)).toString('utf8'));
+  } catch {
+    return sendJson(res, 400, { error: 'invalid JSON body' });
+  }
+  const leftAbs = resolveSafe(body.leftPath);
+  if (!leftAbs) return sendJson(res, 400, { error: 'left path escapes root' });
+  const target = body.target === 'right' ? 'right' : 'left';
+
+  let rightAbs;
+  let tmpDir = null;
+  if (typeof body.rightText === 'string') {
+    // Pasted text has no file on disk to write back to.
+    if (target === 'right') return sendJson(res, 400, { error: 'pasted text has no file to apply to' });
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gmd-cmp-'));
+    rightAbs = path.join(tmpDir, path.basename(leftAbs));
+    await fs.writeFile(rightAbs, body.rightText, 'utf8');
+  } else {
+    rightAbs = resolveSafe(body.rightPath);
+    if (!rightAbs) return sendJson(res, 400, { error: 'right path escapes root' });
+  }
+
+  try {
+    const d = git(
+      ['diff', '--no-index', '--no-color', '--no-ext-diff', '-U3', '--', leftAbs, rightAbs],
+      path.dirname(leftAbs),
+    );
+    if (d.code === -1) return sendJson(res, 500, { error: d.err });
+    const hunks = parseDiff(d.out);
+    const hunk = hunks[body.hunk ?? -1];
+    if (!hunk) return sendJson(res, 409, { error: 'hunk no longer exists — refresh' });
+    const sel = new Set(
+      Array.isArray(body.lines) && body.lines.length
+        ? body.lines
+        : hunk.lines.map((l, i) => (l.t === '+' || l.t === '-' ? i : -1)).filter((i) => i >= 0),
+    );
+    if (!hunk.lines.some((l, i) => (l.t === '+' || l.t === '-') && sel.has(i))) {
+      return sendJson(res, 400, { error: 'selection contains no changed lines' });
+    }
+    // The diff reads left→right, so making the LEFT file match the right is a
+    // forward apply and making the RIGHT file match the left is a reverse one.
+    // buildPatch's demotion rules key off the same flag, so the patch is built
+    // against whichever side it will be matched with.
+    const targetAbs = target === 'right' ? rightAbs : leftAbs;
+    const reverse = target === 'right';
+    const patch = buildPatch(path.basename(targetAbs), hunk, sel, reverse);
+    const args = ['apply', '--unidiff-zero', '--whitespace=nowarn'];
+    if (reverse) args.push('--reverse');
+    args.push('-');
+    // cwd = the target's directory + headers naming its basename: git's
+    // default -p1 strip lands on the right file with no repo involved.
+    const r = git(args, path.dirname(targetAbs), patch);
+    return r.code === 0
+      ? sendJson(res, 200, { ok: true })
+      : sendJson(res, 409, { error: r.err || 'patch does not apply — refresh' });
+  } finally {
+    if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function apiGitAction(req, res) {
   let body;
   try {
@@ -1204,8 +1568,16 @@ async function apiGitAction(req, res) {
       const rel = cleanRepoPath(body.path);
       if (!rel) return sendJson(res, 400, { error: 'bad path' });
       const mode = body.mode ?? 'stage';
+      let base;
+      if (body.base) {
+        // Stage/unstage are index-relative and meaningless against a pinned
+        // tree; only restore-to-base (a reverse apply) is coherent here.
+        if (mode !== 'revert') return sendJson(res, 400, { error: 'base diffs only support revert' });
+        base = resolveRef(abs, body.base);
+        if (!base) return sendJson(res, 400, { error: 'unknown ref' });
+      }
       const fromIndex = mode === 'unstage';
-      const d = rawDiff(abs, rel, fromIndex, !!body.untracked);
+      const d = rawDiff(abs, rel, fromIndex, !!body.untracked, base);
       if (d.code === -1) return sendJson(res, 500, { error: d.err });
       const hunks = parseDiff(d.out);
       const hunk = hunks[body.hunk ?? -1];

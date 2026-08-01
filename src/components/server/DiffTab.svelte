@@ -1,9 +1,13 @@
 <script lang="ts">
-  let { repo = '', path = '', staged = false, untracked = false, compare = null }: {
+  let { repo = '', path = '', staged = false, untracked = false, compare = null, base = '', baseLabel = '' }: {
     repo?: string;
     path?: string;
     staged?: boolean;
     untracked?: boolean;
+    // Pinned sha of a tree-compare base: the diff's old side is that commit's
+    // tree instead of the index. baseLabel is the human name the user picked.
+    base?: string;
+    baseLabel?: string;
     // Set instead of repo/path when the tab came from a compare command: two
     // arbitrary inputs, no repo, no index side. rightText carries pasted
     // content, which has no path of its own.
@@ -107,7 +111,7 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(compare),
           })
-        : await fetch(`/api/git/diff?${new URLSearchParams({ repo, path, staged: staged ? '1' : '0', untracked: untracked ? '1' : '0' })}`);
+        : await fetch(`/api/git/diff?${new URLSearchParams({ repo, path, staged: staged ? '1' : '0', untracked: untracked ? '1' : '0', ...(base ? { base } : {}) })}`);
       const d = await r.json();
       if (!r.ok) { error = d.error ?? `HTTP ${r.status}`; hunks = []; }
       else { error = ''; hunks = d.hunks ?? []; flags = { binary: d.binary, tooBig: d.tooBig }; }
@@ -134,12 +138,38 @@
 
   async function apply(h: number, mode: 'stage' | 'unstage' | 'revert') {
     const n = sel[h]?.size ?? 0;
-    if (mode === 'revert' && !window.confirm(`Revert ${n || 'all'} line(s) of this hunk in the working tree? This cannot be undone.`)) return;
+    const q = base
+      ? `Restore ${n || 'all'} line(s) of this hunk to the base version? The working tree file is overwritten.`
+      : `Revert ${n || 'all'} line(s) of this hunk in the working tree? This cannot be undone.`;
+    if (mode === 'revert' && !window.confirm(q)) return;
     try {
       const r = await fetch('/api/git/action', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ op: 'apply', repo, path, mode, hunk: h, lines: [...(sel[h] ?? [])], untracked }),
+        body: JSON.stringify({ op: 'apply', repo, path, mode, hunk: h, lines: [...(sel[h] ?? [])], untracked, ...(base ? { base } : {}) }),
+      });
+      const d = await r.json();
+      if (!r.ok) { error = d.error ?? `HTTP ${r.status}`; return; }
+      window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
+      await load();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  // Copy one hunk (or the selected lines of it) onto one side of a compare —
+  // VS Code's per-change arrows. The target file is rewritten on disk, so it
+  // always confirms first.
+  async function applyCompare(h: number, target: 'left' | 'right') {
+    if (!compare) return;
+    const n = sel[h]?.size ?? 0;
+    const dest = target === 'left' ? compare.leftPath : compare.rightPath ?? '';
+    if (!window.confirm(`Apply ${n || 'all'} line(s) of this hunk to ${dest}? The file on disk is modified.`)) return;
+    try {
+      const r = await fetch('/api/diff/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...compare, target, hunk: h, lines: [...(sel[h] ?? [])] }),
       });
       const d = await r.json();
       if (!r.ok) { error = d.error ?? `HTTP ${r.status}`; return; }
@@ -154,7 +184,7 @@
 <div class="difftab">
   <div class="diff-head">
     <span class="diff-path" title={subject}>{subject}</span>
-    <span class="diff-side">{compare ? `vs ${compare.rightLabel}` : staged ? 'staged' : untracked ? 'untracked' : 'working tree'}</span>
+    <span class="diff-side">{compare ? `vs ${compare.rightLabel}` : base ? `vs ${baseLabel || base.slice(0, 7)}` : staged ? 'staged' : untracked ? 'untracked' : 'working tree'}</span>
     <span class="viewtoggle">
       <button type="button" class:on={view === 'split'} onclick={() => setView('split')}>Split</button>
       <button type="button" class:on={view === 'inline'} onclick={() => setView('inline')}>Inline</button>
@@ -177,16 +207,21 @@
           <div class="hunk-head">
             <code>@@ -{h.oldStart},{h.oldLines} +{h.newStart},{h.newLines} @@ {h.section}</code>
             <span class="hunk-actions">
-              <!-- A compare has no index and no working tree to write back to,
-                   so line-level staging has nowhere to land. -->
-              {#if !compare}
-                {#if sel[hi]?.size}<span class="selcount">{sel[hi].size} selected</span>{/if}
-                {#if staged}
-                  <button type="button" onclick={() => void apply(hi, 'unstage')}>Unstage {sel[hi]?.size ? 'selected' : 'hunk'}</button>
-                {:else}
-                  <button type="button" onclick={() => void apply(hi, 'stage')}>Stage {sel[hi]?.size ? 'selected' : 'hunk'}</button>
-                  <button type="button" class="danger" onclick={() => void apply(hi, 'revert')}>Revert {sel[hi]?.size ? 'selected' : 'hunk'}</button>
+              {#if sel[hi]?.size}<span class="selcount">{sel[hi].size} selected</span>{/if}
+              {#if compare}
+                <!-- VS Code's per-change arrows: copy this change onto either
+                     side. Pasted text has no file, so no right target then. -->
+                <button type="button" onclick={() => void applyCompare(hi, 'left')}>⇤ Apply {sel[hi]?.size ? 'selected' : 'hunk'} to left</button>
+                {#if compare.rightPath}
+                  <button type="button" onclick={() => void applyCompare(hi, 'right')}>Apply {sel[hi]?.size ? 'selected' : 'hunk'} to right ⇥</button>
                 {/if}
+              {:else if base}
+                <button type="button" class="danger" onclick={() => void apply(hi, 'revert')}>Restore {sel[hi]?.size ? 'selected' : 'hunk'} from base</button>
+              {:else if staged}
+                <button type="button" onclick={() => void apply(hi, 'unstage')}>Unstage {sel[hi]?.size ? 'selected' : 'hunk'}</button>
+              {:else}
+                <button type="button" onclick={() => void apply(hi, 'stage')}>Stage {sel[hi]?.size ? 'selected' : 'hunk'}</button>
+                <button type="button" class="danger" onclick={() => void apply(hi, 'revert')}>Revert {sel[hi]?.size ? 'selected' : 'hunk'}</button>
               {/if}
             </span>
           </div>

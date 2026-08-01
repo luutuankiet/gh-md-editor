@@ -31,6 +31,16 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const SERVER_ENTRY = fileURLToPath(new URL('./index.mjs', import.meta.url));
+
+// npm always ships package.json regardless of the `files` allowlist, so this
+// resolves inside an npx tree exactly as it does in a git checkout. Recorded
+// into every registry entry, which is what lets `upgrade` tell a stale server
+// from a current one instead of restarting everything blindly.
+export const VERSION = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(fileURLToPath(new URL('./package.json', import.meta.url)), 'utf8')).version ?? null;
+  } catch { return null; }
+})();
 const CACHE = process.env.GH_MD_EDITOR_HOME || path.join(os.homedir(), '.cache', 'gh-md-editor');
 const SERVERS = path.join(CACHE, 'servers');
 const LOGS = path.join(CACHE, 'logs');
@@ -251,7 +261,7 @@ function confirm(q) {
 // --- cli -------------------------------------------------------------------
 
 function parse(args) {
-  const o = { _: [], host: null, port: null, auth: null, tunnel: null, tunnelBin: null, all: false, yes: false, force: false, help: false };
+  const o = { _: [], host: null, port: null, auth: null, tunnel: null, tunnelBin: null, all: false, yes: false, force: false, dryRun: false, runner: false, help: false };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--host') o.host = args[++i];
@@ -263,12 +273,69 @@ function parse(args) {
     else if (a === '--all' || a === '-a') o.all = true;
     else if (a === '--yes' || a === '-y') o.yes = true;
     else if (a === '--force' || a === '-f') o.force = true;
+    else if (a === '--dry-run' || a === '-n') o.dryRun = true;
+    // Internal. Set on the detached copy `upgrade` re-execs when it is running
+    // inside a terminal owned by a server it is about to kill; stops that
+    // handoff from recursing.
+    else if (a === '--runner') o.runner = true;
     else if (a === '--help' || a === '-h') o.help = true;
     else if (!a.startsWith('-')) o._.push(a);
     else throw new Error(`unknown flag: ${a}`);
   }
   if (o.port != null && !Number.isInteger(o.port)) throw new Error('--port takes a number');
   return o;
+}
+
+// Spawn a detached server and wait for it to register itself. Shared by `up`
+// and `upgrade`: the only difference between those two is where the spec comes
+// from — cli flags in one case, a registry entry being replayed in the other.
+//
+// detached:true makes the child a session leader, so the SIGHUP that fires when
+// the ssh session ends is delivered to the old foreground group and never
+// reaches it. stdio goes to the log rather than /dev/null — the startup
+// warnings about a missing pty, missing rg and missing git are the whole
+// diagnostic story when something looks broken later.
+async function startServer(spec) {
+  ensureDirs();
+  const logPath = logPathFor(spec.port);
+  const fd = fs.openSync(logPath, 'a', 0o600);
+
+  const argv = [SERVER_ENTRY, spec.root, '--host', spec.host, '--port', String(spec.port)];
+  if (spec.auth) argv.push('--auth', spec.auth);
+  if (spec.tunnel) argv.push('--tunnel', spec.tunnel);
+  if (spec.tunnelBin) argv.push('--tunnel-bin', spec.tunnelBin);
+
+  const child = spawn(process.execPath, argv, {
+    cwd: spec.root,
+    detached: true,
+    stdio: ['ignore', fd, fd],
+    env: { ...process.env, GH_MD_EDITOR_DAEMON: '1', GH_MD_EDITOR_LOG: logPath },
+  });
+  let exited = false;
+  child.on('exit', () => { exited = true; });
+  child.unref();
+  fs.closeSync(fd);
+
+  // Wait for the child's own registry write instead of guessing a sleep. If it
+  // dies first the reason is in the log — EADDRINUSE and an unreadable
+  // workspace both land here.
+  const entry = await waitFor(() => {
+    const e = readEntry(spec.port);
+    return e && e.pid === child.pid ? e : null;
+  }, 20_000, () => !exited);
+
+  return { entry, logPath, pid: child.pid };
+}
+
+// A tunnel url is minted asynchronously by cloudflared/tailscale well after the
+// port is bound, so it arrives as a registry patch rather than at listen time.
+async function awaitTunnelUrl(port, entry) {
+  const withUrl = await waitFor(() => {
+    const e = readEntry(port);
+    return e?.tunnelUrl ? e : null;
+  }, 40_000, null);
+  if (withUrl) Object.assign(entry, withUrl);
+  return !!withUrl;
 }
 
 async function up(o) {
@@ -299,38 +366,9 @@ async function up(o) {
     return 1;
   }
 
-  ensureDirs();
-  const logPath = logPathFor(port);
-  const fd = fs.openSync(logPath, 'a', 0o600);
-
-  const argv = [SERVER_ENTRY, root, '--host', host, '--port', String(port)];
-  if (o.auth) argv.push('--auth', o.auth);
-  if (o.tunnel) argv.push('--tunnel', o.tunnel);
-  if (o.tunnelBin) argv.push('--tunnel-bin', o.tunnelBin);
-
-  // detached:true makes the child a session leader, so the SIGHUP that fires
-  // when the ssh session ends is delivered to the old foreground group and
-  // never reaches it. stdio goes to the log rather than /dev/null — the
-  // startup warnings about a missing pty, missing rg and missing git are the
-  // whole diagnostic story when something looks broken later.
-  const child = spawn(process.execPath, argv, {
-    cwd: root,
-    detached: true,
-    stdio: ['ignore', fd, fd],
-    env: { ...process.env, GH_MD_EDITOR_DAEMON: '1', GH_MD_EDITOR_LOG: logPath },
+  const { entry, logPath } = await startServer({
+    root, host, port, auth: o.auth, tunnel: o.tunnel, tunnelBin: o.tunnelBin,
   });
-  let exited = false;
-  child.on('exit', () => { exited = true; });
-  child.unref();
-  fs.closeSync(fd);
-
-  // Wait for the child's own registry write instead of guessing a sleep. If
-  // it dies first the reason is in the log — EADDRINUSE and an unreadable
-  // workspace both land here.
-  const entry = await waitFor(() => {
-    const e = readEntry(port);
-    return e && e.pid === child.pid ? e : null;
-  }, 20_000, () => !exited);
 
   if (!entry) {
     console.error(`server did not come up on :${port} — last lines of ${tildify(logPath)}:`);
@@ -341,13 +379,9 @@ async function up(o) {
 
   if (o.tunnel) {
     process.stdout.write(`  tunnel: waiting for the ${o.tunnel} url…`);
-    const withUrl = await waitFor(() => {
-      const e = readEntry(port);
-      return e?.tunnelUrl ? e : null;
-    }, 40_000, () => !exited);
+    const got = await awaitTunnelUrl(port, entry);
     console.log('');
-    if (withUrl) Object.assign(entry, withUrl);
-    else console.warn(`  !! no public url yet — see ${tildify(logPath)}. the local server is up regardless.`);
+    if (!got) console.warn(`  !! no public url yet — see ${tildify(logPath)}. the local server is up regardless.`);
   }
 
   console.log('gh-md-editor is up');
@@ -377,8 +411,8 @@ async function ls() {
   }
   const terms = await Promise.all(rows.map(probeTerminals));
   table(
-    ['PID', 'PORT', 'MODE', 'UP', 'TERMS', 'WORKSPACE', 'URL'],
-    rows.map((e, i) => [e.pid, e.port, e.daemon ? 'bg' : 'fg', since(e.startedAt), terms[i] ?? '?', tildify(e.root), urlOf(e)]),
+    ['PID', 'PORT', 'MODE', 'VERSION', 'UP', 'TERMS', 'WORKSPACE', 'URL'],
+    rows.map((e, i) => [e.pid, e.port, e.daemon ? 'bg' : 'fg', e.version ?? '?', since(e.startedAt), terms[i] ?? '?', tildify(e.root), urlOf(e)]),
   );
   return 0;
 }
@@ -457,6 +491,148 @@ async function down(o) {
   return rc;
 }
 
+// Restart every stale server onto the tree this file is running from.
+//
+// The npx fetch IS the upgrade — `npx -y @luutuankiet/gh-md-editor@latest
+// upgrade` downloads the new version and then this walks the registry moving
+// running servers onto it. Each one is replayed from its own entry, so port,
+// bind host, workspace and auth token all survive; existing ?token= bookmarks
+// keep working.
+//
+// Deliberately promptless. `down` asks before killing live shells because the
+// user is throwing them away; here they are collateral of a restart the user
+// explicitly asked for, so they are reported afterwards instead.
+async function upgrade(o) {
+  const rows = listServers();
+  if (!rows.length) {
+    console.log('no gh-md-editor servers running');
+    return 0;
+  }
+
+  let targets = rows;
+  const want = o.port ?? (o._.length ? Number(o._[0]) : null);
+  if (want != null) {
+    targets = rows.filter((e) => e.port === want);
+    if (!targets.length) { console.error(`no server on port ${want}`); return 1; }
+  }
+
+  // A stale global install running `upgrade` should say so out loud rather
+  // than restart everything and look like it worked.
+  if (!o.force) {
+    const current = targets.filter((e) => e.version === VERSION);
+    for (const e of current) console.log(`:${e.port} already on ${VERSION} — skipped  (--force restarts it anyway)`);
+    targets = targets.filter((e) => e.version !== VERSION);
+  }
+  if (!targets.length) return 0;
+
+  if (o.dryRun) {
+    table(
+      ['PORT', 'WORKSPACE', 'FROM', 'TO', 'PID'],
+      targets.map((e) => [e.port, tildify(e.root), e.version ?? '?', VERSION ?? '?', e.pid]),
+    );
+    console.log('');
+    console.log('  --dry-run: nothing was stopped. drop the flag to upgrade.');
+    return 0;
+  }
+
+  // Running from a terminal panel inside one of the servers being replaced:
+  // that shell dies with it, mid-restart, and the new server never gets
+  // started. Hand the work to a detached copy of ourselves — spawn() calls
+  // setsid(), so the new session escapes both the server\'s process-group kill
+  // and its session-wide sweep. GMD_PORT is what marks such a shell, and it is
+  // set by the server for every pty it opens, so this needs no /proc walking
+  // and works the same on linux and macos.
+  const selfPort = Number(process.env.GMD_PORT);
+  if (!o.runner && Number.isInteger(selfPort) && targets.some((e) => e.port === selfPort)) {
+    ensureDirs();
+    const logPath = path.join(LOGS, 'upgrade.log');
+    const fd = fs.openSync(logPath, 'a', 0o600);
+    const args = [SERVER_ENTRY, 'upgrade', '--runner'];
+    if (want != null) args.push('--port', String(want));
+    if (o.force) args.push('--force');
+    const child = spawn(process.execPath, args, {
+      cwd: os.homedir(),
+      detached: true,
+      stdio: ['ignore', fd, fd],
+      // Belt to --runner\'s braces: an unset marker cannot hand off again.
+      env: { ...process.env, GMD_PORT: '', GMD_TERM_ID: '' },
+    });
+    child.unref();
+    fs.closeSync(fd);
+    console.log(`this terminal belongs to :${selfPort}, which is being upgraded.`);
+    console.log(`handed off to a detached runner (pid ${child.pid}) — this shell dies with the old server,`);
+    console.log('the new one comes up on its own. reload the page in a few seconds.');
+    console.log('');
+    console.log(`  progress:  tail -f ${tildify(logPath)}`);
+    return 0;
+  }
+
+  let rc = 0;
+  const results = [];
+  for (const e of targets) {
+    // Capture before stopping — stop() deletes the entry being replayed.
+    const spec = {
+      root: e.root,
+      host: e.host,
+      port: e.port,
+      auth: e.auth ?? null,
+      tunnel: e.tunnel ?? null,
+      tunnelBin: e.tunnelBin ?? null,
+    };
+    const killed = await probeTerminals(e);
+
+    let stopped = false;
+    try { stopped = await stop(e); } catch (err) { console.error(`  ${String(err?.message ?? err)}`); }
+    if (!stopped) {
+      console.error(`:${e.port} could not be stopped (pid ${e.pid}) — left running on ${e.version ?? '?'}`);
+      rc = 1;
+      continue;
+    }
+
+    const { entry, logPath } = await startServer(spec);
+    if (!entry) {
+      console.error(`:${e.port} did not come back up — last lines of ${tildify(logPath)}:`);
+      console.error('');
+      console.error(tail(logPath, 20).replace(/^/gm, '  '));
+      rc = 1;
+      continue;
+    }
+    if (spec.tunnel) await awaitTunnelUrl(spec.port, entry);
+
+    results.push({ old: e, entry, killed: killed ?? 0 });
+  }
+
+  if (results.length) {
+    console.log('');
+    table(
+      ['PORT', 'WORKSPACE', 'VERSION', 'PID', 'SHELLS', 'URL'],
+      results.map(({ old, entry, killed }) =>
+        [entry.port, tildify(entry.root), `${old.version ?? '?'} → ${entry.version ?? '?'}`, entry.pid, killed, urlOf(entry)]),
+    );
+
+    // Three things change under the user that a table cannot show.
+    const wasFg = results.filter(({ old }) => !old.daemon);
+    if (wasFg.length) {
+      console.log('');
+      console.log(`  ${wasFg.length} server(s) were running in the foreground and came back detached —`);
+      console.log(`  their output now lands in ${tildify(LOGS)}/<port>.log instead of a terminal.`);
+    }
+    const tunnelled = results.filter(({ entry }) => entry.tunnel);
+    if (tunnelled.length) {
+      console.log('');
+      console.log('  !! tunnel urls are minted fresh on every start — the old ones are dead.');
+      console.log('  !! bare --tunnel servers also minted a new auth token; use the url above.');
+    }
+    const shells = results.reduce((a, r) => a + r.killed, 0);
+    if (shells) {
+      console.log('');
+      console.log(`  ${shells} terminal session(s) were killed by the restart.`);
+    }
+  }
+
+  return rc;
+}
+
 function help() {
   console.log(`gh-md-editor — background servers
 
@@ -474,6 +650,19 @@ function help() {
       keyboard picker (up/down + enter). --all stops every one. --yes skips
       the confirmation shown when terminal sessions are still live.
 
+  gh-md-editor upgrade [PORT] [-p PORT] [--force] [--dry-run]
+      restart every running server onto THIS version, replaying each one from
+      its registry entry — same port, same bind host, same workspace, same auth
+      token, so open bookmarks keep working. the canonical form is
+
+          npx -y @luutuankiet/gh-md-editor@latest upgrade
+
+      where the npx fetch is the upgrade and this moves the servers onto it.
+      never prompts. servers already on this version are skipped unless
+      --force; --dry-run prints the plan and stops. run it from a terminal
+      panel inside one of those servers and it hands off to a detached runner
+      so the restart survives its own shell dying.
+
   state: ${tildify(CACHE)}
       servers/<port>.json holds the auth token so list-servers can print a url
       you can actually open — dirs 0700, files 0600. logs/<port>.log is the
@@ -489,6 +678,7 @@ export async function run(sub, args) {
   if (sub === 'up') return up(o);
   if (sub === 'ls' || sub === 'list-servers') return ls(o);
   if (sub === 'down') return down(o);
+  if (sub === 'upgrade') return upgrade(o);
   help();
   return 1;
 }

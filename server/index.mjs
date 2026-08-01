@@ -12,7 +12,7 @@
 import http from 'node:http';
 import net from 'node:net';
 import { WebSocketServer } from 'ws';
-import { registerServer, patchServer, unregisterServer, run as runDaemon } from './daemon.mjs';
+import { registerServer, patchServer, unregisterServer, run as runDaemon, VERSION } from './daemon.mjs';
 
 // `up` / `down` / `list-servers` never touch the server itself, and node-pty
 // just below is a native addon. Dispatch before paying for it. Safe this
@@ -20,7 +20,7 @@ import { registerServer, patchServer, unregisterServer, run as runDaemon } from 
 // in it, so daemon.mjs is already loaded here.
 {
   const sub = process.argv[2];
-  if (sub === 'up' || sub === 'down' || sub === 'ls' || sub === 'list-servers') {
+  if (sub === 'up' || sub === 'down' || sub === 'ls' || sub === 'list-servers' || sub === 'upgrade') {
     process.exit(await runDaemon(sub, process.argv.slice(3)));
   }
 }
@@ -136,6 +136,7 @@ for (let i = 0; i < argv.length; i++) {
     console.log('    gh-md-editor up [dir] [-p PORT] […]   start detached, print the url, return');
     console.log('    gh-md-editor list-servers             every running server + its url  (alias: ls)');
     console.log('    gh-md-editor down [-p PORT] [--all]   stop one, pick from a list, or stop all');
+    console.log('    gh-md-editor upgrade [-p PORT]        restart running servers onto this version');
     console.log('    gh-md-editor up --help                more on background mode');
     console.log('');
     console.log('  --tunnel        public HTTPS URL, auth forced on. Downloads cloudflared once');
@@ -2117,7 +2118,11 @@ server.listen(port, host, () => {
     root: ROOT,
     auth: auth ?? null,
     tunnel: tunnel ?? null,
+    // Recorded so a restart can replay the exact invocation: `upgrade` rebuilds
+    // the argv from this entry and nothing else.
+    tunnelBin: tunnelBin ?? null,
     tunnelUrl: null,
+    version: VERSION,
     daemon: process.env.GH_MD_EDITOR_DAEMON === '1',
     log: process.env.GH_MD_EDITOR_LOG ?? null,
     startedAt: Date.now(),

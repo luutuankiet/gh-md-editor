@@ -122,6 +122,9 @@
     align-items: stretch;
     gap: 2px;
     padding-left: 6px;
+    width: max-content;
+    min-width: 100%;
+    box-sizing: border-box;
   }
   /* Stretch, not centre: the guide has to run the full row height so
      consecutive rows form one unbroken vertical line. */
@@ -172,20 +175,18 @@
     cursor: default;
   }
   .label {
-    flex: 1;
-    min-width: 0;
+    flex: 1 0 auto;
     display: flex;
     align-items: center;
     gap: 6px;
     text-align: left;
   }
   .text {
-    overflow: hidden;
-    text-overflow: ellipsis;
     white-space: nowrap;
   }
   .ln {
     margin-left: auto;
+    padding-left: 12px;
     padding-right: 8px;
     opacity: 0.45;
     font-variant-numeric: tabular-nums;

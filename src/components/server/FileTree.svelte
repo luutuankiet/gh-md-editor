@@ -661,12 +661,18 @@
     padding: 4px 0;
     box-sizing: border-box;
   }
+  /* Rows size to their own content and are only FLOORED at the panel width, so
+     a deeply nested name pushes the tree wider instead of being cut off, while
+     short rows still take a full-width hover highlight. `.tree` scrolls both
+     axes; nothing here may clip, or the scroll has nothing to reveal. */
   .row {
     position: relative;
     display: flex;
     align-items: center;
     gap: 4px;
-    width: 100%;
+    width: max-content;
+    min-width: 100%;
+    box-sizing: border-box;
     border: none;
     background: transparent;
     color: inherit;
@@ -675,7 +681,6 @@
     padding: 2px 8px;
     cursor: pointer;
     white-space: nowrap;
-    overflow: hidden;
     line-height: 20px;
   }
   .row:hover { background: rgba(255, 255, 255, 0.07); }
@@ -702,8 +707,7 @@
     flex: 0 0 16px;
   }
   .name {
-    overflow: hidden;
-    text-overflow: ellipsis;
+    flex: 1 0 auto;
   }
   .name.dir { font-weight: 600; }
   .loading { color: #949494; }

@@ -398,7 +398,7 @@
   .rows {
     flex: 1 1 0;
     min-height: 0;
-    overflow-y: auto;
+    overflow: auto;
     margin-top: 4px;
   }
   .filerow {
@@ -409,6 +409,9 @@
     padding: 2px 10px;
     cursor: pointer;
     white-space: nowrap;
+    width: max-content;
+    min-width: 100%;
+    box-sizing: border-box;
   }
   .filerow:hover { background: rgba(110, 118, 129, 0.12); }
   .guide {
@@ -420,10 +423,7 @@
     pointer-events: none;
   }
   .fname {
-    flex: 1 1 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    direction: rtl;
+    flex: 1 0 auto;
     text-align: left;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
     font-size: 11.5px;

@@ -20,6 +20,15 @@
     compare?: { leftPath: string; rightPath?: string; rightText?: string; rightLabel: string } | null;
   } = $props();
 
+  import { untrack } from 'svelte';
+  import { EditorView, lineNumbers, drawSelection, highlightActiveLine, keymap } from '@codemirror/view';
+  import { EditorState } from '@codemirror/state';
+  import type { Extension } from '@codemirror/state';
+  import { MergeView, unifiedMergeView } from '@codemirror/merge';
+  import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands';
+  import { bracketMatching, indentOnInput } from '@codemirror/language';
+  import { grammarFor } from '../../lib/lang-detect';
+  import { monokaiCodeBundle } from '../../lib/monokai-dimmed';
   import { scopeForFilename, highlightToLines, type Tok } from '../../lib/diff-highlight';
 
   interface DiffLine { t: '+' | '-' | ' ' | '\\'; n: number | null; o: number | null; text: string }
@@ -74,12 +83,17 @@
     hl = map;
   }
 
-  // Side-by-side is the default; the choice persists workspace-wide.
+  // Side-by-side is the default; the choice persists workspace-wide. `hunks`
+  // is the original patch renderer, kept as its own mode: it is the only view
+  // that can stage or revert INDIVIDUAL LINES, because the server rebuilds the
+  // patch from a hunk index plus line indices and an editor has neither.
+  type ViewMode = 'split' | 'inline' | 'hunks';
   const DIFFVIEW_KEY = 'ghmd.diffView';
-  let view = $state<'split' | 'inline'>(localStorage.getItem(DIFFVIEW_KEY) === 'inline' ? 'inline' : 'split');
-  function setView(v: 'split' | 'inline') {
+  const storedView = typeof localStorage !== 'undefined' ? localStorage.getItem(DIFFVIEW_KEY) : null;
+  let view = $state<ViewMode>(storedView === 'inline' || storedView === 'hunks' ? storedView : 'split');
+  function setView(v: ViewMode) {
     view = v;
-    localStorage.setItem(DIFFVIEW_KEY, v);
+    try { localStorage.setItem(DIFFVIEW_KEY, v); } catch { /* private mode */ }
   }
 
   interface SplitCell { line: DiffLine; idx: number }
@@ -147,15 +161,174 @@
     void highlightHunks(hunks);
   }
 
+  // ---------------------------------------------------------------------------
+  // Full-file editable diff
+  //
+  // The patch renderer above can only ever show what git printed: the changed
+  // hunks, as text, with no document behind them. Reading the surrounding code
+  // meant opening the file in another tab, and fixing anything meant editing it
+  // there and coming back. Both views below are real CodeMirror documents of
+  // the WHOLE file instead, so the unchanged parts are present (collapsed until
+  // clicked) and the incoming side is the working copy, typed into directly.
+  // ---------------------------------------------------------------------------
+
+  // Beyond this the merge view's per-line decorations cost more than the diff is
+  // worth; the patch renderer handles those files instead.
+  const MAX_CM_LINES = 20000;
+
+  // Root-relative, which is what every file and git endpoint takes. `repo` is
+  // itself root-relative and `path` is relative to the repo.
+  const fullPath = $derived(compare ? '' : repo ? `${repo}/${path}` : path);
+  // Where an edit lands. A pasted right side has no file, so it has none.
+  const rightSavePath = $derived(compare ? compare.rightPath ?? '' : fullPath);
+  // The incoming side is only a file on disk in the working-tree shapes. A
+  // staged diff's right side is the index and a pinned `to` is a commit —
+  // neither is a thing an editor can write back to.
+  const editable = $derived(!to && !staged && (compare ? !!compare.rightPath : true));
+
+  let leftText = $state<string | null>(null);
+  let rightText = $state<string | null>(null);
+  let rightMtime = 0;
+  let cmError = $state('');
+  let dirty = $state(false);
+  let saving = $state(false);
+  let saveErr = $state('');
+  let busy = $state(false);
+  let commitMsg = $state('');
+  let host = $state<HTMLDivElement | null>(null);
+  // Bumped when a fresh pair of documents needs a NEW editor. A reload that
+  // only changes the text dispatches into the existing one instead, so the
+  // cursor and scroll position survive every background refresh.
+  let docsVersion = $state(0);
+
+  // Binary or oversized inputs have no editable form, and neither does a
+  // 2 MB-plus diff — all three fall back to the patch renderer.
+  const cmBlocked = $derived(!!flags.binary || !!flags.tooBig || !!cmError);
+  const shownView = $derived<ViewMode>(cmBlocked ? 'hunks' : view);
+
+  let mv: MergeView | null = null;
+  let uv: EditorView | null = null;
+  // Carried across a rebuild so a background refresh does not throw the reader
+  // back to the top of the file.
+  let pendingScroll: number | null = null;
+  let langExt: Extension = [];
+  let langFor = '';
+  let docsToken = 0;
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const countLines = (s: string) => { let n = 1; for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++; return n; };
+
+  async function fetchFile(p: string): Promise<{ content: string; mtimeMs: number }> {
+    const r = await fetch(`/api/file?path=${encodeURIComponent(p)}`);
+    if (r.status === 413) throw new Error('too-large');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+    if (d.binary) throw new Error('binary');
+    return { content: d.content ?? '', mtimeMs: d.mtimeMs ?? 0 };
+  }
+
+  async function fetchShow(p: string, q: Record<string, string>): Promise<string | null> {
+    const r = await fetch(`/api/git/show?${new URLSearchParams({ path: p, ...q })}`);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+    if (d.binary) return null;
+    // Untracked, or added since the ref asked for: the old side is empty, which
+    // is exactly what git's own diff against /dev/null shows.
+    if (!d.tracked) return '';
+    return d.content ?? '';
+  }
+
+  async function fetchLeft(): Promise<string | null> {
+    if (compare) return (await fetchFile(compare.leftPath)).content;
+    if (untracked) return '';
+    // A pinned base wins; a staged diff measures against HEAD; otherwise the
+    // index (falling back to HEAD), which is what makes the view show UNSTAGED
+    // work only — the same rule the editor's change gutter follows.
+    return await fetchShow(fullPath, base ? { ref: base } : staged ? { ref: 'HEAD' } : {});
+  }
+
+  async function fetchRight(): Promise<string | null> {
+    if (compare) {
+      if (typeof compare.rightText === 'string') return compare.rightText;
+      return compare.rightPath ? (await fetchFile(compare.rightPath)).content : '';
+    }
+    if (to) return await fetchShow(fullPath, { ref: to });
+    if (staged) return await fetchShow(fullPath, { stage: '0' });
+    const f = await fetchFile(fullPath);
+    // Kept for the conflict guard on save: the server rejects a write whose
+    // base mtime is older than the copy on disk.
+    rightMtime = f.mtimeMs;
+    return f.content;
+  }
+
+  async function loadDocs(auto = false) {
+    const token = ++docsToken;
+    try {
+      const [l, r] = await Promise.all([fetchLeft(), fetchRight()]);
+      if (token !== docsToken) return;
+      if (l === null || r === null) { cmError = 'Binary file — no editable diff.'; return; }
+      if (countLines(l) > MAX_CM_LINES || countLines(r) > MAX_CM_LINES) {
+        cmError = `Over ${MAX_CM_LINES.toLocaleString()} lines — showing hunks only.`;
+        return;
+      }
+      if (langFor !== subject) {
+        langExt = await grammarFor(subject);
+        langFor = subject;
+        if (token !== docsToken) return;
+      }
+      cmError = '';
+      if (auto && leftText !== null && rightText !== null) { applyIncoming(l, r); return; }
+      leftText = l;
+      rightText = r;
+      dirty = false;
+      docsVersion++;
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      cmError = m === 'too-large'
+        ? 'File exceeds the server size cap — showing hunks only.'
+        : m === 'binary'
+          ? 'Binary file — no editable diff.'
+          : m;
+    }
+  }
+
+  // A background reload must never throw away work in progress, and must never
+  // cost the user their place in the file: both sides are patched into the
+  // LIVE editors rather than rebuilt.
+  function scroller(): HTMLElement | null {
+    if (!host) return null;
+    // Split mode scrolls the merge container, not either editor: the package
+    // gives `.cm-mergeView` the overflow so both sides move together.
+    return (host.querySelector('.cm-mergeView') as HTMLElement | null) ?? uv?.scrollDOM ?? null;
+  }
+
+  function applyIncoming(l: string, r: string) {
+    const leftChanged = l !== leftText;
+    // Unsaved edits outrank the disk copy — adopting it would silently discard
+    // them. The dirty pill stays up and the next save resolves it.
+    const rightChanged = r !== rightText && !dirty;
+    if (!leftChanged && !rightChanged) return;
+    if (leftChanged) leftText = l;
+    if (rightChanged) rightText = r;
+    // A rebuild, rather than a dispatch into the live editor, is what re-folds
+    // the unchanged stretches. The merge package computes them once, when its
+    // field is installed, and from then on only ever DROPS the ranges a new
+    // chunk touches — patching the document in place would leave the file
+    // permanently expanded. Reconfiguring does not help either: the field
+    // already exists, so its initialiser never runs again.
+    pendingScroll = scroller()?.scrollTop ?? null;
+    docsVersion++;
+  }
+
   // Props are read synchronously (qs build) → tracked: a reused tab pointed
   // at another file/side refetches. Writes only — no self-invalidation.
-  $effect(() => { void load(); });
+  $effect(() => { void load(); void loadDocs(); });
 
   // Live refresh. `gmd:git-refresh` covers mutations made anywhere in this app;
   // `focus` covers everything done outside it — a terminal commit, a revert in
   // another window. Both take the auto path, which no-ops on an unchanged diff.
   $effect(() => {
-    const onRefresh = () => { void load(true); };
+    const onRefresh = () => { void load(true); void loadDocs(true); };
     window.addEventListener('gmd:git-refresh', onRefresh);
     window.addEventListener('focus', onRefresh);
     return () => {
@@ -163,6 +336,207 @@
       window.removeEventListener('focus', onRefresh);
     };
   });
+
+  function baseExtensions(): Extension[] {
+    return [
+      lineNumbers(),
+      history(),
+      drawSelection(),
+      bracketMatching(),
+      indentOnInput(),
+      keymap.of([
+        { key: 'Mod-s', preventDefault: true, run: () => { void save(); return true; } },
+        ...defaultKeymap,
+        ...historyKeymap,
+        indentWithTab,
+      ]),
+      monokaiCodeBundle,
+      langExt,
+      EditorView.theme({
+        '&': { height: '100%' },
+        '.cm-scroller': { fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace", fontSize: '12px', lineHeight: '1.5' },
+      }),
+    ];
+  }
+
+  const onEdit = () => EditorView.updateListener.of((u) => {
+    if (!u.docChanged) return;
+    dirty = true;
+    scheduleSave();
+  });
+
+  // The library's own accept/reject buttons, relabelled: "accept" only moves
+  // the comparison forward in memory (a review marker), while "reject" is the
+  // revert people actually come here for.
+  function mergeControl(type: 'reject' | 'accept', action: (e: MouseEvent) => void): HTMLElement {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = `gmd-mc gmd-mc-${type}`;
+    el.textContent = type === 'reject' ? 'Revert' : 'Reviewed';
+    el.title = type === 'reject'
+      ? 'Restore this chunk to the version on the left, then save'
+      : 'Stop flagging this chunk as a change in this view';
+    el.addEventListener('click', action);
+    return el;
+  }
+
+  function unifiedExt(original: string): Extension {
+    return unifiedMergeView({
+      original,
+      gutter: true,
+      highlightChanges: true,
+      allowInlineDiffs: true,
+      collapseUnchanged: { margin: 3, minSize: 4 },
+      mergeControls: editable ? mergeControl : false,
+    });
+  }
+
+  function buildEditor(h: HTMLDivElement, mode: ViewMode) {
+    const l = leftText ?? '';
+    const r = rightText ?? '';
+    if (mode === 'split') {
+      mv = new MergeView({
+        a: { doc: l, extensions: [...baseExtensions(), EditorState.readOnly.of(true)] },
+        b: {
+          doc: r,
+          extensions: [
+            ...baseExtensions(),
+            EditorState.readOnly.of(!editable),
+            ...(editable ? [highlightActiveLine(), onEdit()] : []),
+          ],
+        },
+        parent: h,
+        // The whole point of the rewrite: the unchanged body of the file is
+        // present, folded to a clickable strip until someone wants it.
+        collapseUnchanged: { margin: 3, minSize: 4 },
+        highlightChanges: true,
+        gutter: true,
+        // Arrows that copy a chunk from the base onto the working copy — the
+        // revert, without leaving the diff. Pointless when nothing is writable.
+        ...(editable ? { revertControls: 'a-to-b' as const } : {}),
+      });
+    } else {
+      uv = new EditorView({
+        doc: r,
+        parent: h,
+        extensions: [
+          ...baseExtensions(),
+          EditorState.readOnly.of(!editable),
+          ...(editable ? [highlightActiveLine(), onEdit()] : []),
+          unifiedExt(l),
+        ],
+      });
+    }
+    if (pendingScroll !== null) {
+      const top = pendingScroll;
+      pendingScroll = null;
+      requestAnimationFrame(() => { const s = scroller(); if (s) s.scrollTop = top; });
+    }
+  }
+
+  function destroyEditor() {
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    mv?.destroy();
+    uv?.destroy();
+    mv = null;
+    uv = null;
+  }
+
+  // Tracks exactly three things: the container, the chosen view, and the
+  // document generation. Everything the builder reads is untracked, so the
+  // effect cannot invalidate itself on the state it writes.
+  $effect(() => {
+    const h = host;
+    const mode = view;
+    const gen = docsVersion;
+    if (!h || !gen) return;
+    untrack(() => buildEditor(h, mode));
+    return destroyEditor;
+  });
+
+  function scheduleSave() {
+    if (!editable) return;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => { saveTimer = null; void save(); }, 900);
+  }
+
+  async function save() {
+    const b = mv ? mv.b : uv;
+    if (!editable || !rightSavePath || !b) return;
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    const content = b.state.doc.toString();
+    saving = true;
+    try {
+      const r = await fetch('/api/file', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: rightSavePath, content, baseMtimeMs: rightMtime }),
+      });
+      const d = await r.json();
+      if (r.status === 409) {
+        // Someone else wrote the file after this view loaded. Adopting their
+        // mtime as the new base means a second save deliberately overwrites —
+        // the user has been told, and the choice is theirs.
+        rightMtime = d.mtimeMs ?? rightMtime;
+        saveErr = 'This file changed on disk after the diff loaded. Save again to overwrite it, or reload to take the disk copy.';
+        return;
+      }
+      if (!r.ok) { saveErr = d.error ?? `HTTP ${r.status}`; return; }
+      saveErr = '';
+      rightMtime = d.mtimeMs ?? 0;
+      rightText = content;
+      dirty = false;
+      window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
+    } catch (e) {
+      saveErr = e instanceof Error ? e.message : String(e);
+    } finally {
+      saving = false;
+    }
+  }
+
+  // Stage this one file — and, with a message, commit it — without leaving the
+  // diff. Unsaved edits are flushed first, or the commit would capture the
+  // version on disk rather than the one on screen.
+  async function stageAndCommit(alsoCommit: boolean) {
+    if (!repo || compare || busy) return;
+    busy = true;
+    try {
+      if (dirty) await save();
+      if (saveErr) return;
+      const post = (body: unknown) => fetch('/api/git/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const s = await post({ op: 'stage', repo, paths: [path] });
+      const sd = await s.json();
+      if (!s.ok) { saveErr = sd.error ?? `HTTP ${s.status}`; return; }
+      if (alsoCommit) {
+        const c = await post({ op: 'commit', repo, message: commitMsg });
+        const cd = await c.json();
+        if (!c.ok) { saveErr = cd.error ?? `HTTP ${c.status}`; return; }
+        commitMsg = '';
+      }
+      saveErr = '';
+      window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
+      await load();
+      await loadDocs(true);
+    } catch (e) {
+      saveErr = e instanceof Error ? e.message : String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function reloadAll() {
+    dirty = false;
+    leftText = null;
+    rightText = null;
+    saveErr = '';
+    cmError = '';
+    void load();
+    void loadDocs();
+  }
 
   function toggle(h: number, i: number) {
     const s = new Set(sel[h]);
@@ -186,6 +560,7 @@
       if (!r.ok) { error = d.error ?? `HTTP ${r.status}`; return; }
       window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
       await load();
+      await loadDocs(true);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -209,6 +584,7 @@
       if (!r.ok) { error = d.error ?? `HTTP ${r.status}`; return; }
       window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
       await load();
+      await loadDocs(true);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -219,14 +595,48 @@
   <div class="diff-head">
     <span class="diff-path" title={subject}>{subject}</span>
     <span class="diff-side">{compare ? `vs ${compare.rightLabel}` : to ? `${toLabel || to.slice(0, 7)} vs ${baseLabel || base.slice(0, 7)}` : base ? `vs ${baseLabel || base.slice(0, 7)}` : staged ? 'staged' : untracked ? 'untracked' : 'working tree'}</span>
+    {#if shownView !== 'hunks' && editable}
+      {#if dirty}
+        <button type="button" class="pill dirtypill" title="Unsaved edits — click to save now" onclick={() => void save()}>● unsaved</button>
+      {:else if saving}
+        <span class="pill">saving…</span>
+      {/if}
+    {:else if shownView !== 'hunks'}
+      <span class="pill">read-only</span>
+    {/if}
     <span class="viewtoggle">
-      <button type="button" class:on={view === 'split'} onclick={() => setView('split')}>Split</button>
-      <button type="button" class:on={view === 'inline'} onclick={() => setView('inline')}>Inline</button>
+      <button type="button" class:on={shownView === 'split'} disabled={cmBlocked} onclick={() => setView('split')}>Split</button>
+      <button type="button" class:on={shownView === 'inline'} disabled={cmBlocked} onclick={() => setView('inline')}>Inline</button>
+      <button type="button" class:on={shownView === 'hunks'} onclick={() => setView('hunks')}>Hunks</button>
     </span>
-    <button type="button" class="icon-btn" title="Reload" onclick={() => void load()}>⟳</button>
+    <button type="button" class="icon-btn" title="Reload both sides from disk" onclick={reloadAll}>⟳</button>
   </div>
+  {#if shownView !== 'hunks' && editable && repo && !compare}
+    <!-- Commit without switching tabs: the file is staged first, so the commit
+         captures exactly what is on screen rather than whatever happened to be
+         in the index already. -->
+    <div class="commitbar">
+      <input
+        type="text"
+        placeholder="Commit message for this file…"
+        bind:value={commitMsg}
+        disabled={busy}
+        onkeydown={(e) => { if (e.key === 'Enter' && commitMsg.trim()) void stageAndCommit(true); }}
+      />
+      <button type="button" disabled={busy} onclick={() => void stageAndCommit(false)}>Stage file</button>
+      <button type="button" class="primary" disabled={busy || !commitMsg.trim()} onclick={() => void stageAndCommit(true)}>Stage &amp; commit</button>
+    </div>
+  {/if}
   {#if error}<div class="diff-error">{error}</div>{/if}
-  {#if loading}
+  {#if saveErr}<div class="diff-error">{saveErr}</div>{/if}
+  {#if cmError && view !== 'hunks'}<div class="diff-note">{cmError}</div>{/if}
+  {#if shownView !== 'hunks'}
+    {#if leftText === null || rightText === null}
+      <div class="empty">Loading file…</div>
+    {:else}
+      <div class="cmwrap" bind:this={host}></div>
+    {/if}
+  {:else if loading}
     <div class="empty">Loading diff…</div>
   {:else if flags.binary}
     <div class="empty">Binary file — no text diff.</div>
@@ -373,12 +783,68 @@
   .difftab :global(.pl-mb) { color: #c5c8c6; font-weight: 600; }
   .difftab :global(.pl-mi) { color: #c5c8c6; font-style: italic; }
 
+  /* @codemirror/merge ships a light-first palette. Every rule below is two
+     classes deep so it outranks the package's own base theme without
+     !important, exactly like the starry-night block above. */
+  .difftab :global(.cm-mergeView),
+  .difftab :global(.cm-mergeViewEditors) { height: 100%; }
+  .difftab :global(.cm-mergeViewEditor) { min-width: 0; }
+  .difftab :global(.cm-merge-a .cm-changedLine),
+  .difftab :global(.cm-deletedChunk) { background: rgba(248, 81, 73, 0.13); }
+  .difftab :global(.cm-merge-a .cm-changedText),
+  .difftab :global(.cm-deletedChunk .cm-deletedText) { background: rgba(248, 81, 73, 0.32); }
+  .difftab :global(.cm-merge-b .cm-changedLine),
+  .difftab :global(.cm-insertedLine),
+  .difftab :global(.cm-inlineChangedLine) { background: rgba(46, 160, 67, 0.13); }
+  .difftab :global(.cm-merge-b .cm-changedText),
+  .difftab :global(.cm-insertedLine .cm-changedText) { background: rgba(46, 160, 67, 0.32); }
+  .difftab :global(.cm-changeGutter) { background: transparent; }
+  .difftab :global(.cm-changedLineGutter) { background: #e58520; }
+  .difftab :global(.cm-deletedLineGutter) { background: #f28b82; }
+  .difftab :global(.cm-inlineChangedLineGutter) { background: #e2c08d; }
+  /* The collapsed strip IS the new feature's affordance — it has to read as a
+     button, not as a stray blank line. */
+  .difftab :global(.cm-collapsedLines) {
+    padding: 3px 6px 3px 12px;
+    background: #262626;
+    border-top: 1px solid #3a3a3a;
+    border-bottom: 1px solid #3a3a3a;
+    color: #949494;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .difftab :global(.cm-collapsedLines:hover) { background: #303030; color: #c5c8c6; }
+  .difftab :global(.cm-chunkButtons) { gap: 4px; }
+  /* Built imperatively by @codemirror/merge, so scoped styles never reach
+     them — these have to be :global. */
+  .difftab :global(.gmd-mc) {
+    border: 1px solid #505050;
+    background: #2d2d2d;
+    color: #c5c8c6;
+    border-radius: 4px;
+    font-size: 10px;
+    padding: 0 6px;
+    cursor: pointer;
+  }
+  .difftab :global(.gmd-mc:hover) { background: #3a3a3a; }
+  .difftab :global(.gmd-mc-reject) { color: #f28b82; }
+  .difftab :global(.cm-merge-revert button) {
+    color: #c5c8c6;
+    background: #2d2d2d;
+    border: 1px solid #505050;
+  }
+
   .difftab {
     height: 100%;
     display: flex;
     flex-direction: column;
     background: #1e1e1e;
     color: #c5c8c6;
+  }
+  .cmwrap {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: hidden;
   }
   .diff-head {
     flex: 0 0 auto;
@@ -404,6 +870,49 @@
     border-radius: 8px;
     padding: 0 8px;
   }
+  .pill {
+    flex: 0 0 auto;
+    font-size: 11px;
+    color: #949494;
+    border: 1px solid #404040;
+    border-radius: 8px;
+    padding: 0 8px;
+    background: transparent;
+  }
+  .dirtypill { color: #e58520; border-color: #e58520; cursor: pointer; }
+  .commitbar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    border-bottom: 1px solid #404040;
+    background: #232323;
+  }
+  .commitbar input {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: #1e1e1e;
+    border: 1px solid #505050;
+    border-radius: 4px;
+    color: #c5c8c6;
+    font-size: 12px;
+    padding: 2px 8px;
+  }
+  .commitbar input:focus { outline: none; border-color: #e58520; }
+  .commitbar button {
+    flex: 0 0 auto;
+    border: 1px solid #505050;
+    background: #2d2d2d;
+    color: #c5c8c6;
+    border-radius: 4px;
+    font-size: 11px;
+    padding: 2px 10px;
+    cursor: pointer;
+  }
+  .commitbar button:hover:not(:disabled) { background: #3a3a3a; }
+  .commitbar button:disabled { opacity: 0.5; cursor: default; }
+  .commitbar button.primary { border-color: #e58520; color: #e58520; }
   .diff-error {
     flex: 0 0 auto;
     margin: 6px 10px 0;
@@ -412,6 +921,16 @@
     border: 1px solid rgba(248, 81, 73, 0.4);
     border-radius: 4px;
     color: #f28b82;
+    font-size: 12px;
+  }
+  .diff-note {
+    flex: 0 0 auto;
+    margin: 6px 10px 0;
+    padding: 4px 8px;
+    background: rgba(229, 133, 32, 0.12);
+    border: 1px solid rgba(229, 133, 32, 0.35);
+    border-radius: 4px;
+    color: #e2c08d;
     font-size: 12px;
   }
   .hunks {
@@ -522,6 +1041,7 @@
     padding: 1px 8px;
     cursor: pointer;
   }
+  .viewtoggle button:disabled { opacity: 0.4; cursor: default; }
   .viewtoggle button.on {
     background: #353535;
     color: #c5c8c6;

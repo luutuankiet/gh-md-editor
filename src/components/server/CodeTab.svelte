@@ -21,18 +21,13 @@
   import { search, searchKeymap, getSearchQuery, searchPanelOpen } from '@codemirror/search';
   import { indentationMarkers } from '@replit/codemirror-indentation-markers';
   import { wordHighlight, wordMatchRanges } from '../../lib/word-highlight';
-  import { languages } from '@codemirror/language-data';
   import { monokaiCodeBundle } from '../../lib/monokai-dimmed';
 
   import { outlineFromState } from '../../lib/code-outline';
-  import { dotenvLanguage } from '../../lib/lang-dotenv';
+  import { LANGS, describeFor } from '../../lib/lang-detect';
   import { expandSelection, shrinkSelection, resetSelectionHistory } from '../../lib/expand-selection';
   import { formatDocumentText } from '../../lib/format-doc';
 
-  // One list, three consumers: the picker's name list, the picker's lookup,
-  // and filename auto-detection. Anything appended here has to be visible to
-  // all three or the picker and the detector disagree about what exists.
-  const LANGS = [dotenvLanguage, ...languages];
 
   // --- inline change gutter ---------------------------------------------------
   // VS Code's dirty-diff, built on CodeMirror's merge machinery. That package
@@ -972,7 +967,7 @@
   $effect(() => {
     const name = filename;
     if (!untrack(() => view)) return;
-    const detected = LanguageDescription.matchFilename(LANGS, name);
+    const detected = describeFor(name);
     untrack(() => {
       selectedLanguage = detected ? detected.name : PLAIN;
       void applyLanguage(selectedLanguage).then(() => {

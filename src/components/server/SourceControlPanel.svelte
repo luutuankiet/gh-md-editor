@@ -447,9 +447,13 @@
   .scm-lists {
     flex: 1 1 0;
     min-height: 0;
-    overflow-y: auto;
+    overflow: auto;
   }
+  /* Pinned to the left edge so the section a row belongs to stays readable
+     once the list is scrolled sideways to a long path. */
   .section-head {
+    position: sticky;
+    left: 0;
     display: flex;
     align-items: center;
     gap: 6px;
@@ -474,6 +478,9 @@
     padding: 2px 10px;
     cursor: pointer;
     white-space: nowrap;
+    width: max-content;
+    min-width: 100%;
+    box-sizing: border-box;
   }
   .filerow:hover { background: rgba(110, 118, 129, 0.12); }
   .guide {
@@ -484,11 +491,12 @@
     background: #353535;
     pointer-events: none;
   }
+  /* Grow to keep the badge on the right edge of short rows, but never shrink:
+     a long name widens the row and the list scrolls sideways to it. The old
+     `direction: rtl` went with the ellipsis — it clipped from the left, at the
+     cost of rendering a leading dot at the wrong end (`.env` as `env.`). */
   .fname {
-    flex: 1 1 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    direction: rtl;
+    flex: 1 0 auto;
     text-align: left;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
     font-size: 11.5px;

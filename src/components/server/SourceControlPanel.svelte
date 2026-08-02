@@ -1,14 +1,17 @@
 <script lang="ts">
   import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
 
-  let { visible = true, onOpenDiff }: {
+  let { visible = true, onOpenDiff, onOpenMerge }: {
     visible?: boolean;
     onOpenDiff: (repo: string, file: { path: string; staged: boolean; untracked?: boolean }) => void;
+    onOpenMerge: (repo: string, path: string) => void;
   } = $props();
 
   interface RepoInfo { repo: string; branch?: string; ahead?: number; behind?: number; changes?: number; error?: string }
   interface FileRow { path: string; status: string; untracked?: boolean; orig?: string | null }
-  interface GitStatus { repo: string; branch: string; upstream: string; ahead: number; behind: number; empty: boolean; staged: FileRow[]; changes: FileRow[] }
+  // `conflicts` is optional so a page left open against an older server still
+  // renders the two groups it does know about.
+  interface GitStatus { repo: string; branch: string; upstream: string; ahead: number; behind: number; empty: boolean; staged: FileRow[]; changes: FileRow[]; conflicts?: FileRow[] }
 
   let repos = $state<RepoInfo[]>([]);
   let repo = $state('');
@@ -296,6 +299,34 @@
   {#if error}<div class="scm-error">{error}</div>{/if}
   <div class="scm-lists">
     {#if status}
+      {#if status.conflicts?.length}
+        <div class="section">
+          <div class="section-head">
+            <span>Merge changes</span>
+            <span class="count">{status.conflicts.length}</span>
+          </div>
+          <!-- Flat, and without the stage and discard buttons the other groups
+               carry: a conflicted file has one useful action, and burying it
+               among verbs that would silently pick a side is how people end up
+               committing half a merge. -->
+          {#each status.conflicts as f (f.path)}
+            <div
+              class="filerow"
+              role="button"
+              tabindex="0"
+              title="{f.path} — resolve in the merge editor"
+              style="padding-left: 6px"
+              onclick={() => onOpenMerge(repo, f.path)}
+              onkeydown={(e) => { if (e.key === 'Enter') onOpenMerge(repo, f.path); }}
+            >
+              <span class="chevron"></span>
+              <img class="ficon" alt="" aria-hidden="true" src={fileIconUrl(leafName(f.path))} />
+              <span class="fname">{leafName(f.path)}</span>
+              <span class="badge conflict">{f.status}</span>
+            </div>
+          {/each}
+        </div>
+      {/if}
       <div class="section">
         <div class="section-head">
           <span>Staged changes</span>
@@ -346,6 +377,7 @@
     font-size: 12px;
     padding: 2px 4px;
   }
+  .badge.conflict { color: #f28b82; }
   .branchline {
     flex: 0 0 auto;
     display: flex;

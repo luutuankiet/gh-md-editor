@@ -3,7 +3,7 @@
 
   let { visible = false, onOpenDiff }: {
     visible?: boolean;
-    onOpenDiff: (repo: string, file: { path: string; staged: boolean; untracked?: boolean; base?: string; baseLabel?: string }) => void;
+    onOpenDiff: (repo: string, file: { path: string; staged: boolean; untracked?: boolean; base?: string; baseLabel?: string; to?: string; toLabel?: string }) => void;
   } = $props();
 
   interface RepoInfo { repo: string; branch?: string; error?: string }
@@ -14,6 +14,12 @@
   let refs = $state<string[]>([]);
   let head = $state('');
   let base = $state('');
+  // The incoming side. '' means the working tree — the historical behaviour,
+  // and the only shape where a file can be restored from the base. With a ref
+  // pinned here both sides are commits, so every diff opened is read-only.
+  let incoming = $state('');
+  let resolvedHead = $state('');
+  let hashDraft = $state({ base: '', incoming: '' });
   // Merge-base by default — the PR view: only this branch's own work. Direct
   // compares the trees head-on, differences from BOTH sides included.
   let direct = $state(false);
@@ -30,6 +36,11 @@
 
   const folder = new URLSearchParams(location.search).get('folder') ?? '';
   const baseKey = (r: string) => `ghmd.compareBase:${folder}:${r}`;
+  const incomingKey = (r: string) => `ghmd.compareIncoming:${folder}:${r}`;
+  // Anything shaped like an abbreviated object name is kept exactly as typed
+  // and handed to the server — resolveRef there is the only thing that can
+  // actually say whether it names a commit.
+  const isSha = (s: string) => /^[0-9a-f]{7,40}$/i.test(s);
 
   async function loadRepos() {
     try {
@@ -56,8 +67,15 @@
       refs = d.refs ?? [];
       head = d.head ?? '';
       let saved = '';
-      try { saved = localStorage.getItem(baseKey(repo)) ?? ''; } catch { /* private mode */ }
-      base = saved && refs.includes(saved) ? saved : refs.find((x) => x !== head) ?? refs[0] ?? '';
+      let savedIn = '';
+      try {
+        saved = localStorage.getItem(baseKey(repo)) ?? '';
+        savedIn = localStorage.getItem(incomingKey(repo)) ?? '';
+      } catch { /* private mode */ }
+      // A remembered sha is never in `refs`; only a remembered BRANCH that has
+      // since disappeared should be dropped.
+      base = saved && (refs.includes(saved) || isSha(saved)) ? saved : refs.find((x) => x !== head) ?? refs[0] ?? '';
+      incoming = savedIn && (refs.includes(savedIn) || isSha(savedIn)) ? savedIn : '';
       await refresh();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -68,11 +86,11 @@
     if (!repo || !base) { files = []; resolved = ''; return; }
     loading = true;
     try {
-      const qs = new URLSearchParams({ repo, base, ...(direct ? { mode: 'direct' } : {}) });
+      const qs = new URLSearchParams({ repo, base, ...(incoming ? { head: incoming } : {}), ...(direct ? { mode: 'direct' } : {}) });
       const r = await fetch(`/api/git/compare?${qs}`);
       const d = await r.json();
       if (!r.ok) { error = d.error ?? `HTTP ${r.status}`; files = []; }
-      else { error = ''; files = d.files ?? []; resolved = d.resolved ?? ''; }
+      else { error = ''; files = d.files ?? []; resolved = d.resolved ?? ''; resolvedHead = d.resolvedHead ?? ''; }
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -80,8 +98,40 @@
   }
 
   function pickBase(b: string) {
+    if (!b) return;
     base = b;
     try { localStorage.setItem(baseKey(repo), b); } catch { /* private mode */ }
+    void refresh();
+  }
+
+  function pickIncoming(b: string) {
+    incoming = b;
+    try { localStorage.setItem(incomingKey(repo), b); } catch { /* private mode */ }
+    void refresh();
+  }
+
+  // Enter in a hash box commits that value to its side. Nothing is validated
+  // here on purpose — an unknown ref comes back as a 400 with git's own words.
+  function commitHash(side: 'base' | 'incoming', e: KeyboardEvent) {
+    if (e.key !== 'Enter') return;
+    const v = (e.currentTarget as HTMLInputElement).value.trim();
+    if (!v) return;
+    if (side === 'base') pickBase(v); else pickIncoming(v);
+    hashDraft = { ...hashDraft, [side]: '' };
+  }
+
+  // Only meaningful when both sides are refs: the working tree cannot become a
+  // base. Written as one transaction — routing through pickBase/pickIncoming
+  // would read the value the other one just overwrote.
+  function swapSides() {
+    if (!incoming) return;
+    const b = base;
+    base = incoming;
+    incoming = b;
+    try {
+      localStorage.setItem(baseKey(repo), base);
+      localStorage.setItem(incomingKey(repo), incoming);
+    } catch { /* private mode */ }
     void refresh();
   }
 
@@ -92,8 +142,14 @@
       untracked: f.status === 'U',
       base: resolved,
       baseLabel: direct ? base : `${base} ⤴`,
+      ...(incoming ? { to: resolvedHead, toLabel: incoming } : {}),
     });
   }
+
+  // A pinned sha is not in `refs`, so it needs its own option or the select
+  // would render blank and silently misreport what is being compared.
+  const baseOptions = $derived(base && !refs.includes(base) ? [base, ...refs] : refs);
+  const incomingOptions = $derived(incoming && !refs.includes(incoming) ? [incoming, ...refs] : refs);
 
   $effect(() => {
     void repo; // track: switching repos refetches refs + files
@@ -217,17 +273,44 @@
     <button type="button" class="icon-btn" title="Refresh" onclick={() => void loadRepos()}>⟳</button>
   </div>
   <div class="tcmp-top">
+    <span class="sidelbl" title="Base — the side everything is compared against">base</span>
     <select value={base} onchange={(e) => pickBase(e.currentTarget.value)} title="Base branch / tag / ref to compare against">
-      {#each refs as rf (rf)}
+      {#each baseOptions as rf (rf)}
         <option value={rf}>{rf}</option>
       {/each}
     </select>
+    <input
+      class="hash"
+      placeholder="sha…"
+      title="Type a commit hash and press Enter to use it as the base"
+      value={hashDraft.base}
+      onkeydown={(e) => commitHash('base', e)}
+    />
+  </div>
+  <div class="tcmp-top">
+    <span class="sidelbl" title="Incoming — the side being compared">into</span>
+    <select value={incoming} onchange={(e) => pickIncoming(e.currentTarget.value)} title="Incoming side. Working tree includes uncommitted changes; pinning a ref makes both sides commits, so the diffs open read-only">
+      <option value="">working tree</option>
+      {#each incomingOptions as rf (rf)}
+        <option value={rf}>{rf}</option>
+      {/each}
+    </select>
+    <input
+      class="hash"
+      placeholder="sha…"
+      title="Type a commit hash and press Enter to use it as the incoming side"
+      value={hashDraft.incoming}
+      onkeydown={(e) => commitHash('incoming', e)}
+    />
+    <button type="button" class="icon-btn" title="Swap base and incoming" disabled={!incoming} onclick={swapSides}>⇄</button>
+  </div>
+  <div class="tcmp-top">
     <label class="direct" title="Compare trees directly instead of against the merge-base (PR view)">
       <input type="checkbox" bind:checked={direct} onchange={() => void refresh()} /> direct
     </label>
   </div>
   {#if head}
-    <div class="headline" title={resolved}>⎇ {head} vs {base}{direct ? '' : ' (merge-base)'}</div>
+    <div class="headline" title={resolvedHead || resolved}>⎇ {incoming || head} vs {base}{direct ? '' : ' (merge-base)'}{incoming ? ' · read-only' : ''}</div>
   {/if}
   {#if error}<div class="tcmp-error">{error}</div>{/if}
   <div class="rows">
@@ -265,6 +348,22 @@
     border-radius: 4px;
     font-size: 12px;
     padding: 2px 4px;
+  }
+  .tcmp-top .hash {
+    flex: 0 1 66px;
+    min-width: 0;
+    background: #1e1e1e;
+    color: #c5c8c6;
+    border: 1px solid #404040;
+    border-radius: 4px;
+    font-size: 11px;
+    padding: 2px 4px;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  }
+  .sidelbl {
+    flex: 0 0 26px;
+    color: #949494;
+    font-size: 11px;
   }
   .direct {
     color: #949494;
@@ -347,6 +446,7 @@
     line-height: 1.2;
   }
   .icon-btn:hover { background: #444444; color: #c5c8c6; }
+  .icon-btn:disabled { opacity: 0.35; cursor: default; background: transparent; }
   .empty {
     padding: 16px;
     color: #949494;

@@ -69,6 +69,7 @@ export default defineConfig({
       '@codemirror/language-data',
       '@codemirror/commands',
       '@codemirror/search',
+      '@codemirror/merge',
       '@replit/codemirror-indentation-markers',
     ],
   },

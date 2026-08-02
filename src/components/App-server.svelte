@@ -5,17 +5,21 @@
   import SourceControlPanel from './server/SourceControlPanel.svelte';
   import TreeComparePanel from './server/TreeComparePanel.svelte';
   import DiffTab from './server/DiffTab.svelte';
+  import MergeTab from './server/MergeTab.svelte';
   import SaveAsModal from './server/SaveAsModal.svelte';
   import WorkspaceBrowser from './server/WorkspaceBrowser.svelte';
 
   interface Tab {
     path: string;
     name: string;
-    kind: 'md' | 'code' | 'diff';
+    kind: 'md' | 'code' | 'diff' | 'merge';
     pinned: boolean;
     content: string;
     savedContent: string;
     mtimeMs: number;
+    // Disk moved under a buffer that has unsaved edits. Never set on a clean
+    // buffer — that one is reloaded silently instead.
+    stale?: boolean;
     binary?: boolean;
     error?: string;
     // A blank Alt+N buffer never written to disk. `path` is a synthetic
@@ -24,11 +28,15 @@
     // Set by a search-result click; consumed by CodeTab to scroll + select.
     reveal?: { line: number; seq: number; select?: { from: number; to: number } };
     // Present on kind === 'diff' tabs: which repo/file/side the tab shows.
-    git?: { repo: string; path: string; staged: boolean; untracked: boolean; base?: string; baseLabel?: string };
+    git?: { repo: string; path: string; staged: boolean; untracked: boolean; base?: string; baseLabel?: string; to?: string; toLabel?: string };
     // Present on kind === 'diff' tabs opened by a compare command: two
     // arbitrary inputs instead of a git side. rightText holds pasted content,
     // which lives in memory only.
     cmp?: { leftPath: string; rightPath?: string; rightText?: string; rightLabel: string };
+    // Present on kind === 'merge' tabs: which conflicted file to resolve. The
+    // tab holds no content of its own — the merge view owns the three sides
+    // and the working copy it writes back.
+    merge?: { repo: string; path: string };
   }
 
   import OutlinePanel from './server/OutlinePanel.svelte';
@@ -96,6 +104,24 @@
   // Never show results that belong to a mode other than the one being typed.
   let qoShown = $derived(qoResultsMode === qoMode ? qoResults : []);
 
+  // Blame is a window-wide preference rather than per-tab state, so the toggle
+  // lives here and every open editor is told at once.
+  let blameOn = typeof localStorage !== 'undefined' && localStorage.getItem('ghmd.blame') === '1';
+  function toggleBlame() {
+    blameOn = !blameOn;
+    try { localStorage.setItem('ghmd.blame', blameOn ? '1' : '0'); } catch { /* private mode */ }
+    window.dispatchEvent(new CustomEvent('gmd:toggle-blame', { detail: { on: blameOn } }));
+  }
+
+  // The trailing annotation on the cursor's line, toggled separately from the
+  // column: it costs no width, so it is the one people leave on.
+  let inlineBlameOn = typeof localStorage !== 'undefined' && localStorage.getItem('ghmd.blameInline') === '1';
+  function toggleInlineBlame() {
+    inlineBlameOn = !inlineBlameOn;
+    try { localStorage.setItem('ghmd.blameInline', inlineBlameOn ? '1' : '0'); } catch { /* private mode */ }
+    window.dispatchEvent(new CustomEvent('gmd:toggle-blame-inline', { detail: { on: inlineBlameOn } }));
+  }
+
   const COMMANDS: { label: string; hint?: string; run: () => void }[] = [
     { label: 'Open Workspace…', hint: 'this tab', run: () => { browse = { mode: 'workspace', action: 'same' }; } },
     { label: 'Open Workspace in New Tab', run: () => { browse = { mode: 'workspace', action: 'tab' }; } },
@@ -110,6 +136,8 @@
     { label: 'Format Document', hint: 'Shift+Alt+F', run: () => window.dispatchEvent(new CustomEvent('gmd:format-document')) },
     { label: 'Compare Active File With…', run: () => { if (compareSource()) browse = { mode: 'compare', action: 'same' }; } },
     { label: 'Compare Active File With Clipboard', run: () => void compareWithClipboard() },
+    { label: 'Toggle Git Blame', hint: 'code editors', run: toggleBlame },
+    { label: 'Toggle Inline Blame', hint: 'current line, code editors', run: toggleInlineBlame },
   ];
   let qoCommands = $derived(
     qoTerm ? COMMANDS.filter((c) => c.label.toLowerCase().includes(qoTerm.toLowerCase())) : COMMANDS
@@ -674,6 +702,69 @@
     return !t.binary && !t.error && t.content !== t.savedContent;
   }
 
+  // Freshness check against disk, on VS Code's rule: a clean buffer is
+  // replaced silently (CodeTab dispatches a diff rather than rebuilding the
+  // editor, so undo history survives), a dirty one is only flagged. Nothing is
+  // ever overwritten behind the user's back — that conflict still surfaces at
+  // save time through the 409 the server already returns.
+  async function revalidateTab(tab: Tab) {
+    if (tab.untitled || tab.binary || tab.error || tab.kind === 'diff' || !tab.mtimeMs) return;
+    try {
+      const res = await fetch(`/api/file?path=${encodeURIComponent(tab.path)}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.binary || typeof data.mtimeMs !== 'number' || data.mtimeMs === tab.mtimeMs) return;
+      if (isDirty(tab)) { tab.stale = true; return; }
+      tab.content = data.content;
+      tab.savedContent = data.content;
+      tab.mtimeMs = data.mtimeMs;
+      tab.stale = false;
+    } catch { /* offline or mid-restart: the next focus tries again */ }
+  }
+
+  // Explicit discard of local edits in favour of what is on disk.
+  async function reloadFromDisk(tab: Tab) {
+    try {
+      const res = await fetch(`/api/file?path=${encodeURIComponent(tab.path)}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.binary) return;
+      tab.content = data.content;
+      tab.savedContent = data.content;
+      tab.mtimeMs = data.mtimeMs;
+      tab.stale = false;
+    } catch { /* leave the banner up so it can be retried */ }
+  }
+
+  // Only the visible tab of each group is checked: a hidden buffer cannot be
+  // showing stale content, and it revalidates the moment it is selected.
+  let lastRevalidate = 0;
+  function revalidateVisible() {
+    const now = Date.now();
+    if (now - lastRevalidate < 500) return;
+    lastRevalidate = now;
+    for (const g of groups) {
+      const t = g.tabs.find((x) => x.path === g.activePath);
+      if (t) void revalidateTab(t);
+    }
+  }
+
+  $effect(() => {
+    const onFocus = () => revalidateVisible();
+    const onVisible = () => { if (document.visibilityState === 'visible') revalidateVisible(); };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisible);
+    // A hunk reverted from a diff tab is a disk write this window made itself,
+    // so no focus event follows it — the editor showing that file would keep
+    // the pre-revert text until something else happened to trigger a check.
+    window.addEventListener('gmd:git-refresh', onFocus);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('gmd:git-refresh', onFocus);
+    };
+  });
+
   function baseName(p: string): string {
     const i = p.lastIndexOf('/');
     return i >= 0 ? p.slice(i + 1) : p;
@@ -749,8 +840,10 @@
   // A diff tab is keyed by repo+side+path so the staged and working-tree
   // views of the same file are two distinct tabs — exactly like VS Code's
   // "Index vs Working Tree" split.
-  function openDiff(repo: string, file: { path: string; staged: boolean; untracked?: boolean; base?: string; baseLabel?: string }) {
-    const key = `gmd-diff:${repo}:${file.base ? `B:${file.base}` : file.staged ? 'S' : 'W'}:${file.path}`;
+  function openDiff(repo: string, file: { path: string; staged: boolean; untracked?: boolean; base?: string; baseLabel?: string; to?: string; toLabel?: string }) {
+    // The incoming sha is part of the key: the same file compared into two
+    // different commits is two different diffs, not one tab to reuse.
+    const key = `gmd-diff:${repo}:${file.base ? `B:${file.base}${file.to ? `:${file.to}` : ''}` : file.staged ? 'S' : 'W'}:${file.path}`;
     for (const g of groups) {
       const existing = g.tabs.find((t) => t.path === key);
       if (existing) {
@@ -761,13 +854,44 @@
     }
     const tab: Tab = {
       path: key,
-      name: `${baseName(file.path)} (${file.base ? `vs ${file.baseLabel ?? 'base'}` : file.staged ? 'staged' : 'changes'})`,
+      name: `${baseName(file.path)} (${file.to ? `${file.toLabel ?? 'incoming'} vs ${file.baseLabel ?? 'base'}` : file.base ? `vs ${file.baseLabel ?? 'base'}` : file.staged ? 'staged' : 'changes'})`,
       kind: 'diff',
       pinned: false,
       content: '',
       savedContent: '',
       mtimeMs: 0,
-      git: { repo, path: file.path, staged: file.staged, untracked: !!file.untracked, base: file.base, baseLabel: file.baseLabel },
+      git: { repo, path: file.path, staged: file.staged, untracked: !!file.untracked, base: file.base, baseLabel: file.baseLabel, to: file.to, toLabel: file.toLabel },
+    };
+    const home = groups.includes(activeGroup) ? activeGroup : groups[0];
+    const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
+    if (previewIdx >= 0) home.tabs[previewIdx] = tab;
+    else home.tabs.push(tab);
+    home.activePath = key;
+    activeGroupId = home.id;
+  }
+
+  // Conflict resolution gets its own kind rather than a third diff mode: the
+  // file exists in four versions at once here (base, current, incoming and the
+  // working copy being written), which is more than a two-sided diff can say.
+  function openMerge(repo: string, filePath: string) {
+    const key = `gmd-merge:${repo}:${filePath}`;
+    for (const g of groups) {
+      const existing = g.tabs.find((t) => t.path === key);
+      if (existing) {
+        activeGroupId = g.id;
+        g.activePath = key;
+        return;
+      }
+    }
+    const tab: Tab = {
+      path: key,
+      name: `${baseName(filePath)} (merge)`,
+      kind: 'merge',
+      pinned: false,
+      content: '',
+      savedContent: '',
+      mtimeMs: 0,
+      merge: { repo, path: filePath },
     };
     const home = groups.includes(activeGroup) ? activeGroup : groups[0];
     const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
@@ -886,6 +1010,7 @@
       const data = await res.json();
       tab.mtimeMs = data.mtimeMs;
       tab.savedContent = tab.content;
+      tab.stale = false;
       return;
     }
     if (res.status === 409) {
@@ -896,12 +1021,14 @@
           const d2 = await res2.json();
           tab.mtimeMs = d2.mtimeMs;
           tab.savedContent = tab.content;
+          tab.stale = false;
         }
       } else {
         // Discard local edits, take the disk version.
         tab.content = data.content;
         tab.savedContent = data.content;
         tab.mtimeMs = data.mtimeMs;
+        tab.stale = false;
       }
     }
   }
@@ -1381,6 +1508,13 @@
             >
               {#key g.activePath}
                 {#if at}
+                  {#if at.stale}
+                    <div class="stalebar">
+                      <span>This file changed on disk. Your unsaved edits are kept — saving will ask before overwriting.</span>
+                      <button type="button" onclick={() => void reloadFromDisk(at)}>Reload from disk</button>
+                      <button type="button" onclick={() => { at.stale = false; }}>Dismiss</button>
+                    </div>
+                  {/if}
                   {#if at.error}
                     <div class="placeholder">Cannot open {at.name}: {at.error}</div>
                   {:else if at.binary}
@@ -1388,11 +1522,13 @@
                   {:else if at.kind === 'diff' && at.cmp}
                     <DiffTab compare={at.cmp} />
                   {:else if at.kind === 'diff' && at.git}
-                    <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} />
+                    <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} to={at.git.to ?? ''} toLabel={at.git.toLabel ?? ''} />
+                  {:else if at.kind === 'merge' && at.merge}
+                    <MergeTab repo={at.merge.repo} path={at.merge.path} />
                   {:else if at.kind === 'md'}
                     <MarkdownTab bind:value={at.content} name={at.name} reveal={at.reveal ?? null} />
                   {:else}
-                    <CodeTab bind:value={at.content} filename={at.name} reveal={at.reveal ?? null} />
+                    <CodeTab bind:value={at.content} filename={at.name} gitPath={at.untitled ? '' : at.path} reveal={at.reveal ?? null} />
                   {/if}
                 {:else}
                   <div class="placeholder">Open a file from the tree.</div>
@@ -1440,7 +1576,7 @@
     </div>
     <aside class="rightpanel" class:hidden={!layout.showRight} style="flex-basis: {layout.rightW}px">
       <div class="panel-title">Source Control</div>
-      <SourceControlPanel visible={layout.showRight} onOpenDiff={openDiff} />
+      <SourceControlPanel visible={layout.showRight} onOpenDiff={openDiff} onOpenMerge={openMerge} />
     </aside>
   </div>
 </div>
@@ -1892,6 +2028,35 @@
     position: relative;
     overflow: hidden;
   }
+  .stalebar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 10px;
+    background: #3a3223;
+    border-bottom: 1px solid #5a4a2a;
+    color: #e2c08d;
+    font-size: 12px;
+  }
+  .stalebar span {
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .stalebar button {
+    flex: 0 0 auto;
+    background: #2d2d2d;
+    color: #c5c8c6;
+    border: 1px solid #505050;
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .stalebar button:hover { background: #3a3a3a; }
   .placeholder {
     height: 100%;
     display: flex;

@@ -882,6 +882,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/diff/apply' && req.method === 'POST') return await apiDiffApply(req, res);
     if (url.pathname === '/api/git/refs' && req.method === 'GET') return await apiGitRefs(res, url.searchParams);
     if (url.pathname === '/api/git/compare' && req.method === 'GET') return await apiGitCompare(res, url.searchParams);
+    if (url.pathname === '/api/git/show' && req.method === 'GET') return await apiGitShow(res, url.searchParams);
+    if (url.pathname === '/api/git/blame' && req.method === 'GET') return await apiGitBlame(res, url.searchParams);
     if (url.pathname === '/api/git/action' && req.method === 'POST') return await apiGitAction(req, res);
     if (url.pathname === '/api/terminals' && req.method === 'GET') {
       return sendJson(res, 200, { terminals: [...sessions.values()].map(sessionInfo) });
@@ -1052,6 +1054,8 @@ function apiSearch(req, res, params) {
 //   POST /api/diff/apply           apply one compare hunk onto either side
 //   GET  /api/git/refs?repo=       branch/tag names for the compare picker
 //   GET  /api/git/compare?repo=&base=&mode=   changed files vs a base ref
+//   GET  /api/git/show?path=&stage=|&ref=     one file's committed content
+//   GET  /api/git/blame?path=                 who last touched each line
 //   POST /api/git/action           {op: stage|unstage|discard|apply|commit}
 const GIT_MAX = 16 * 1024 * 1024;
 const GIT_SKIP = new Set(['node_modules', 'dist', 'build', 'target', 'vendor', '__pycache__']);
@@ -1065,6 +1069,34 @@ function git(args, cwd, input) {
     return { code: -1, out: '', err: msg };
   }
   return { code: r.status ?? -1, out: r.stdout ?? '', err: (r.stderr ?? '').trim() };
+}
+
+// Blame is the one git call here that is routinely slow — a long-lived file
+// with a deep history takes on the order of a second — so it is the one that
+// cannot use the helper above: a spawnSync would hold the event loop for that
+// whole second and stall every other request the window has in flight.
+function gitAsync(args, cwd) {
+  return new Promise((resolve) => {
+    const p = spawn('git', ['--no-pager', ...args], { cwd });
+    let out = '';
+    let err = '';
+    let over = false;
+    p.stdout.setEncoding('utf8');
+    p.stderr.setEncoding('utf8');
+    p.stdout.on('data', (d) => {
+      if (over) return;
+      if (out.length + d.length > GIT_MAX) { over = true; p.kill(); return; }
+      out += d;
+    });
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('error', (e) => {
+      resolve({ code: -1, out: '', err: e.code === 'ENOENT' ? 'git not found on PATH' : String(e.message ?? e) });
+    });
+    p.on('close', (code) => {
+      if (over) return resolve({ code: -1, out: '', err: 'blame output too large' });
+      resolve({ code: code ?? -1, out, err: err.trim() });
+    });
+  });
 }
 
 // Reject anything that could climb out of the repo before it reaches the CLI.
@@ -1257,7 +1289,7 @@ function buildPatch(relPath, hunk, sel, reverse) {
   return `--- a/${relPath}\n+++ b/${relPath}\n${header}\n${body.join('\n')}\n`;
 }
 
-function rawDiff(repoAbs, rel, staged, untracked, base) {
+function rawDiff(repoAbs, rel, staged, untracked, base, head) {
   const common = ['--no-color', '--no-ext-diff', '-U3'];
   // An untracked file has nothing to diff against, so compare it to /dev/null
   // rather than synthesising a hunk by hand — this also gets binary detection
@@ -1265,6 +1297,9 @@ function rawDiff(repoAbs, rel, staged, untracked, base) {
   // This wins over `base` on purpose: a file absent from the base tree has
   // the same whole-file-add shape whichever view asked for it.
   if (untracked) return git(['diff', '--no-index', ...common, '--', '/dev/null', rel], repoAbs);
+  // Both sides pinned: the working tree is out of the picture entirely, which
+  // is why every mutation refuses this shape (nothing on disk to patch).
+  if (base && head) return git(['diff', ...common, base, head, '--', rel], repoAbs);
   // A base ref pins the old side to that commit's tree instead of the index —
   // exactly what the tree-compare view shows.
   if (base) return git(['diff', ...common, base, '--', rel], repoAbs);
@@ -1300,16 +1335,26 @@ async function apiGitCompare(res, params) {
   if (!abs) return sendJson(res, 400, { error: 'repo escapes root' });
   const baseSha = resolveRef(abs, params.get('base'));
   if (!baseSha) return sendJson(res, 400, { error: 'unknown ref' });
+  // The incoming side. Absent means the working tree — the historical shape,
+  // and the only one where restoring a file from the base is coherent.
+  let headSha = '';
+  if (params.get('head')) {
+    headSha = resolveRef(abs, params.get('head'));
+    if (!headSha) return sendJson(res, 400, { error: 'unknown incoming ref' });
+  }
   // Merge-base by default mirrors a PR review: only this branch's own work
   // shows up, not everything the base gained since. `mode=direct` compares
   // the trees head-on instead. The resolved sha is returned so every later
   // call (per-file diff, restore) pins to the SAME tree even if HEAD moves.
   let base = baseSha;
   if (params.get('mode') !== 'direct') {
-    const mb = git(['merge-base', baseSha, 'HEAD'], abs);
+    const mb = git(['merge-base', baseSha, headSha || 'HEAD'], abs);
     if (mb.code === 0) base = mb.out.trim();
   }
-  const d = git(['diff', '--no-color', '--no-renames', '--name-status', '-z', base, '--'], abs);
+  const d = git(
+    ['diff', '--no-color', '--no-renames', '--name-status', '-z', base, ...(headSha ? [headSha] : []), '--'],
+    abs,
+  );
   if (d.code !== 0) return sendJson(res, 500, { error: d.err || 'git diff failed' });
   const files = [];
   const parts = d.out.split('\0');
@@ -1317,12 +1362,138 @@ async function apiGitCompare(res, params) {
     files.push({ status: parts[i][0], path: parts[i + 1] });
   }
   // Untracked files never show in a ref diff but ARE part of "my tree vs
-  // base", so they are appended with the panel's usual U badge.
-  const u = git(['ls-files', '--others', '--exclude-standard', '-z'], abs);
-  if (u.code === 0) {
-    for (const p of u.out.split('\0')) if (p) files.push({ status: 'U', path: p });
+  // base", so they are appended with the panel's usual U badge. With an
+  // incoming ref pinned they are not part of the comparison at all.
+  if (!headSha) {
+    const u = git(['ls-files', '--others', '--exclude-standard', '-z'], abs);
+    if (u.code === 0) {
+      for (const p of u.out.split('\0')) if (p) files.push({ status: 'U', path: p });
+    }
   }
-  return sendJson(res, 200, { base: params.get('base'), resolved: base, files });
+  return sendJson(res, 200, {
+    base: params.get('base'),
+    resolved: base,
+    head: params.get('head') ?? '',
+    resolvedHead: headSha,
+    files,
+  });
+}
+
+// One file's content as git has it, for the editor's inline change gutter and
+// (with an explicit stage) for the three-way merge view. The repo is derived
+// from the file rather than passed in: the editor knows which file it has open
+// and nothing else, and asking it to also work out which checkout that file
+// belongs to would duplicate what the CLI already does correctly.
+async function apiGitShow(res, params) {
+  const abs = resolveSafe(params.get('path'));
+  if (!abs) return sendJson(res, 400, { error: 'path escapes root' });
+  const top = git(['rev-parse', '--show-toplevel'], path.dirname(abs));
+  if (top.code !== 0) return sendJson(res, 200, { tracked: false, reason: 'not a git repository' });
+  const repoAbs = top.out.trim();
+  const rel = path.relative(repoAbs, abs);
+  if (!rel || rel.startsWith('..')) return sendJson(res, 400, { error: 'path escapes repo' });
+
+  // An explicit stage wins: 1/2/3 are the conflict stages (base, ours, theirs)
+  // that the three-way view is built from, 0 is the ordinary index entry.
+  // Otherwise the index is tried first and HEAD is the fallback, which is what
+  // makes the gutter mark UNSTAGED work only — stage a hunk and it stops being
+  // marked, exactly as VS Code behaves.
+  const stage = params.get('stage');
+  const ref = params.get('ref');
+  let specs;
+  if (stage) {
+    if (!/^[0-3]$/.test(stage)) return sendJson(res, 400, { error: 'bad stage' });
+    specs = [[`:${stage}:${rel}`, `stage${stage}`]];
+  } else if (ref) {
+    const sha = resolveRef(repoAbs, ref);
+    if (!sha) return sendJson(res, 400, { error: 'unknown ref' });
+    specs = [[`${sha}:${rel}`, ref]];
+  } else {
+    specs = [[`:0:${rel}`, 'index'], [`HEAD:${rel}`, 'HEAD']];
+  }
+
+  for (const [spec, source] of specs) {
+    const r = git(['show', spec], repoAbs);
+    if (r.code !== 0) continue;
+    // A NUL byte is git's own binary heuristic, and the only test that matters
+    // here: neither the gutter nor the merge view can display bytes.
+    if (r.out.includes('\0')) return sendJson(res, 200, { tracked: true, binary: true, source });
+    return sendJson(res, 200, { tracked: true, binary: false, source, path: rel, content: r.out });
+  }
+  // Untracked, or added since the ref asked for — nothing to compare against.
+  return sendJson(res, 200, { tracked: false, reason: 'no such object' });
+}
+
+// --incremental rather than --line-porcelain: the same information, but each
+// commit's metadata is emitted once instead of once per line. On a file where
+// a handful of commits own everything — which is most files — that repetition
+// is the bulk of the output.
+//
+// The wire shape keeps the same economy: commits are deduplicated into a list
+// and each line carries an index into it, so a thousand-line file blamed to
+// five commits sends five commit records rather than a thousand.
+function parseBlameIncremental(out) {
+  const commits = [];
+  const seen = new Map();
+  const lines = [];
+  let cur = null;
+  for (const raw of out.split('\n')) {
+    if (!raw) continue;
+    // Every group starts with <sha> <orig-line> <final-line> <line-count>;
+    // the metadata lines that follow belong to it, and appear only the first
+    // time that commit is named.
+    const head = /^([0-9a-f]{40}) \d+ (\d+) (\d+)$/.exec(raw);
+    if (head) {
+      const sha = head[1];
+      let i = seen.get(sha);
+      if (i === undefined) {
+        i = commits.length;
+        seen.set(sha, i);
+        commits.push({
+          sha,
+          short: sha.slice(0, 8),
+          // All-zero is git's marker for a line that exists only in the
+          // working tree. It has no author or message of its own to report.
+          uncommitted: /^0+$/.test(sha),
+          author: '',
+          authorTime: 0,
+          summary: '',
+        });
+      }
+      cur = commits[i];
+      const final = Number(head[2]);
+      const count = Number(head[3]);
+      for (let k = 0; k < count; k++) lines[final - 1 + k] = i;
+      continue;
+    }
+    if (!cur) continue;
+    const sp = raw.indexOf(' ');
+    const key = sp < 0 ? raw : raw.slice(0, sp);
+    const val = sp < 0 ? '' : raw.slice(sp + 1);
+    if (key === 'author' && !cur.author) cur.author = val;
+    else if (key === 'author-time' && !cur.authorTime) cur.authorTime = Number(val) * 1000;
+    else if (key === 'summary' && !cur.summary) cur.summary = val;
+  }
+  return { commits, lines };
+}
+
+async function apiGitBlame(res, params) {
+  const abs = resolveSafe(params.get('path'));
+  if (!abs) return sendJson(res, 400, { error: 'path escapes root' });
+  const top = git(['rev-parse', '--show-toplevel'], path.dirname(abs));
+  if (top.code !== 0) return sendJson(res, 200, { tracked: false, reason: 'not a git repository' });
+  const repoAbs = top.out.trim();
+  const rel = path.relative(repoAbs, abs);
+  if (!rel || rel.startsWith('..')) return sendJson(res, 400, { error: 'path escapes repo' });
+
+  // --root so the first commit is reported like any other rather than as a
+  // boundary with its metadata suppressed.
+  const r = await gitAsync(['blame', '--incremental', '--root', '--', rel], repoAbs);
+  // A file git has never seen is the ordinary case here, not an error: the
+  // gutter simply stays empty for it.
+  if (r.code !== 0) return sendJson(res, 200, { tracked: false, reason: r.err || 'no blame for this path' });
+  const { commits, lines } = parseBlameIncremental(r.out);
+  return sendJson(res, 200, { tracked: true, path: rel, commits, lines });
 }
 
 async function apiGitRepos(res, params) {
@@ -1347,6 +1518,12 @@ async function apiGitRepos(res, params) {
   return sendJson(res, 200, { repos });
 }
 
+// Git's unmerged index states as porcelain reports them, both letters read
+// together: 'UU' is both sides editing, 'DD' both deleting, 'AU' ours adding
+// while theirs never had the file. What they share is that the index holds
+// more than one version, which is the only thing the caller needs to know.
+const UNMERGED = new Set(['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU']);
+
 async function apiGitStatus(res, params) {
   const repoRel = params.get('repo') ?? '.';
   const abs = resolveSafe(repoRel);
@@ -1360,9 +1537,18 @@ async function apiGitStatus(res, params) {
   // XY = 'MM' appears under both Staged and Changes.
   const staged = [];
   const changes = [];
+  // A file mid-merge belongs to neither group. Its index entry is three
+  // competing versions rather than one staged change, so the Stage and
+  // Discard buttons the other two groups carry would offer the wrong verbs
+  // for it — the only useful action is to resolve it.
+  const conflicts = [];
   for (const f of s.files) {
     if (f.x === '?' ) {
       changes.push({ path: f.path, status: 'U', untracked: true });
+      continue;
+    }
+    if (UNMERGED.has(`${f.x}${f.y}`)) {
+      conflicts.push({ path: f.path, status: `${f.x}${f.y}` });
       continue;
     }
     if (f.x !== ' ' && f.x !== '?') staged.push({ path: f.path, status: f.x, orig: f.orig });
@@ -1377,6 +1563,7 @@ async function apiGitStatus(res, params) {
     empty: !!s.empty,
     staged,
     changes,
+    conflicts,
   });
 }
 
@@ -1393,8 +1580,16 @@ async function apiGitDiff(res, params) {
     base = resolveRef(abs, params.get('base'));
     if (!base) return sendJson(res, 400, { error: 'unknown ref' });
   }
+  // `to` pins the new side as well. Only meaningful alongside a base: on its
+  // own it would mean "working tree vs a commit", which is `base` reversed.
+  let to;
+  if (params.get('to')) {
+    if (!base) return sendJson(res, 400, { error: 'to requires base' });
+    to = resolveRef(abs, params.get('to'));
+    if (!to) return sendJson(res, 400, { error: 'unknown ref' });
+  }
 
-  const d = rawDiff(abs, rel, staged, untracked, base);
+  const d = rawDiff(abs, rel, staged, untracked, base, to);
   if (d.code === -1) return sendJson(res, 500, { error: d.err });
   if (/^Binary files /m.test(d.out) || /^GIT binary patch/m.test(d.out)) {
     return sendJson(res, 200, { path: rel, staged, binary: true, hunks: [] });
@@ -1402,7 +1597,7 @@ async function apiGitDiff(res, params) {
   if (d.out.length > 2 * 1024 * 1024) {
     return sendJson(res, 200, { path: rel, staged, tooBig: true, hunks: [] });
   }
-  return sendJson(res, 200, { path: rel, staged, untracked, hunks: parseDiff(d.out) });
+  return sendJson(res, 200, { path: rel, staged, untracked, readOnly: !!to, hunks: parseDiff(d.out) });
 }
 
 // Compare two arbitrary inputs. There is no repo and no index here, so this
@@ -1568,6 +1763,9 @@ async function apiGitAction(req, res) {
       // patch is always built against the tree as it is right now.
       const rel = cleanRepoPath(body.path);
       if (!rel) return sendJson(res, 400, { error: 'bad path' });
+      // A two-ref diff describes neither the index nor the working tree, so
+      // there is no coherent target to stage into or restore from.
+      if (body.to) return sendJson(res, 400, { error: 'two-ref diffs are read-only' });
       const mode = body.mode ?? 'stage';
       let base;
       if (body.base) {

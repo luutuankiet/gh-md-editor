@@ -1,7 +1,9 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { EditorView, lineNumbers, drawSelection, highlightActiveLine, keymap } from '@codemirror/view';
-  import { EditorState, EditorSelection, Compartment } from '@codemirror/state';
+  import { EditorView, lineNumbers, drawSelection, highlightActiveLine, keymap, gutter, GutterMarker, Decoration, WidgetType, ViewPlugin } from '@codemirror/view';
+  import type { DecorationSet, ViewUpdate } from '@codemirror/view';
+  import { EditorState, EditorSelection, Compartment, StateField, StateEffect, Facet, RangeSet, RangeSetBuilder } from '@codemirror/state';
+  import { unifiedMergeView, getChunks, getOriginalDoc, rejectChunk } from '@codemirror/merge';
   import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands';
   import {
     indentOnInput,
@@ -32,9 +34,388 @@
   // all three or the picker and the detector disagree about what exists.
   const LANGS = [dotenvLanguage, ...languages];
 
-  let { value = $bindable(''), filename, reveal = null }: {
+  // --- inline change gutter ---------------------------------------------------
+  // VS Code's dirty-diff, built on CodeMirror's merge machinery. That package
+  // supplies the part worth reusing — a chunk model that re-diffs itself on
+  // every keystroke — but not its presentation: it renders every deleted chunk
+  // as an always-visible block, which turns a lightly-edited file into a wall
+  // of text. So all of its visuals are switched off, its deleted-chunk widgets
+  // are hidden in CSS, and what is left is the diff, the original document and
+  // revert. The gutter and the peek panel below are this file's own.
+  const diffCompartment = new Compartment();
+
+  // `gutter` is read by the implementation but missing from the published
+  // option type, hence the cast. The config type itself is declared but never
+  // exported, so it is reached through the function's own signature.
+  const mergeOff = (original: string) => ({
+    original,
+    highlightChanges: false,
+    mergeControls: false,
+    allowInlineDiffs: false,
+    gutter: false,
+  }) as unknown as Parameters<typeof unifiedMergeView>[0];
+
+  // Where the original text came from, for the peek panel's label.
+  const originalSource = Facet.define<string, string>({ combine: (v) => v[0] ?? 'index' });
+
+  // Chunk starts (positions in the CURRENT document) whose original text is
+  // expanded. A set rather than a single position: having to close one change
+  // to read another is exactly the friction that stops people using this.
+  const toggleChangePeek = StateEffect.define<number>();
+
+  const changePeeks = StateField.define<Set<number>>({
+    create: () => new Set<number>(),
+    update(open, tr) {
+      // Any edit re-runs the diff, so these positions stop naming the same
+      // chunks — including the revert a panel just performed on itself.
+      if (tr.docChanged) return open.size ? new Set<number>() : open;
+      let next = open;
+      for (const e of tr.effects) {
+        if (!e.is(toggleChangePeek)) continue;
+        next = new Set(next);
+        if (next.has(e.value)) next.delete(e.value);
+        else next.add(e.value);
+      }
+      return next;
+    },
+  });
+
+  class OriginalTextWidget extends WidgetType {
+    text: string;
+    pos: number;
+    label: string;
+    // Written out rather than declared as constructor parameter properties:
+    // Svelte parses TypeScript in a component without that extension and
+    // rejects it outright.
+    constructor(text: string, pos: number, label: string) {
+      super();
+      this.text = text;
+      this.pos = pos;
+      this.label = label;
+    }
+    eq(other: OriginalTextWidget) {
+      return other.text === this.text && other.pos === this.pos && other.label === this.label;
+    }
+    toDOM(vw: EditorView) {
+      const wrap = document.createElement('div');
+      wrap.className = 'gmd-peek';
+      const bar = wrap.appendChild(document.createElement('div'));
+      bar.className = 'gmd-peek-bar';
+      const label = bar.appendChild(document.createElement('span'));
+      label.className = 'gmd-peek-label';
+      label.textContent = this.text ? `in ${this.label}` : `added — not in ${this.label}`;
+      const revert = bar.appendChild(document.createElement('button'));
+      revert.type = 'button';
+      revert.className = 'gmd-peek-btn';
+      revert.textContent = 'Revert';
+      revert.title = this.text ? 'Put this chunk back to the version shown' : 'Remove these added lines';
+      const close = bar.appendChild(document.createElement('button'));
+      close.type = 'button';
+      close.className = 'gmd-peek-btn';
+      close.textContent = 'Close';
+      // mousedown is how CodeMirror moves the selection into a widget; swallowing
+      // it leaves the cursor where the user left it.
+      for (const b of [revert, close]) b.addEventListener('mousedown', (e) => e.preventDefault());
+      // Client-side revert, not the server's patch route: this is an ordinary
+      // document edit, so it joins the undo history and is saved like any other.
+      revert.addEventListener('click', () => { rejectChunk(vw, this.pos); vw.focus(); });
+      close.addEventListener('click', () => { vw.dispatch({ effects: toggleChangePeek.of(this.pos) }); vw.focus(); });
+      if (this.text) {
+        const pre = wrap.appendChild(document.createElement('pre'));
+        pre.className = 'gmd-peek-text';
+        pre.textContent = this.text;
+      }
+      return wrap;
+    }
+    ignoreEvent() { return false; }
+  }
+
+  function buildPeeks(state: EditorState): DecorationSet {
+    const open = state.field(changePeeks, false);
+    if (!open || open.size === 0) return Decoration.none;
+    const info = getChunks(state);
+    if (!info) return Decoration.none;
+    const orig = getOriginalDoc(state);
+    const label = state.facet(originalSource);
+    const out = [];
+    for (const ch of info.chunks) {
+      if (!open.has(ch.fromB)) continue;
+      out.push(
+        Decoration.widget({
+          widget: new OriginalTextWidget(orig.sliceString(ch.fromA, Math.max(ch.fromA, ch.endA)), ch.fromB, label),
+          block: true,
+          side: -1,
+        }).range(ch.fromB),
+      );
+    }
+    return Decoration.set(out, true);
+  }
+
+  const changePeekDecorations = StateField.define<DecorationSet>({
+    create: (state) => buildPeeks(state),
+    update(deco, tr) {
+      // Effects are checked as well: swapping in a new original document is a
+      // reconfigure, which changes the chunks without touching the document.
+      if (
+        !tr.docChanged && tr.effects.length === 0 &&
+        tr.startState.field(changePeeks, false) === tr.state.field(changePeeks, false)
+      ) return deco;
+      return buildPeeks(tr.state);
+    },
+    provide: (f) => EditorView.decorations.from(f),
+  });
+
+  class ChangeMarker extends GutterMarker {
+    elementClass: string;
+    constructor(cls: string) {
+      super();
+      this.elementClass = cls;
+    }
+    eq(other: ChangeMarker) { return other.elementClass === this.elementClass; }
+  }
+  const MOD_MARKER = new ChangeMarker('gmd-chg gmd-chg-mod');
+  const ADD_MARKER = new ChangeMarker('gmd-chg gmd-chg-add');
+  const DEL_MARKER = new ChangeMarker('gmd-chg gmd-chg-del');
+
+  const changeGutter = gutter({
+    class: 'gmd-change-gutter',
+    markers: (vw) => {
+      const info = getChunks(vw.state);
+      if (!info) return RangeSet.empty;
+      const doc = vw.state.doc;
+      const b = new RangeSetBuilder<GutterMarker>();
+      for (const ch of info.chunks) {
+        // Nothing was added: the chunk exists only in the original, so there is
+        // no line of ours to paint. Mark where it was removed from instead.
+        if (ch.fromB === ch.toB) {
+          b.add(ch.fromB, ch.fromB, DEL_MARKER);
+          continue;
+        }
+        const marker = ch.fromA === ch.toA ? ADD_MARKER : MOD_MARKER;
+        for (let line = doc.lineAt(ch.fromB); ; ) {
+          b.add(line.from, line.from, marker);
+          if (line.to >= ch.endB || line.to + 1 > doc.length) break;
+          line = doc.lineAt(line.to + 1);
+        }
+      }
+      return b.finish();
+    },
+    // Without a spacer the column has no width until the first change lands,
+    // and the whole document shifts sideways the moment one does.
+    initialSpacer: () => MOD_MARKER,
+    domEventHandlers: {
+      mousedown: (vw, line, event) => {
+        const info = getChunks(vw.state);
+        if (!info) return false;
+        const hit = info.chunks.find((ch) => ch.fromB <= line.to && ch.endB >= line.from);
+        if (!hit) return false;
+        event.preventDefault();
+        vw.dispatch({ effects: toggleChangePeek.of(hit.fromB) });
+        return true;
+      },
+    },
+  });
+
+  // --- blame gutter -----------------------------------------------------------
+  // Who last touched each line, in a column of its own to the left of the line
+  // numbers. Off by default, and toggled for the whole window rather than per
+  // tab: turning it on while reading one file and finding it off in the next
+  // reads as a bug.
+  const blameCompartment = new Compartment();
+
+  interface BlameCommit {
+    sha: string;
+    short: string;
+    author: string;
+    // Milliseconds — the server has already scaled git's seconds.
+    authorTime: number;
+    summary: string;
+    uncommitted: boolean;
+  }
+  interface BlameData { commits: BlameCommit[]; lines: number[] }
+
+  const MONTH = 30 * 24 * 3600 * 1000;
+  // Ages, not dates: the useful question at a glance is whether a line is old
+  // or new, and the exact timestamp is one hover away.
+  function ago(ms: number) {
+    const d = Date.now() - ms;
+    if (d < 3600_000) return `${Math.max(1, Math.round(d / 60_000))}m ago`;
+    if (d < 86400_000) return `${Math.round(d / 3600_000)}h ago`;
+    if (d < MONTH) return `${Math.round(d / 86400_000)}d ago`;
+    if (d < 12 * MONTH) return `${Math.round(d / MONTH)}mo ago`;
+    return `${Math.round(d / (12 * MONTH))}y ago`;
+  }
+
+  class BlameMarker extends GutterMarker {
+    text: string;
+    hint: string;
+    cls: string;
+    constructor(text: string, hint: string, cls: string) {
+      super();
+      this.text = text;
+      this.hint = hint;
+      this.cls = cls;
+    }
+    eq(other: BlameMarker) {
+      return other.text === this.text && other.hint === this.hint && other.cls === this.cls;
+    }
+    toDOM() {
+      const el = document.createElement('span');
+      el.className = this.cls;
+      el.textContent = this.text;
+      el.title = this.hint;
+      return el;
+    }
+  }
+  // Sizes the column before the first marker renders, so switching blame on
+  // shoves the text sideways once rather than twice. Anything longer than this
+  // is clipped rather than allowed to widen the column further.
+  const BLAME_SPACER = new BlameMarker('Somebody 00mo ago', '', 'gmd-blame');
+
+  function blameGutter(data: BlameData) {
+    const markers: (BlameMarker | null)[] = [];
+    let prev = -1;
+    for (const ci of data.lines) {
+      const c = data.commits[ci];
+      if (!c) { markers.push(null); prev = -1; continue; }
+      const hint = c.uncommitted
+        ? 'Not committed yet'
+        : `${c.summary}\n\n${c.sha}\n${c.author} — ${new Date(c.authorTime).toLocaleString()}`;
+      // A run of lines from one commit is labelled once. Forty repeats of the
+      // same name is noise, and suppressing them is what makes the boundaries
+      // between commits legible at a glance.
+      if (ci === prev) markers.push(new BlameMarker('', hint, 'gmd-blame gmd-blame-run'));
+      else if (c.uncommitted) markers.push(new BlameMarker('Uncommitted', hint, 'gmd-blame gmd-blame-new'));
+      // Name and age only. The sha and the full message are what the hover is
+      // for — spending a fifth of the editor's width on a column that is read
+      // in passing is the trade GitLens gets right.
+      else markers.push(new BlameMarker(`${c.author.split(' ')[0]} ${ago(c.authorTime)}`, hint, 'gmd-blame'));
+      prev = ci;
+    }
+    return gutter({
+      class: 'gmd-blame-gutter',
+      // Blame is line-indexed rather than position-indexed: it was computed
+      // against the file on disk, so it is looked up by line number and simply
+      // runs out at the end of a buffer that has grown since.
+      lineMarker: (vw, block) => markers[vw.state.doc.lineAt(block.from).number - 1] ?? null,
+      initialSpacer: () => BLAME_SPACER,
+    });
+  }
+
+  // --- inline blame -----------------------------------------------------------
+  // The other half of what GitLens does: one faint annotation trailing the line
+  // the cursor is on. The column answers "who owns this region"; this answers
+  // "who wrote the line I am looking at right now", without spending any width
+  // to do it — the annotation sits past the end of the text, where nothing else
+  // is competing for the space.
+  const inlineCompartment = new Compartment();
+
+  class InlineBlameWidget extends WidgetType {
+    commit: BlameCommit;
+    constructor(c: BlameCommit) {
+      super();
+      this.commit = c;
+    }
+    eq(other: InlineBlameWidget) {
+      return other.commit.sha === this.commit.sha;
+    }
+    // Never focusable and never part of the document: the annotation must not
+    // be selectable, copyable, or reachable by the caret.
+    ignoreEvent() {
+      return false;
+    }
+    toDOM() {
+      const c = this.commit;
+      const el = document.createElement('span');
+      el.className = 'gmd-blame-inline';
+      el.textContent = c.uncommitted
+        ? '    You • uncommitted changes'
+        : `    ${c.author}, ${ago(c.authorTime)} • ${c.summary}`;
+      if (c.uncommitted) return el;
+      // The full record on hover, rather than crammed into the annotation. A
+      // native title tooltip would do for the gutter, where the text is short,
+      // but a commit message wants line breaks and a monospaced sha.
+      el.addEventListener('mouseenter', () => {
+        closeBlameCards();
+        const card = document.createElement('div');
+        card.className = 'gmd-blame-card';
+        card.style.cssText = [
+          'position:fixed', 'z-index:60', 'max-width:520px', 'padding:8px 10px',
+          'background:#232323', 'border:1px solid #505050', 'border-radius:4px',
+          'color:#c5c8c6', 'font-size:12px', 'line-height:1.5',
+          'box-shadow:0 4px 16px rgba(0,0,0,0.45)', 'pointer-events:none',
+          'white-space:pre-wrap',
+        ].join(';');
+        const summary = document.createElement('div');
+        summary.textContent = c.summary;
+        summary.style.cssText = 'color:#e6e6e6;margin-bottom:6px';
+        const who = document.createElement('div');
+        who.textContent = `${c.author} — ${new Date(c.authorTime).toLocaleString()}`;
+        who.style.cssText = 'color:#949494';
+        const sha = document.createElement('div');
+        sha.textContent = c.sha;
+        sha.style.cssText = 'color:#949494;font-family:monospace;font-size:11px;margin-top:4px';
+        card.append(summary, who, sha);
+        document.body.appendChild(card);
+        const r = el.getBoundingClientRect();
+        const w = card.getBoundingClientRect();
+        // Flip above the line when there is no room below, and keep the whole
+        // card on screen when the annotation is near the right edge.
+        const below = r.bottom + 6;
+        card.style.top = `${below + w.height > window.innerHeight ? Math.max(4, r.top - w.height - 6) : below}px`;
+        card.style.left = `${Math.max(4, Math.min(r.left, window.innerWidth - w.width - 8))}px`;
+      });
+      el.addEventListener('mouseleave', closeBlameCards);
+      return el;
+    }
+    destroy() {
+      closeBlameCards();
+    }
+  }
+
+  // The card lives on document.body — outside the editor, so it is never
+  // clipped by the scroller — which means nothing removes it implicitly.
+  function closeBlameCards() {
+    for (const n of document.querySelectorAll('.gmd-blame-card')) n.remove();
+  }
+
+  function inlineBlame(data: BlameData) {
+    function build(vw: EditorView) {
+      const sel = vw.state.selection.main;
+      // A selection, rather than a cursor, means the user is working with a
+      // range; an annotation pinned to one end of it is just noise.
+      if (!sel.empty) return Decoration.none;
+      const line = vw.state.doc.lineAt(sel.head);
+      const c = data.commits[data.lines[line.number - 1]];
+      if (!c) return Decoration.none;
+      return Decoration.set([
+        Decoration.widget({ widget: new InlineBlameWidget(c), side: 1 }).range(line.to),
+      ]);
+    }
+    return ViewPlugin.fromClass(
+      class {
+        decorations: DecorationSet;
+        constructor(vw: EditorView) {
+          this.decorations = build(vw);
+        }
+        update(u: ViewUpdate) {
+          if (u.docChanged || u.selectionSet || u.viewportChanged) this.decorations = build(u.view);
+        }
+        destroy() {
+          closeBlameCards();
+        }
+      },
+      { decorations: (v) => v.decorations }
+    );
+  }
+
+  let { value = $bindable(''), filename, gitPath = '', reveal = null }: {
     value?: string;
     filename: string;
+    // Workspace-relative path, empty for an unsaved buffer. Used only to ask
+    // git what this file looked like before the current edits — the editor
+    // itself stays path-agnostic.
+    gitPath?: string;
     // Search-result jump. `seq` is what makes a repeat click on the same line
     // fire again — a bare line number would compare equal and do nothing.
     // `select` carries a range to highlight instead of just placing the cursor,
@@ -236,6 +617,42 @@
     }
   }
 
+  // The committed version of this file, as the gutter measures against. Null
+  // means "no diff": untracked, binary, or not in a repository at all.
+  let originalText: string | null = null;
+
+  async function loadOriginal() {
+    const vw = untrack(() => view);
+    const p = gitPath;
+    if (!vw) return;
+    let text: string | null = null;
+    let source = 'index';
+    if (p) {
+      try {
+        const r = await fetch(`/api/git/show?path=${encodeURIComponent(p)}`);
+        const d = await r.json();
+        if (r.ok && d.tracked && !d.binary) {
+          text = d.content as string;
+          source = d.source ?? 'index';
+        }
+      } catch {
+        return; // offline or mid-restart: the next refresh tries again
+      }
+    }
+    // The tab may have been pointed somewhere else while this was in flight.
+    if (untrack(() => view) !== vw || gitPath !== p) return;
+    // Reconfiguring rebuilds the chunk model from scratch, which closes every
+    // open peek panel — so an unchanged original is left alone. This is what
+    // makes the refresh on window focus invisible.
+    if (text === originalText) return;
+    originalText = text;
+    vw.dispatch({
+      effects: diffCompartment.reconfigure(
+        text === null ? [] : [originalSource.of(source), changeGutter, unifiedMergeView(mergeOff(text))],
+      ),
+    });
+  }
+
   $effect(() => {
     if (!host) return;
     const initialDoc = untrack(() => value);
@@ -243,6 +660,11 @@
     const state = EditorState.create({
       doc: initialDoc,
       extensions: [
+        // Before the line numbers on purpose — extension order is gutter
+        // order, and blame belongs at the far left where GitLens puts it,
+        // outside the numbers rather than between them and the text.
+        blameCompartment.of([]),
+        inlineCompartment.of([]),
         lineNumbers(),
         codeFolding(),
         foldGutter(),
@@ -262,6 +684,13 @@
         }),
         search({ top: true }),
         wordHighlight,
+        // Empty until the file turns out to be tracked, and it carries the
+        // change gutter with it — declared here so that gutter lands to the
+        // right of the fold arrows and immediately left of the text, where VS
+        // Code puts it. Extension order IS gutter order.
+        diffCompartment.of([]),
+        changePeeks,
+        changePeekDecorations,
         wrapCompartment.of(wrapEnabled ? EditorView.lineWrapping : []),
         languageCompartment.of([]),
         themeCompartment.of(untrack(() => isDark) ? darkBundle : lightBundle),
@@ -415,6 +844,96 @@
           },
           '.cm-panel.cm-search br': { display: 'none' },
         }),
+        // Change gutter + peek panel. In the editor theme rather than the
+        // component stylesheet because every element it targets is rendered by
+        // CodeMirror, including the widget's own DOM.
+        EditorView.theme({
+          // The one piece of @codemirror/merge's presentation that cannot be
+          // switched off by configuration. The peek panel replaces it, on
+          // demand, instead of every deleted chunk being permanently on screen.
+          '.cm-deletedChunk': { display: 'none' },
+          '.gmd-blame-gutter': {
+            padding: '0 6px 0 4px',
+            fontSize: '90%',
+            whiteSpace: 'pre',
+            userSelect: 'none',
+            borderRight: '1px solid rgba(128, 128, 128, 0.25)',
+          },
+          '.gmd-blame': {
+            display: 'inline-block',
+            // Fixed rather than content-sized: the column is then the same
+            // width in every file, and one unusually long name cannot push the
+            // text of a whole document sideways.
+            minWidth: '20ch',
+            maxWidth: '20ch',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            verticalAlign: 'bottom',
+            color: '#767676',
+            cursor: 'default',
+          },
+          '.gmd-blame-new': { color: '#e2c08d' },
+          '.gmd-blame-inline': {
+            color: '#6a6a6a',
+            fontStyle: 'italic',
+            whiteSpace: 'pre',
+            cursor: 'default',
+            userSelect: 'none',
+          },
+          // Wider than the 3px bar it draws: a 3px click target is pixel-sniping.
+          '.gmd-change-gutter': { width: '10px', cursor: 'pointer' },
+          '.gmd-change-gutter .cm-gutterElement': { position: 'relative' },
+          '.gmd-chg': { boxShadow: 'inset 3px 0 0 0 currentColor' },
+          '.gmd-chg-mod': { color: '#1b81a8' },
+          '.gmd-chg-add': { color: '#487e02' },
+          // A deletion occupies no line of this document, so it gets a stub at
+          // the top edge of the line that closed over it, not a full-height bar.
+          '.gmd-chg-del': { color: 'transparent' },
+          '.gmd-chg-del::before': {
+            content: '""',
+            position: 'absolute',
+            left: '0',
+            top: '0',
+            width: '3px',
+            height: '7px',
+            background: '#f14c4c',
+          },
+          '.gmd-peek': {
+            margin: '2px 0',
+            border: '1px solid #505050',
+            borderRadius: '4px',
+            background: '#232323',
+            overflow: 'hidden',
+          },
+          '.gmd-peek-bar': {
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            padding: '3px 8px',
+            background: '#272727',
+            borderBottom: '1px solid #404040',
+            fontSize: '11px',
+            color: '#949494',
+          },
+          '.gmd-peek-label': { flex: '1 1 auto' },
+          '.gmd-peek-btn': {
+            font: 'inherit',
+            padding: '1px 8px',
+            borderRadius: '3px',
+            border: '1px solid #505050',
+            background: '#2d2d2d',
+            color: '#c5c8c6',
+            cursor: 'pointer',
+          },
+          '.gmd-peek-btn:hover': { background: '#3a3a3a' },
+          '.gmd-peek-text': {
+            margin: '0',
+            padding: '4px 8px',
+            whiteSpace: 'pre-wrap',
+            color: '#c5c8c6',
+            background: 'rgba(248, 81, 73, 0.10)',
+          },
+        }),
       ],
     });
 
@@ -461,6 +980,92 @@
         if (vw) pushOutline(vw);
       });
     });
+  });
+
+  // Refetch when the tab is pointed at a different file. `originalText` is
+  // cleared first so the no-op guard in loadOriginal cannot mistake the
+  // previous file's content for this one's.
+  $effect(() => {
+    const p = gitPath;
+    if (!untrack(() => view)) return;
+    untrack(() => {
+      originalText = null;
+      void loadOriginal();
+    });
+    void p;
+  });
+
+  // Staging, reverting or committing moves the index the gutter is measured
+  // against; `focus` covers the same things done outside this window. Both
+  // no-op when the original is unchanged, which is the common case.
+  $effect(() => {
+    const on = () => { void loadOriginal(); void loadBlame(); };
+    window.addEventListener('gmd:git-refresh', on);
+    window.addEventListener('focus', on);
+    return () => {
+      window.removeEventListener('gmd:git-refresh', on);
+      window.removeEventListener('focus', on);
+    };
+  });
+
+  // The window-wide preference, read once at open so a tab created while blame
+  // is on comes up with it on.
+  let blameOn = $state(typeof localStorage !== 'undefined' && localStorage.getItem('ghmd.blame') === '1');
+
+  $effect(() => {
+    const on = (e: Event) => { blameOn = !!(e as CustomEvent).detail?.on; };
+    window.addEventListener('gmd:toggle-blame', on);
+    return () => window.removeEventListener('gmd:toggle-blame', on);
+  });
+
+  // Independent of the column: the annotation is the cheaper of the two to
+  // leave on permanently, and plenty of people want one without the other.
+  let inlineBlameOn = $state(typeof localStorage !== 'undefined' && localStorage.getItem('ghmd.blameInline') === '1');
+
+  $effect(() => {
+    const on = (e: Event) => { inlineBlameOn = !!(e as CustomEvent).detail?.on; };
+    window.addEventListener('gmd:toggle-blame-inline', on);
+    return () => window.removeEventListener('gmd:toggle-blame-inline', on);
+  });
+
+  async function loadBlame() {
+    const vw = untrack(() => view);
+    if (!vw) return;
+    const p = gitPath;
+    // One fetch feeds both the column and the annotation, so it runs when
+    // either is on and is torn down only when both are off.
+    if ((!untrack(() => blameOn) && !untrack(() => inlineBlameOn)) || !p) {
+      closeBlameCards();
+      vw.dispatch({ effects: [blameCompartment.reconfigure([]), inlineCompartment.reconfigure([])] });
+      return;
+    }
+    let data: BlameData | null = null;
+    try {
+      const r = await fetch(`/api/git/blame?path=${encodeURIComponent(p)}`);
+      const d = await r.json();
+      if (r.ok && d.tracked) data = d as BlameData;
+    } catch {
+      return; // offline or mid-restart: the next refresh tries again
+    }
+    // The tab may have been pointed elsewhere, or blame switched off, while
+    // this was in flight.
+    if (untrack(() => view) !== vw || gitPath !== p) return;
+    if (!untrack(() => blameOn) && !untrack(() => inlineBlameOn)) return;
+    closeBlameCards();
+    vw.dispatch({
+      effects: [
+        blameCompartment.reconfigure(data && untrack(() => blameOn) ? blameGutter(data) : []),
+        inlineCompartment.reconfigure(data && untrack(() => inlineBlameOn) ? inlineBlame(data) : []),
+      ],
+    });
+  }
+
+  $effect(() => {
+    void blameOn;
+    void inlineBlameOn;
+    void gitPath;
+    if (!untrack(() => view)) return;
+    untrack(() => { void loadBlame(); });
   });
 
   $effect(() => {

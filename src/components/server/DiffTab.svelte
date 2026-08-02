@@ -1,5 +1,5 @@
 <script lang="ts">
-  let { repo = '', path = '', staged = false, untracked = false, compare = null, base = '', baseLabel = '' }: {
+  let { repo = '', path = '', staged = false, untracked = false, compare = null, base = '', baseLabel = '', to = '', toLabel = '' }: {
     repo?: string;
     path?: string;
     staged?: boolean;
@@ -8,6 +8,12 @@
     // tree instead of the index. baseLabel is the human name the user picked.
     base?: string;
     baseLabel?: string;
+    // Pinned sha of the incoming side. Empty means the working tree, which is
+    // the only shape where a hunk can be staged or restored: with both sides
+    // pinned to commits there is nothing on disk for a patch to land in, so
+    // the whole view goes read-only.
+    to?: string;
+    toLabel?: string;
     // Set instead of repo/path when the tab came from a compare command: two
     // arbitrary inputs, no repo, no index side. rightText carries pasted
     // content, which has no path of its own.
@@ -22,6 +28,9 @@
   // What the diff is *about* — drives the header and the grammar pick. A
   // compare has no repo-relative path, so its left input names the tab.
   const subject = $derived(compare ? compare.leftPath : path);
+
+  // Two commits, no working tree — nothing here can be staged or reverted.
+  const readOnly = $derived(!!to);
 
   let hunks = $state<Hunk[]>([]);
   let flags = $state<{ binary?: boolean; tooBig?: boolean }>({});
@@ -100,8 +109,11 @@
     return rows;
   }
 
-  async function load() {
-    loading = true;
+  async function load(auto = false) {
+    // A background reload keeps the current diff on screen while it runs: the
+    // spinner would otherwise flash on every window focus.
+    if (!auto) loading = true;
+    let next: Hunk[] = [];
     try {
       // Two request shapes, one response shape. A compare carries no repo and
       // no side, and pasted text has no path at all — hence the POST.
@@ -111,13 +123,22 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(compare),
           })
-        : await fetch(`/api/git/diff?${new URLSearchParams({ repo, path, staged: staged ? '1' : '0', untracked: untracked ? '1' : '0', ...(base ? { base } : {}) })}`);
+        : await fetch(`/api/git/diff?${new URLSearchParams({ repo, path, staged: staged ? '1' : '0', untracked: untracked ? '1' : '0', ...(base ? { base } : {}), ...(to ? { to } : {}) })}`);
       const d = await r.json();
-      if (!r.ok) { error = d.error ?? `HTTP ${r.status}`; hunks = []; }
-      else { error = ''; hunks = d.hunks ?? []; flags = { binary: d.binary, tooBig: d.tooBig }; }
+      if (!r.ok) { error = d.error ?? `HTTP ${r.status}`; hunks = []; sel = []; loading = false; return; }
+      error = '';
+      next = d.hunks ?? [];
+      flags = { binary: d.binary, tooBig: d.tooBig };
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
+      loading = false;
+      return;
     }
+    // An automatic reload that finds the diff unchanged must not touch state.
+    // Resetting would wipe a line selection the user is still building, and a
+    // focus event fires every time they tab away to check something.
+    if (auto && JSON.stringify(next) === JSON.stringify(hunks)) { loading = false; return; }
+    hunks = next;
     sel = hunks.map(() => new Set());
     loading = false;
     // Fire-and-forget: the diff paints as plain text immediately and upgrades
@@ -129,6 +150,19 @@
   // Props are read synchronously (qs build) → tracked: a reused tab pointed
   // at another file/side refetches. Writes only — no self-invalidation.
   $effect(() => { void load(); });
+
+  // Live refresh. `gmd:git-refresh` covers mutations made anywhere in this app;
+  // `focus` covers everything done outside it — a terminal commit, a revert in
+  // another window. Both take the auto path, which no-ops on an unchanged diff.
+  $effect(() => {
+    const onRefresh = () => { void load(true); };
+    window.addEventListener('gmd:git-refresh', onRefresh);
+    window.addEventListener('focus', onRefresh);
+    return () => {
+      window.removeEventListener('gmd:git-refresh', onRefresh);
+      window.removeEventListener('focus', onRefresh);
+    };
+  });
 
   function toggle(h: number, i: number) {
     const s = new Set(sel[h]);
@@ -184,7 +218,7 @@
 <div class="difftab">
   <div class="diff-head">
     <span class="diff-path" title={subject}>{subject}</span>
-    <span class="diff-side">{compare ? `vs ${compare.rightLabel}` : base ? `vs ${baseLabel || base.slice(0, 7)}` : staged ? 'staged' : untracked ? 'untracked' : 'working tree'}</span>
+    <span class="diff-side">{compare ? `vs ${compare.rightLabel}` : to ? `${toLabel || to.slice(0, 7)} vs ${baseLabel || base.slice(0, 7)}` : base ? `vs ${baseLabel || base.slice(0, 7)}` : staged ? 'staged' : untracked ? 'untracked' : 'working tree'}</span>
     <span class="viewtoggle">
       <button type="button" class:on={view === 'split'} onclick={() => setView('split')}>Split</button>
       <button type="button" class:on={view === 'inline'} onclick={() => setView('inline')}>Inline</button>
@@ -208,7 +242,11 @@
             <code>@@ -{h.oldStart},{h.oldLines} +{h.newStart},{h.newLines} @@ {h.section}</code>
             <span class="hunk-actions">
               {#if sel[hi]?.size}<span class="selcount">{sel[hi].size} selected</span>{/if}
-              {#if compare}
+              {#if readOnly}
+                <!-- Both sides are pinned commits: no working tree exists for
+                     a patch to land in, so no action is offered at all. -->
+                <span class="selcount">read-only</span>
+              {:else if compare}
                 <!-- VS Code's per-change arrows: copy this change onto either
                      side. Pasted text has no file, so no right target then. -->
                 <button type="button" onclick={() => void applyCompare(hi, 'left')}>⇤ Apply {sel[hi]?.size ? 'selected' : 'hunk'} to left</button>

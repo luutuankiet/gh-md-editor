@@ -31,12 +31,41 @@
   // Cmd/Ctrl+click multi-select — a Set of node paths, reassigned (never
   // mutated) on change so Svelte sees it.
   let selected = $state<Set<string>>(new Set());
+  // A plain click seeds `selected` with the row it opened, so a following
+  // Cmd/Ctrl+click extends from it instead of starting over. That seeded state
+  // is implicit: the loud multi-select tint only shows once the user has
+  // actually reached for Cmd or Shift.
+  let selectionExplicit = $state(false);
   let menu = $state<{ x: number; y: number; path: string; type: EntryType; paths: string[] } | null>(null);
   let toast = $state('');
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
   let refreshing = $state(false);
   // Shift+click extends from the last row touched by a plain or Cmd/Ctrl click.
   let anchorPath = '';
+  // The one row that renders as an input instead of a button: either a new
+  // entry being named, or an existing one being renamed.
+  let editing = $state<
+    | { mode: 'create'; parent: string; type: EntryType; name: string }
+    | { mode: 'rename'; path: string; parent: string; name: string }
+    | null
+  >(null);
+  // Paths being dragged, and the folder they would land in.
+  let dragPaths = $state<string[]>([]);
+  let dropDir = $state<string | null>(null);
+  // Private to this tree: a public MIME type would let a stray drop paste
+  // these paths as text into an open document.
+  const TREE_DND_MIME = 'application/x-gmd-tree-paths';
+
+  function parentOf(p: string) {
+    const i = p.lastIndexOf('/');
+    return i < 0 ? '' : p.slice(0, i);
+  }
+
+  function baseOf(p: string) {
+    return p.split('/').pop() ?? p;
+  }
+
+  const joinIn = joinPath;
 
   function joinPath(base: string, name: string): string {
     return base ? `${base}/${name}` : name;
@@ -239,6 +268,7 @@
       if (a >= 0 && b >= 0) {
         const [lo, hi] = a <= b ? [a, b] : [b, a];
         selected = new Set(flat.slice(lo, hi + 1));
+        selectionExplicit = true;
         return;
       }
     }
@@ -249,15 +279,160 @@
       if (next.has(node.path)) next.delete(node.path);
       else next.add(node.path);
       selected = next;
+      selectionExplicit = true;
       return;
     }
-    if (selected.size) selected = new Set();
+    selected = new Set([node.path]);
+    selectionExplicit = false;
     if (node.type === 'dir') void toggleDir(node);
     else onOpen(node.path, { pinned: false });
   }
 
+  // Double-click renames. Opening a file pinned still lives on the tab strip's
+  // own double-click, so nothing is lost by repurposing this one.
   function handleDblClick(node: TreeNode) {
-    if (node.type !== 'dir') onOpen(node.path, { pinned: true });
+    startRename(node.path);
+  }
+
+  function startRename(path: string) {
+    menu = null;
+    editing = { mode: 'rename', path, parent: parentOf(path), name: baseOf(path) };
+  }
+
+  // Right-clicking a folder creates inside it; a file creates beside it.
+  async function startCreate(type: EntryType) {
+    const target = menu;
+    menu = null;
+    if (!target) return;
+    const parent = target.type === 'dir' ? target.path : parentOf(target.path);
+    // The draft row has to be somewhere visible, so the parent opens first.
+    if (parent && parent !== folder) await expandPath(parent);
+    editing = { mode: 'create', parent, type, name: '' };
+  }
+
+  // Focus and pre-select on mount. A leading dot is the whole name
+  // (.gitignore), not an extension, so only an inner dot splits.
+  function focusName(el: HTMLInputElement) {
+    el.focus();
+    const dot = el.value.lastIndexOf('.');
+    if (dot > 0) el.setSelectionRange(0, dot);
+    else el.select();
+  }
+
+  async function commitEdit() {
+    const ed = editing;
+    editing = null;
+    if (!ed) return;
+    const name = ed.name.trim();
+    if (!name || name.includes('/')) return;
+    if (ed.mode === 'rename') {
+      const to = joinIn(ed.parent, name);
+      if (to === ed.path) return;
+      await moveEntries([{ from: ed.path, to }]);
+      return;
+    }
+    const target = joinIn(ed.parent, name);
+    try {
+      const res = await fetch('/api/entry', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: target, type: ed.type }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+      await refresh();
+      window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
+      if (ed.type === 'dir') await expandPath(target);
+      else onOpen(target, { pinned: true });
+    } catch (err) {
+      showToast(`Create failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // Rename and drag-move are the same server call; the only thing that differs
+  // is whether the parent folder changes.
+  async function moveEntries(moves: { from: string; to: string }[]) {
+    if (!moves.length) return;
+    try {
+      const res = await fetch('/api/entry', {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ moves }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+      const done: { from: string; to: string }[] = data.moved ?? [];
+      if (done.length) {
+        // Tabs are keyed by path, so every open reference has to follow the
+        // file rather than linger pointing at a name that no longer exists.
+        window.dispatchEvent(new CustomEvent('gmd:paths-moved', { detail: { moves: done } }));
+        window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
+        selected = new Set(done.map((m) => m.to));
+      }
+      await refresh();
+      if (data.errors?.length) {
+        showToast(`Moved ${done.length}, failed ${data.errors.length}: ${data.errors[0].error}`);
+      } else if (done.length > 1) {
+        showToast(`Moved ${done.length} items.`);
+      }
+    } catch (err) {
+      showToast(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // Dragging a row inside the selection carries the whole selection; dragging
+  // one outside it carries that row alone.
+  function handleRowDragStart(e: DragEvent, node: TreeNode) {
+    dragPaths = selected.has(node.path) && selected.size > 1 ? [...selected] : [node.path];
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData(TREE_DND_MIME, dragPaths.join('\n'));
+    }
+  }
+
+  // Dropping on a file means dropping into the folder that holds it.
+  function dropParentFor(node: TreeNode) {
+    return node.type === 'dir' ? node.path : parentOf(node.path);
+  }
+
+  function badDrop(dest: string) {
+    // Into itself, into its own subtree, or back where it already lives.
+    return dragPaths.some((p) => dest === p || dest.startsWith(`${p}/`) || parentOf(p) === dest);
+  }
+
+  function handleRowDragOver(e: DragEvent, node: TreeNode) {
+    if (!dragPaths.length) return;
+    const dest = dropParentFor(node);
+    if (badDrop(dest)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+    if (dropDir !== dest) dropDir = dest;
+  }
+
+  function handleRowDrop(e: DragEvent, node: TreeNode) {
+    e.preventDefault();
+    // Without this the tree background would treat the same drop as a move to
+    // the workspace root.
+    e.stopPropagation();
+    const dest = dropParentFor(node);
+    const paths = dragPaths;
+    dragPaths = [];
+    dropDir = null;
+    if (!paths.length || badDrop(dest)) return;
+    void moveEntries(paths.map((p) => ({ from: p, to: joinIn(dest, baseOf(p)) })));
+  }
+
+  function handleRootDrop(e: DragEvent) {
+    e.preventDefault();
+    const paths = dragPaths;
+    dragPaths = [];
+    dropDir = null;
+    if (!paths.length) return;
+    void moveEntries(
+      paths
+        .filter((p) => parentOf(p) !== folder)
+        .map((p) => ({ from: p, to: joinIn(folder, baseOf(p)) }))
+    );
   }
 
   function handleContextMenu(e: MouseEvent, node: TreeNode) {
@@ -265,7 +440,13 @@
     // for "Open workspace here". Right-clicking inside a multi-selection acts
     // on the whole selection; outside it, on the clicked row alone.
     e.preventDefault();
-    const paths = selected.has(node.path) && selected.size > 1 ? [...selected] : [node.path];
+    if (!selected.has(node.path)) {
+      // Right-clicking outside the selection moves the selection to that row.
+      selected = new Set([node.path]);
+      selectionExplicit = false;
+      anchorPath = node.path;
+    }
+    const paths = selected.size > 1 ? [...selected] : [node.path];
     menu = { x: e.clientX, y: e.clientY, path: node.path, type: node.type, paths };
   }
 
@@ -362,6 +543,7 @@
           : `Deleted ${gone.length} item${gone.length === 1 ? '' : 's'}.`
       );
       selected = new Set();
+      selectionExplicit = false;
       anchorPath = '';
       await refresh();
     } catch (e) {
@@ -481,18 +663,58 @@
   }
 </script>
 
+<!-- The row being named renders as a div: an <input> inside a <button> is
+     invalid HTML, and the button swallows the clicks that would place a
+     cursor in it. -->
+{#snippet editRow(depth: number)}
+  <div class="row editing" style="padding-left: {8 + depth * 14}px">
+    <span class="chevron"></span>
+    <img
+      class="icon"
+      alt=""
+      aria-hidden="true"
+      src={editing?.mode === 'create' && editing.type === 'dir'
+        ? folderIconUrl(editing.name || 'folder', false)
+        : fileIconUrl(editing?.name || 'file')}
+    />
+    <input
+      class="name-input"
+      value={editing?.name ?? ''}
+      spellcheck="false"
+      use:focusName
+      oninput={(e) => { if (editing) editing.name = e.currentTarget.value; }}
+      onkeydown={(e) => {
+        if (e.key === 'Enter') { e.preventDefault(); void commitEdit(); }
+        else if (e.key === 'Escape') { e.preventDefault(); editing = null; }
+      }}
+      onblur={() => { editing = null; }}
+    />
+  </div>
+{/snippet}
+
 {#snippet rows(nodes: TreeNode[], depth: number)}
   {#each nodes as node (node.path)}
+    {#if editing?.mode === 'rename' && editing.path === node.path}
+      {@render editRow(depth)}
+    {:else}
     <button
       type="button"
       class="row"
-      class:selected={selected.has(node.path)}
+      class:selected={selectionExplicit && selected.has(node.path)}
       class:active={node.path === activeRow}
+      class:droptarget={dropDir === node.path}
       data-path={node.path}
       style="padding-left: {8 + depth * 14}px"
+      draggable="true"
+      ondragstart={(e) => handleRowDragStart(e, node)}
+      ondragover={(e) => handleRowDragOver(e, node)}
+      ondragleave={() => { if (dropDir === dropParentFor(node)) dropDir = null; }}
+      ondrop={(e) => handleRowDrop(e, node)}
+      ondragend={() => { dragPaths = []; dropDir = null; }}
       onclick={(e) => handleClick(e, node)}
       ondblclick={() => handleDblClick(node)}
       oncontextmenu={(e) => handleContextMenu(e, node)}
+      onkeydown={(e) => { if (e.key === 'F2') { e.preventDefault(); startRename(node.path); } }}
       title={node.path}
     >
       {#each Array(depth) as _, i}
@@ -508,7 +730,11 @@
       <span class="name" class:dir={node.type === 'dir'}>{node.name}</span>
       {#if node.loading}<span class="loading">…</span>{/if}
     </button>
+    {/if}
     {#if node.type === 'dir' && node.expanded && node.children}
+      {#if editing?.mode === 'create' && editing.parent === node.path}
+        {@render editRow(depth + 1)}
+      {/if}
       {@render rows(node.children, depth + 1)}
     {/if}
   {/each}
@@ -542,10 +768,19 @@
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5a5.5 5.5 0 1 0 5.32 6.9l-1.29-.34A4.2 4.2 0 1 1 8 3.8v2.2l3.2-2.75L8 .5z" /></svg>
     </button>
   </div>
-  <div class="tree" bind:this={treeEl}>
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="tree"
+    bind:this={treeEl}
+    ondragover={(e) => { if (!dragPaths.length) return; e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'; }}
+    ondrop={handleRootDrop}
+  >
     {#if rootError}
       <div class="error">{rootError}</div>
     {:else}
+      {#if editing?.mode === 'create' && editing.parent === folder}
+        {@render editRow(0)}
+      {/if}
       {@render rows(roots, 0)}
     {/if}
   </div>
@@ -557,6 +792,18 @@
       <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && pickWorkspace(menu.path)}>
         Open workspace here
       </button>
+    {/if}
+    {#if menu.paths.length === 1}
+      <button type="button" role="menuitem" class="ctx-item" onclick={() => void startCreate('file')}>
+        New file…
+      </button>
+      <button type="button" role="menuitem" class="ctx-item" onclick={() => void startCreate('dir')}>
+        New folder…
+      </button>
+      <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && startRename(menu.path)}>
+        Rename…
+      </button>
+      <div class="ctx-sep"></div>
     {/if}
     <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && copyAsContext(menu.paths)}>
       Copy as context{#if menu.paths.length > 1}&nbsp;({menu.paths.length}){/if}
@@ -607,6 +854,23 @@
 {/if}
 
 <style>
+  /* Naming row. Shares .row so indent, height and icon slot line up with the
+     rows above and below it. */
+  .row.editing { display: flex; align-items: center; gap: 4px; }
+  .name-input {
+    flex: 1;
+    min-width: 0;
+    background: #1e1e1e;
+    border: 1px solid #e58520;
+    border-radius: 3px;
+    color: #c5c8c6;
+    font: inherit;
+    padding: 1px 4px;
+  }
+  .name-input:focus { outline: none; }
+  /* Folder a drag would land in. Reads on the folder row itself even when the
+     pointer is over one of its files. */
+  .row.droptarget { background: rgba(229, 133, 32, 0.22); }
   .explorer {
     display: flex;
     flex-direction: column;

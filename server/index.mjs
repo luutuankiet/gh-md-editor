@@ -93,7 +93,7 @@ try {
 } catch { /* no prebuilt for this platform — fall back below */ }
 if (!rgBin && onPath('rg')) rgBin = 'rg';
 import { spawn, spawnSync } from 'node:child_process';
-import { createReadStream, promises as fs } from 'node:fs';
+import { createReadStream, closeSync, mkdirSync, openSync, statSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
@@ -723,6 +723,88 @@ async function apiDeleteEntry(res, params) {
   sendJson(res, 200, { deleted, errors });
 }
 
+// Explorer create. One entry per call, because the draft row in the tree names
+// a single thing at a time. Existence is checked before the write rather than
+// relying on mkdir's EEXIST, which recursive:true never raises.
+async function apiCreateEntry(req, res) {
+  let body;
+  try {
+    body = JSON.parse(String(await readBody(req)) || '{}');
+  } catch {
+    return sendJson(res, 400, { error: 'invalid JSON body' });
+  }
+  const rel = typeof body.path === 'string' ? body.path : '';
+  const type = body.type === 'dir' ? 'dir' : 'file';
+  if (!rel) return sendJson(res, 400, { error: 'path required' });
+  const abs = resolveSafe(rel);
+  if (!abs) return sendJson(res, 400, { error: 'path escapes root' });
+  try {
+    await fs.stat(abs);
+    return sendJson(res, 409, { error: 'already exists' });
+  } catch {
+    // ENOENT is the happy path here.
+  }
+  try {
+    if (type === 'dir') {
+      await fs.mkdir(abs, { recursive: true });
+    } else {
+      // A name typed as a/b/c.txt creates the intermediate folders too, the
+      // same way the quick-open path field already behaves.
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      const fh = await fs.open(abs, 'wx');
+      await fh.close();
+    }
+  } catch (e) {
+    return sendJson(res, e?.code === 'EEXIST' ? 409 : 500, { error: String(e?.message ?? e) });
+  }
+  fileListCache.clear();
+  sendJson(res, 200, { path: toClientPath(abs), type });
+}
+
+// Rename and drag-move share one route: a rename is a move whose parent does
+// not change. Per-item errors, so a partial multi-move still tells the client
+// exactly which paths landed and which did not.
+async function apiMoveEntry(req, res) {
+  let body;
+  try {
+    body = JSON.parse(String(await readBody(req)) || '{}');
+  } catch {
+    return sendJson(res, 400, { error: 'invalid JSON body' });
+  }
+  const moves = Array.isArray(body.moves) ? body.moves : [];
+  if (!moves.length) return sendJson(res, 400, { error: 'moves required' });
+  const moved = [];
+  const errors = [];
+  for (const m of moves) {
+    const from = typeof m?.from === 'string' ? m.from : '';
+    const to = typeof m?.to === 'string' ? m.to : '';
+    if (!from || !to) { errors.push({ from, to, error: 'from and to are both required' }); continue; }
+    const src = resolveSafe(from);
+    const dst = resolveSafe(to);
+    if (!src || !dst) { errors.push({ from, to, error: 'path escapes root' }); continue; }
+    if (src === ROOT) { errors.push({ from, to, error: 'refusing to move the workspace root' }); continue; }
+    if (src === dst) { errors.push({ from, to, error: 'source and destination are the same' }); continue; }
+    // Dropping a folder inside its own subtree would detach everything below
+    // it. rename() reports EINVAL for some of these but not all, so the guard
+    // is explicit rather than inherited.
+    if (dst.startsWith(src + path.sep)) { errors.push({ from, to, error: 'cannot move a folder into itself' }); continue; }
+    try {
+      // rename() replaces an existing destination file silently, which for a
+      // drag gesture means data loss with no undo. Refuse instead.
+      let clash = false;
+      try { await fs.stat(dst); clash = true; } catch { /* free */ }
+      if (clash) { errors.push({ from, to, error: 'destination already exists' }); continue; }
+      await fs.mkdir(path.dirname(dst), { recursive: true });
+      await fs.rename(src, dst);
+      moved.push({ from, to: toClientPath(dst) });
+    } catch (e) {
+      errors.push({ from, to, error: String(e?.message ?? e) });
+    }
+  }
+  fileListCache.clear();
+  sendJson(res, 200, { moved, errors });
+}
+
 async function apiQuickOpen(res, params) {
   const baseAbs = resolveSafe(params.get('path') || '.');
   if (!baseAbs) return sendJson(res, 400, { error: 'path escapes root' });
@@ -763,6 +845,91 @@ async function apiQuickOpen(res, params) {
 // GET /api/ports → {ports:[n]} — LISTEN sockets parsed from /proc/net/tcp{,6}
 // (Linux; other platforms return an empty list and the UI falls back to
 // manual entry). The server's own port is excluded.
+// --- version / self-upgrade ------------------------------------------------
+
+// Literal, never from the request. This endpoint sits behind the same token as
+// everything else, and a client-supplied package spec would turn that token
+// into arbitrary code execution.
+const PKG = '@luutuankiet/gh-md-editor';
+
+// An npx or global install lands under a node_modules directory; a git
+// checkout never does. That distinction is the only thing standing between a
+// click in the browser and npm's published build overwriting a working copy.
+const PUBLISHED_TREE = __dirname.includes(`${path.sep}node_modules${path.sep}`);
+const CACHE_HOME = process.env.GH_MD_EDITOR_HOME || path.join(os.homedir(), '.cache', 'gh-md-editor');
+const UPGRADE_LOG = path.join(CACHE_HOME, 'logs', 'upgrade.log');
+
+// Reported by GET /api/version so the badge can explain itself, and enforced
+// again by POST /api/upgrade so a stale client cannot talk its way past it.
+function upgradeBlocker() {
+  if (!PUBLISHED_TREE) {
+    return 'running from a source checkout — upgrading would replace it with the published build. Use git.';
+  }
+  if (tunnel) {
+    return 'this server is tunnelled — a restart mints a fresh public url and auth token, so this page could never reconnect. Upgrade from a terminal.';
+  }
+  return null;
+}
+
+function apiVersion(res) {
+  const blocker = upgradeBlocker();
+  sendJson(res, 200, {
+    version: VERSION,
+    pkg: PKG,
+    port,
+    upgradable: !blocker,
+    reason: blocker,
+    log: UPGRADE_LOG,
+  });
+}
+
+// A server cannot upgrade itself in-process: it is running the old code, and
+// the npx fetch that downloads the new code IS the upgrade. So the work goes
+// to a detached child that outlives this process — the same manoeuvre the cli
+// performs when `upgrade` is typed into a terminal owned by the server it is
+// about to kill. spawn() calls setsid(), so the runner escapes both the
+// process-group kill and the session sweep that are about to land here.
+// Clearing GMD_PORT marks it as already-handed-off so it cannot bounce the
+// work onwards again.
+//
+// --force because there is no staleness check: without it a server already on
+// the latest release is skipped, comes back never, and the caller waits out
+// its whole timeout for a no-op. A restart is the honest outcome of a click.
+//
+// Live terminal sessions die with the old process. Deliberately unprompted —
+// same posture as the cli, which reports them afterwards rather than asking.
+function apiUpgrade(res) {
+  const blocker = upgradeBlocker();
+  if (blocker) return sendJson(res, 409, { error: blocker });
+
+  let fd;
+  try {
+    mkdirSync(path.dirname(UPGRADE_LOG), { recursive: true, mode: 0o700 });
+    fd = openSync(UPGRADE_LOG, 'a', 0o600);
+  } catch (e) {
+    return sendJson(res, 500, { error: `cannot open ${UPGRADE_LOG}: ${String(e?.message ?? e)}` });
+  }
+
+  // npx ships beside the node binary running this. Falling back to PATH covers
+  // the shim-based installs (volta, asdf) that put the two elsewhere.
+  const sibling = path.join(path.dirname(process.execPath), 'npx');
+  let bin = 'npx';
+  try { if (statSync(sibling).isFile()) bin = sibling; } catch { /* PATH it is */ }
+
+  const child = spawn(bin, ['-y', `${PKG}@latest`, 'upgrade', '--runner', '--force', '--port', String(port)], {
+    cwd: os.homedir(),
+    detached: true,
+    stdio: ['ignore', fd, fd],
+    env: { ...process.env, GMD_PORT: '', GMD_TERM_ID: '', npm_config_yes: 'true' },
+  });
+  child.on('error', (e) => console.error(`upgrade: could not spawn ${bin} — ${e.message}`));
+  child.unref();
+  closeSync(fd);
+
+  console.log(`upgrade requested from the editor — detached runner pid ${child.pid}, log ${UPGRADE_LOG}`);
+  sendJson(res, 202, { from: VERSION, pid: child.pid, log: UPGRADE_LOG });
+}
+
 async function apiPorts(res) {
   const ports = new Set();
   for (const f of ['/proc/net/tcp', '/proc/net/tcp6']) {
@@ -906,7 +1073,11 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/quickopen' && req.method === 'GET') return await apiQuickOpen(res, url.searchParams);
     if (url.pathname === '/api/open' && req.method === 'POST') return await apiOpen(req, res);
     if (url.pathname === '/api/entry' && req.method === 'DELETE') return await apiDeleteEntry(res, url.searchParams);
+    if (url.pathname === '/api/entry' && req.method === 'POST') return await apiCreateEntry(req, res);
+    if (url.pathname === '/api/entry' && req.method === 'PATCH') return await apiMoveEntry(req, res);
     if (url.pathname === '/api/ports' && req.method === 'GET') return await apiPorts(res);
+    if (url.pathname === '/api/version' && req.method === 'GET') return apiVersion(res);
+    if (url.pathname === '/api/upgrade' && req.method === 'POST') return apiUpgrade(res);
     if (url.pathname.startsWith('/api/')) return sendJson(res, 404, { error: 'unknown endpoint' });
     const px = parseProxyPath(url.pathname);
     if (px) {

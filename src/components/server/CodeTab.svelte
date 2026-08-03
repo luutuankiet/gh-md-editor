@@ -19,6 +19,7 @@
   import { indentFoldService } from '../../lib/fold-indent';
   import { TAB_DND_MIME, PATH_DND_MIME } from '../../lib/dnd';
   import { search, searchKeymap, getSearchQuery, searchPanelOpen } from '@codemirror/search';
+  import { selectAllOccurrences } from '../../lib/select-occurrences';
   import { indentationMarkers } from '@replit/codemirror-indentation-markers';
   import { wordHighlight, wordMatchRanges } from '../../lib/word-highlight';
   import { monokaiCodeBundle } from '../../lib/monokai-dimmed';
@@ -482,6 +483,16 @@
     return () => window.removeEventListener('gmd:format-document', on);
   });
 
+  // Same command, reached from the palette instead of the keyboard.
+  $effect(() => {
+    const on = () => {
+      const vw = view;
+      if (vw) selectAllOccurrences(vw);
+    };
+    window.addEventListener('gmd:select-all-occurrences', on);
+    return () => window.removeEventListener('gmd:select-all-occurrences', on);
+  });
+
   const languageCompartment = new Compartment();
   const themeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
@@ -754,6 +765,13 @@
           // three operating systems beats matching each one's local habit.
           { mac: 'Cmd-Ctrl-Shift-ArrowLeft', preventDefault: true, run: expandSelection },
           { mac: 'Cmd-Ctrl-Shift-ArrowRight', preventDefault: true, run: shrinkSelection },
+          // Select all occurrences of the selection, the all-at-once form of
+          // Mod-d. Bound twice on purpose: Shift+D is the chord asked for, and
+          // Shift+L is VS Code's own — some browsers claim Shift+D for
+          // "bookmark all tabs" and never let the page see the keystroke.
+          // Declared here so it beats searchKeymap's own Mod-Shift-l below.
+          { key: 'Mod-Shift-d', preventDefault: true, run: selectAllOccurrences },
+          { key: 'Mod-Shift-l', preventDefault: true, run: selectAllOccurrences },
           // Tab indents, Shift-Tab outdents. Without this nothing consumes Tab,
           // so the browser falls back to native focus traversal and lands on the
           // language picker in the corner instead of touching the document.

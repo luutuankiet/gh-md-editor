@@ -5,6 +5,7 @@
   import { history, historyKeymap, defaultKeymap, indentWithTab, selectParentSyntax } from '@codemirror/commands';
   import { indentOnInput, bracketMatching, syntaxTree, LanguageDescription } from '@codemirror/language';
   import { searchKeymap, search, getSearchQuery, searchPanelOpen } from '@codemirror/search';
+  import { selectAllOccurrences } from '../lib/select-occurrences';
   import { recordExpansion, shrinkSelection, resetSelectionHistory } from '../lib/expand-selection';
   import { wordHighlight, wordMatchRanges } from '../lib/word-highlight';
   import { markdown as markdownLang, markdownLanguage } from '@codemirror/lang-markdown';
@@ -479,6 +480,10 @@
           // Cmd clears it while keeping left = expand on every platform.
           { mac: 'Cmd-Ctrl-Shift-ArrowLeft', preventDefault: true, run: expandHere },
           { mac: 'Cmd-Ctrl-Shift-ArrowRight', preventDefault: true, run: shrinkSelection },
+          // Select all occurrences — see the note in CodeTab for why this is
+          // bound to both Shift+D and Shift+L.
+          { key: 'Mod-Shift-d', preventDefault: true, run: selectAllOccurrences },
+          { key: 'Mod-Shift-l', preventDefault: true, run: selectAllOccurrences },
           ...defaultKeymap,
           ...historyKeymap,
           // Mod-g / Shift-Mod-g dropped — see the note in CodeTab: CodeMirror

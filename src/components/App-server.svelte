@@ -1,5 +1,6 @@
 <script lang="ts">
   import FileTree from './server/FileTree.svelte';
+  import Breadcrumbs from './server/Breadcrumbs.svelte';
   import MarkdownTab from './server/MarkdownTab.svelte';
   import CodeTab from './server/CodeTab.svelte';
   import SourceControlPanel from './server/SourceControlPanel.svelte';
@@ -122,6 +123,64 @@
     window.dispatchEvent(new CustomEvent('gmd:toggle-blame-inline', { detail: { on: inlineBlameOn } }));
   }
 
+  // Version badge + self-upgrade. The server decides whether upgrading is even
+  // allowed — a source checkout must not be replaced by the published build,
+  // and a tunnelled server mints a new url and token on restart, which would
+  // strand this page — so the badge can say why instead of failing late.
+  let serverVersion = $state<string | null>(null);
+  let upgradable = $state(false);
+  let upgradeReason = $state<string | null>(null);
+  let upgradeState = $state<'idle' | 'running' | 'failed'>('idle');
+  let upgradeNote = $state('');
+
+  async function loadVersion() {
+    try {
+      const r = await fetch('/api/version', { cache: 'no-store' });
+      if (!r.ok) return;
+      const v = await r.json();
+      serverVersion = v.version ?? null;
+      upgradable = !!v.upgradable;
+      upgradeReason = v.reason ?? null;
+    } catch { /* offline or mid-restart: the badge keeps its last value */ }
+  }
+
+  // The upgrade replaces this server with a freshly fetched one, so the page it
+  // is serving dies with it. The npm fetch happens first and is the slow part —
+  // the port stays up throughout it — then the old process goes down and the
+  // new one binds the same port. Watching for down-then-up rather than for a
+  // version change is deliberate: --force can legitimately land on the same
+  // version, and a version-only watch would hang there forever.
+  async function upgradeServer() {
+    if (upgradeState === 'running') return;
+    upgradeState = 'running';
+    upgradeNote = 'fetching the latest release…';
+    try {
+      const r = await fetch('/api/upgrade', { method: 'POST' });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body?.error ?? `HTTP ${r.status}`);
+    } catch (e) {
+      upgradeState = 'failed';
+      upgradeNote = String((e as Error)?.message ?? e);
+      return;
+    }
+    let sawDown = false;
+    for (let i = 0; i < 180; i++) {
+      await new Promise((done) => setTimeout(done, 1000));
+      try {
+        const r = await fetch('/api/version', { cache: 'no-store' });
+        if (!r.ok) throw new Error(String(r.status));
+        // Answering again after a gap means the replacement is listening, and
+        // it is serving a different bundle than the one running this code.
+        if (sawDown) return location.reload();
+      } catch {
+        sawDown = true;
+        upgradeNote = 'server restarting — waiting for it to come back…';
+      }
+    }
+    upgradeState = 'failed';
+    upgradeNote = 'timed out waiting for the server. Check ~/.cache/gh-md-editor/logs/upgrade.log';
+  }
+
   const COMMANDS: { label: string; hint?: string; run: () => void }[] = [
     { label: 'Open Workspace…', hint: 'this tab', run: () => { browse = { mode: 'workspace', action: 'same' }; } },
     { label: 'Open Workspace in New Tab', run: () => { browse = { mode: 'workspace', action: 'tab' }; } },
@@ -134,10 +193,12 @@
     { label: 'Show Outline', run: () => { layout.showLeft = true; sideView = 'explorer'; toggleOutline(true); } },
     { label: 'New Untitled File', hint: 'Alt+N', run: () => newUntitledTab() },
     { label: 'Format Document', hint: 'Shift+Alt+F', run: () => window.dispatchEvent(new CustomEvent('gmd:format-document')) },
+    { label: 'Select All Occurrences', hint: 'Mod+Shift+D', run: () => window.dispatchEvent(new CustomEvent('gmd:select-all-occurrences')) },
     { label: 'Compare Active File With…', run: () => { if (compareSource()) browse = { mode: 'compare', action: 'same' }; } },
     { label: 'Compare Active File With Clipboard', run: () => void compareWithClipboard() },
     { label: 'Toggle Git Blame', hint: 'code editors', run: toggleBlame },
     { label: 'Toggle Inline Blame', hint: 'current line, code editors', run: toggleInlineBlame },
+    { label: 'Upgrade Server', hint: 'restarts — kills terminal sessions', run: () => void upgradeServer() },
   ];
   let qoCommands = $derived(
     qoTerm ? COMMANDS.filter((c) => c.label.toLowerCase().includes(qoTerm.toLowerCase())) : COMMANDS
@@ -185,6 +246,10 @@
   // ---- Recently opened, so an empty query still offers somewhere to go ----
   const RECENT_FILES_KEY = 'ghmd.recentFiles';
   const RECENT_WS_KEY = 'ghmd.recentWorkspaces';
+  const RECENT_OPEN_KEY = 'ghmd.recentOpen';
+  // Deep enough to cover a week of hopping between checkouts, shallow enough
+  // that the collapsed section stays a jump-off point rather than a history.
+  const RECENT_WS_MAX = 10;
   function readList<T>(key: string): T[] {
     try {
       const v = JSON.parse(localStorage.getItem(key) ?? '[]');
@@ -212,9 +277,76 @@
     const home = folder;
     if (!home || notedWorkspace) return;
     notedWorkspace = true;
-    const next = [home, ...readList<string>(RECENT_WS_KEY).filter((w) => w !== home)].slice(0, 5);
+    const next = [home, ...readList<string>(RECENT_WS_KEY).filter((w) => w !== home)].slice(0, RECENT_WS_MAX);
     recentWorkspaces = next;
     localStorage.setItem(RECENT_WS_KEY, JSON.stringify(next));
+  });
+
+  // Collapsed by default, and the choice is global rather than per-folder: the
+  // list is identical in every workspace, unlike the outline it sits above.
+  let recentOpen = $state(localStorage.getItem(RECENT_OPEN_KEY) === '1');
+  function toggleRecent() {
+    recentOpen = !recentOpen;
+    localStorage.setItem(RECENT_OPEN_KEY, recentOpen ? '1' : '0');
+  }
+
+  // Rows read as "name  parent", so sibling checkouts stay distinguishable.
+  function wsName(p: string) {
+    const parts = p.replace(/\/+$/, '').split('/');
+    return parts[parts.length - 1] || p;
+  }
+  function wsParent(p: string) {
+    const parts = p.replace(/\/+$/, '').split('/');
+    parts.pop();
+    return parts.join('/');
+  }
+
+  // Entries are never probed for existence: a folder that moved is still worth
+  // showing, because the name is the reminder. Removal is by hand.
+  let rwMenu = $state<{ x: number; y: number; path: string } | null>(null);
+  function writeRecentWorkspaces(next: string[]) {
+    recentWorkspaces = next;
+    localStorage.setItem(RECENT_WS_KEY, JSON.stringify(next));
+  }
+  function forgetWorkspace(p: string) {
+    rwMenu = null;
+    writeRecentWorkspaces(recentWorkspaces.filter((w) => w !== p));
+  }
+  function clearWorkspaces() {
+    rwMenu = null;
+    writeRecentWorkspaces([]);
+  }
+
+  // A renamed or moved file keeps its identity. Tabs are keyed by path, so
+  // every open reference has to follow it — otherwise the tab survives as a
+  // ghost pointing at a name that no longer resolves, and saving it recreates
+  // the file at the old location.
+  $effect(() => {
+    const on = (e: Event) => {
+      const moves = (e as CustomEvent<{ moves: { from: string; to: string }[] }>).detail?.moves ?? [];
+      if (!moves.length) return;
+      const remap = (p: string) => {
+        for (const m of moves) {
+          if (p === m.from) return m.to;
+          // A moved folder drags every path underneath it along.
+          if (p.startsWith(`${m.from}/`)) return m.to + p.slice(m.from.length);
+        }
+        return p;
+      };
+      for (const g of groups) {
+        for (const t of g.tabs) {
+          const next = remap(t.path);
+          if (next === t.path) continue;
+          t.path = next;
+          t.name = next.split('/').pop() ?? t.name;
+        }
+        if (g.activePath) g.activePath = remap(g.activePath);
+      }
+      recentFiles = recentFiles.map((r) => ({ ...r, path: remap(r.path) }));
+      localStorage.setItem(RECENT_FILES_KEY, JSON.stringify(recentFiles));
+    };
+    window.addEventListener('gmd:paths-moved', on);
+    return () => window.removeEventListener('gmd:paths-moved', on);
   });
 
   function flattenOutline(
@@ -492,7 +624,7 @@
   import TerminalPanel from './server/TerminalPanel.svelte';
   import SearchPanel from './server/SearchPanel.svelte';
   import PortsPanel from './server/PortsPanel.svelte';
-  import { fileIconUrl } from '../lib/file-icons';
+  import { fileIconUrl, folderIconUrl } from '../lib/file-icons';
   import { TAB_DND_MIME, PATH_DND_MIME } from '../lib/dnd';
 
   // ---- Layout shell: VS Code-style panels (explorer / secondary side bar / bottom panel) ----
@@ -1161,17 +1293,34 @@
 
   // ---- Tab drag & drop: drop on another group's strip/center to move the tab;
   // drop on the right 40% of a group's editor to split a new group to its right. ----
-  let dragSrc: { groupId: number; path: string } | null = null;
+  // Reactive because the drop caret in the tab strip renders off it.
+  let dragSrc = $state<{ groupId: number; path: string } | null>(null);
   let dropTarget = $state<{ groupId: number; zone: 'center' | 'right' } | null>(null);
+  // Slot the dragged tab would occupy in the hovered strip, or null when the
+  // pointer is over an editor body rather than a strip.
+  let dropIndex = $state<number | null>(null);
 
   function handleDragOver(e: DragEvent, groupId: number, tabstrip: boolean) {
     if (!dragSrc) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
     let zone: 'center' | 'right' = 'center';
-    if (!tabstrip) {
+    if (tabstrip) {
+      // First tab whose midpoint sits right of the pointer wins the slot;
+      // past every midpoint means the end of the strip. Measured here rather
+      // than per-tab so one listener covers the whole strip, including the
+      // empty space after the last tab.
+      const tabs = [...(e.currentTarget as HTMLElement).querySelectorAll('.tab')];
+      let idx = tabs.length;
+      for (let i = 0; i < tabs.length; i++) {
+        const r = tabs[i].getBoundingClientRect();
+        if (e.clientX < r.left + r.width / 2) { idx = i; break; }
+      }
+      if (dropIndex !== idx) dropIndex = idx;
+    } else {
       const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
       zone = e.clientX - r.left > r.width * 0.6 ? 'right' : 'center';
+      if (dropIndex !== null) dropIndex = null;
     }
     if (dropTarget?.groupId !== groupId || dropTarget?.zone !== zone) {
       dropTarget = { groupId, zone };
@@ -1181,8 +1330,10 @@
   function handleDrop(targetId: number) {
     const src = dragSrc;
     const zone = dropTarget?.zone ?? 'center';
+    const idx = dropIndex;
     dragSrc = null;
     dropTarget = null;
+    dropIndex = null;
     if (!src) return;
     const srcGroup = groups.find((g) => g.id === src.groupId);
     if (!srcGroup) return;
@@ -1211,12 +1362,26 @@
       if (srcGroup.tabs.length === 0) removeGroup(srcGroup.id);
       normalizeSizes();
     } else {
-      if (src.groupId === targetId) return;
       const targetGroup = groups.find((g) => g.id === targetId);
       if (!targetGroup) return;
+      if (src.groupId === targetId) {
+        // Reordering inside one strip. Dropping on the editor body (no slot)
+        // is a no-op rather than a move to nowhere.
+        if (idx === null) return;
+        // Pulling the tab out first shifts every later slot one to the left.
+        const to = idx > tabIdx ? idx - 1 : idx;
+        if (to === tabIdx) return;
+        srcGroup.tabs.splice(tabIdx, 1);
+        srcGroup.tabs.splice(to, 0, tab);
+        srcGroup.activePath = tab.path;
+        activeGroupId = targetId;
+        return;
+      }
       detach();
       tab.pinned = true;
-      targetGroup.tabs.push(tab);
+      // Landed on a strip: take that slot. Landed on the body: append.
+      const at = idx === null ? targetGroup.tabs.length : Math.min(idx, targetGroup.tabs.length);
+      targetGroup.tabs.splice(at, 0, tab);
       targetGroup.activePath = tab.path;
       activeGroupId = targetId;
       if (srcGroup.tabs.length === 0) removeGroup(srcGroup.id);
@@ -1312,6 +1477,7 @@
     };
     window.addEventListener('keydown', onKey, true);
     window.addEventListener('beforeunload', onBeforeUnload);
+    void loadVersion();
     return () => {
       window.removeEventListener('keydown', onKey, true);
       window.removeEventListener('beforeunload', onBeforeUnload);
@@ -1345,6 +1511,22 @@
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" stroke="currentColor" /><path d="M10 3v10" stroke="currentColor" />{#if layout.showRight}<rect x="11" y="3.75" width="2.25" height="8.5" fill="currentColor" />{/if}</svg>
       </button>
     </div>
+    <!-- Right end of the titlebar, after the toggles their margin-left:auto has
+         already pushed over. Click upgrades; the reason a disabled-looking
+         badge cannot be clicked lives in its tooltip. -->
+    <button
+      type="button"
+      class="version-badge"
+      class:busy={upgradeState === 'running'}
+      class:failed={upgradeState === 'failed'}
+      disabled={upgradeState === 'running' || !upgradable}
+      title={upgradeState === 'idle'
+        ? (upgradable ? `gh-md-editor ${serverVersion ?? ''} — click to upgrade and restart` : (upgradeReason ?? ''))
+        : upgradeNote}
+      onclick={() => void upgradeServer()}
+    >
+      {#if upgradeState === 'running'}upgrading…{:else}v{serverVersion ?? '…'}{#if upgradeState === 'failed'} !{/if}{/if}
+    </button>
   </header>
 
   <QuickOpen
@@ -1390,6 +1572,39 @@
       <!-- Both views stay mounted: remounting the explorer would collapse every
            expanded folder, remounting search would drop the result set. -->
       <div class="side-view stack" class:hidden={sideView !== 'explorer'}>
+        <!-- Above the tree because it is a jump-off point, not something to
+             browse. Collapsed until asked for. -->
+        <div class="stack-item recent" class:open={recentOpen}>
+          <div class="section-head">
+            <button type="button" class="sec-main" onclick={toggleRecent}>
+              <span class="sec-chev">{recentOpen ? '▾' : '▸'}</span>
+              <span class="sec-title">Recent Workspaces</span>
+            </button>
+          </div>
+          {#if recentOpen}
+            <div class="section-body">
+              {#if recentWorkspaces.length === 0}
+                <div class="recent-empty">Nothing opened yet.</div>
+              {:else}
+                {#each recentWorkspaces as w (w)}
+                  <button
+                    type="button"
+                    class="recent-row"
+                    class:current={w === folder}
+                    title={w}
+                    onclick={(e) => openWorkspaceIn(w, e.metaKey || e.ctrlKey ? 'tab' : 'same')}
+                    onauxclick={(e) => { if (e.button === 1) { e.preventDefault(); openWorkspaceIn(w, 'tab'); } }}
+                    oncontextmenu={(e) => { e.preventDefault(); rwMenu = { x: e.clientX, y: e.clientY, path: w }; }}
+                  >
+                    <img class="icon" alt="" aria-hidden="true" src={folderIconUrl(wsName(w), false)} />
+                    <span class="recent-name">{wsName(w)}</span>
+                    {#if wsParent(w)}<span class="recent-dir">{wsParent(w)}</span>{/if}
+                  </button>
+                {/each}
+              {/if}
+            </div>
+          {/if}
+        </div>
         <div class="stack-item grow">
           <FileTree {folder} {rootInfo} activePath={activeGroup.activePath ?? ''} onOpen={openFile} onOpenWorkspace={openWorkspace} onNewTerminal={newTerminalAt} />
         </div>
@@ -1441,6 +1656,21 @@
             </div>
           {/if}
         </div>
+        {#if rwMenu}
+          <!-- Full-viewport scrim, so the menu cannot outlive the gesture. -->
+          <div
+            class="rw-scrim"
+            role="presentation"
+            onclick={() => { rwMenu = null; }}
+            oncontextmenu={(e) => { e.preventDefault(); rwMenu = null; }}
+          ></div>
+          <div class="rw-menu" style="left: {rwMenu.x}px; top: {rwMenu.y}px" role="menu">
+            <button type="button" role="menuitem" onclick={() => { const p = rwMenu?.path ?? ''; rwMenu = null; openWorkspaceIn(p, 'tab'); }}>Open in New Tab</button>
+            <button type="button" role="menuitem" onclick={() => { const p = rwMenu?.path ?? ''; rwMenu = null; openWorkspaceIn(p, 'window'); }}>Open in New Window</button>
+            <button type="button" role="menuitem" onclick={() => forgetWorkspace(rwMenu?.path ?? '')}>Remove from list</button>
+            <button type="button" role="menuitem" onclick={clearWorkspaces}>Clear all</button>
+          </div>
+        {/if}
       </div>
       <div class="side-view" class:hidden={sideView !== 'search'}>
         <SearchPanel onOpen={(p, line) => openFile(p, { pinned: false, line })} />
@@ -1470,7 +1700,10 @@
               ondragover={(e) => handleDragOver(e, g.id, true)}
               ondrop={(e) => { e.preventDefault(); handleDrop(g.id); }}
             >
-              {#each g.tabs as tab (tab.path)}
+              {#each g.tabs as tab, i (tab.path)}
+                {#if dragSrc && dropTarget?.groupId === g.id && dropIndex === i}
+                  <span class="tab-caret"></span>
+                {/if}
                 <div
                   class="tab"
                   class:active={tab.path === g.activePath}
@@ -1481,7 +1714,7 @@
                   title={tab.path}
                   draggable="true"
                   ondragstart={(e) => { dragSrc = { groupId: g.id, path: tab.path }; e.dataTransfer?.setData(TAB_DND_MIME, tab.path); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'; }}
-                  ondragend={() => { dragSrc = null; dropTarget = null; }}
+                  ondragend={() => { dragSrc = null; dropTarget = null; dropIndex = null; }}
                   onclick={() => { g.activePath = tab.path; }}
                   ondblclick={() => { tab.pinned = true; }}
                   onauxclick={(e) => { if (e.button === 1) { e.preventDefault(); closeTab(g, tab.path); } }}
@@ -1499,7 +1732,15 @@
                   >×</button>
                 </div>
               {/each}
+              {#if dragSrc && dropTarget?.groupId === g.id && dropIndex === g.tabs.length}
+                <span class="tab-caret"></span>
+              {/if}
             </div>
+            {#if at && !at.error && !at.path.includes(':')}
+              <!-- Synthetic tabs (untitled:, diff, compare, merge) key on ':'
+                   and have no place on disk to walk into. -->
+              <Breadcrumbs path={at.path} {folder} onOpen={openFile} />
+            {/if}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
               class="content"
@@ -1833,6 +2074,21 @@
   }
   .layout-toggles button:hover { background: #444444; }
   .layout-toggles button.on { color: #c5c8c6; }
+  .version-badge {
+    flex: 0 0 auto;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+    color: #949494;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 1px 6px;
+    cursor: pointer;
+  }
+  .version-badge:hover:not(:disabled) { background: #3a3a3a; color: #c5c8c6; }
+  .version-badge:disabled { cursor: default; }
+  .version-badge.busy, .version-badge.failed { color: #e58520; }
+  .version-badge.failed { border-color: #e58520; }
   .cmd-center {
     display: flex;
     align-items: center;
@@ -1856,6 +2112,72 @@
   .side-view.stack { display: flex; flex-direction: column; min-height: 0; }
   .stack-item { display: flex; flex-direction: column; min-height: 0; }
   .stack-item.grow { flex: 1 1 auto; }
+  .stack-item.recent { flex: 0 0 auto; border-bottom: 1px solid #404040; }
+  /* Ten rows is short, but a narrow window is shorter — cap and scroll rather
+     than pushing the tree off the bottom. */
+  .stack-item.recent .section-body { max-height: 40vh; overflow: auto; }
+  .recent-empty { padding: 6px 10px; opacity: 0.6; font-size: 12px; }
+  .recent-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 3px 8px;
+    background: none;
+    border: 0;
+    color: inherit;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .recent-row:hover { background: rgba(127, 127, 127, 0.16); }
+  .recent-row.current { background: rgba(229, 133, 32, 0.16); }
+  .recent-row .icon { width: 16px; height: 16px; flex: 0 0 auto; }
+  .recent-name { flex: 0 0 auto; }
+  .recent-dir {
+    flex: 1;
+    min-width: 0;
+    opacity: 0.55;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .rw-scrim { position: fixed; inset: 0; z-index: 40; }
+  .rw-menu {
+    position: fixed;
+    z-index: 41;
+    min-width: 180px;
+    padding: 4px;
+    background: #232323;
+    border: 1px solid #505050;
+    border-radius: 6px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+    display: flex;
+    flex-direction: column;
+  }
+  .rw-menu button {
+    background: none;
+    border: 0;
+    color: inherit;
+    font: inherit;
+    font-size: 13px;
+    text-align: left;
+    padding: 5px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .rw-menu button:hover { background: #3a3a3a; }
+  /* Insertion caret for tab reordering. Takes real width so the tabs part
+     around it, which is the whole feedback — no ghost, no animation. */
+  .tab-caret {
+    flex: 0 0 auto;
+    width: 2px;
+    align-self: stretch;
+    background: #e58520;
+    pointer-events: none;
+  }
   .stack-item.outline { flex: 0 0 auto; border-top: 1px solid #404040; }
   /* Height comes from the inline flex-basis the resizer writes; shrinking is
      allowed so a short window cannot push the tree out entirely. */

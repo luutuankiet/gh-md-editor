@@ -23,7 +23,8 @@
 #
 # Flags
 #   --yes        skip the confirmation prompt (required when stdin is not a terminal)
-#   --publish    ext only: run vsce publish after packaging (needs VSCE_PAT or vsce login)
+#   --publish    ext only: run vsce publish after packaging (needs VSCE_PAT, a
+#                signed-in Azure CLI, or vsce login)
 #
 set -euo pipefail
 
@@ -184,17 +185,24 @@ release_ext() {
 }
 
 # ---------------------------------------------------------------- publish --
-# Publishing needs an Azure DevOps token with Marketplace:Manage scope, either
-# in VSCE_PAT or stored by `vsce login luutuankiet`. Tokens expire, and vsce
-# reports that as an opaque TF400813 authorization error - hence the hint below.
+# Publishing needs an Azure DevOps identity with Marketplace:Manage scope. Three
+# ways to have one, in the order this tries them: a token in VSCE_PAT, a signed-in
+# Azure CLI (vsce borrows it, so there is no secret to rotate), or a token stored
+# by `vsce login luutuankiet`. Tokens expire, and vsce reports that as an opaque
+# TF400813 authorization error - hence the hint below.
 publish_ext() {
-  local ver vsix
+  local ver vsix azflag=""
   ver="$(read_version vscode/package.json)"
   vsix="vscode/gh-md-editor-$ver.vsix"
   [ -f "$vsix" ] || die "$vsix not found. Run './scripts/ship.sh build ext' first."
 
+  if [ -z "${VSCE_PAT:-}" ] && command -v az >/dev/null 2>&1 && az account show >/dev/null 2>&1; then
+    azflag="--azure-credentials"
+    info "no VSCE_PAT, but the Azure CLI is signed in - publishing as that identity"
+  fi
+
   bold "Publishing $vsix to the Marketplace"
-  if ! ( cd vscode && npx --yes @vscode/vsce publish --no-dependencies --packagePath "gh-md-editor-$ver.vsix" ); then
+  if ! ( cd vscode && npx --yes @vscode/vsce publish --no-dependencies $azflag --packagePath "gh-md-editor-$ver.vsix" ); then
     warn "publish failed. If the error mentions TF400813 or token verification,"
     info "the Azure DevOps token has expired. Issue a new one with the"
     info "Marketplace:Manage scope at https://dev.azure.com/ (User settings ->"

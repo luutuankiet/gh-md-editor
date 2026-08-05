@@ -11,12 +11,72 @@
   // launch directory — same anchor the explorer and git panel read.
   const folder = new URLSearchParams(location.search).get('folder') ?? '';
 
-  type Term = { id: string; title: string; pid: number };
+  type Term = { id: string; title: string; pid: number; cwd?: string };
 
   let terms = $state<Term[]>([]);
   let activeId = $state<string | null>(null);
   let error = $state<string | null>(null);
   let booted = $state(false);
+
+  const leafOf = (p: string) => {
+    const t = p.replace(/\/+$/, '');
+    const i = t.lastIndexOf('/');
+    return i === -1 ? t : t.slice(i + 1);
+  };
+
+  // Grouped by the directory each shell was spawned in. With several windows
+  // open on different workspaces, a flat list is exactly how a command lands
+  // in the wrong repo — so any group that is not this window's anchor starts
+  // folded, and the anchored one starts open.
+  const groups = $derived.by(() => {
+    const by = new Map<string, Term[]>();
+    for (const t of terms) {
+      const k = t.cwd ?? '';
+      const g = by.get(k);
+      if (g) g.push(t);
+      else by.set(k, [t]);
+    }
+    return [...by].map(([cwd, items]) => ({ cwd, items, mine: cwd === folder }));
+  });
+  let folded = $state<Record<string, boolean>>({});
+  const isFolded = (cwd: string, mine: boolean) => folded[cwd] ?? !mine;
+
+  const RAIL_KEY = 'ghmd.termRail';
+  const storedRail = typeof localStorage !== 'undefined' ? localStorage.getItem(RAIL_KEY) : null;
+  let railW = $state(storedRail !== null && Number.isFinite(+storedRail) ? Math.min(420, Math.max(0, +storedRail)) : 168);
+  let railPrev = 168;
+  function persistRail() {
+    try { localStorage.setItem(RAIL_KEY, String(railW)); } catch { /* private mode */ }
+  }
+  function toggleRail() {
+    if (railW > 0) { railPrev = railW; railW = 0; } else railW = railPrev || 168;
+    persistRail();
+  }
+  // Pointer capture rather than window listeners: the cursor leaves the 4px
+  // handle on the very first move, and without capture the drag would end
+  // there. Width is measured from the container's right edge so the handle
+  // stays under the pointer regardless of where the panel sits.
+  function startDrag(e: PointerEvent) {
+    const bar = e.currentTarget as HTMLElement;
+    bar.setPointerCapture(e.pointerId);
+    const move = (ev: PointerEvent) => {
+      const box = bar.parentElement?.getBoundingClientRect();
+      if (!box) return;
+      const raw = Math.min(420, Math.max(0, box.right - ev.clientX));
+      // Magnets, because a free-running rail settles on widths nobody wants:
+      // anything narrower than a readable name collapses, and the default
+      // width re-attracts so a nudged rail can be restored by feel.
+      railW = raw < 48 ? 0 : Math.abs(raw - 168) < 24 ? 168 : Math.round(raw);
+    };
+    const up = (ev: PointerEvent) => {
+      bar.releasePointerCapture(ev.pointerId);
+      bar.removeEventListener('pointermove', move);
+      bar.removeEventListener('pointerup', up);
+      persistRail();
+    };
+    bar.addEventListener('pointermove', move);
+    bar.addEventListener('pointerup', up);
+  }
 
   async function api(path: string, init?: RequestInit) {
     const res = await fetch(path, init);
@@ -109,7 +169,10 @@
   <div class="tbody">
     <div class="tviews">
       {#each terms as t (t.id)}
-        <TerminalView id={t.id} visible={visible && t.id === activeId} onexit={() => drop(t.id)} />
+        <!-- A clean exit closes the tab, the way a terminal emulator does.
+             Anything else — a nonzero status, a signal, a dropped socket —
+             keeps it, so the failure and the output around it stay readable. -->
+        <TerminalView id={t.id} visible={visible && t.id === activeId} onexit={(code, signal) => { if (code === 0 && !signal) drop(t.id); }} />
       {/each}
       {#if terms.length === 0 && booted}
         <div class="tempty">
@@ -120,26 +183,53 @@
     </div>
 
     {#if terms.length > 1}
-      <ul class="tlist">
-        {#each terms as t, i (t.id)}
-          <li>
+      <div
+        class="trail-grip"
+        role="separator"
+        aria-label="Resize terminal list — double-click to collapse"
+        aria-orientation="vertical"
+        tabindex="-1"
+        onpointerdown={startDrag}
+        ondblclick={toggleRail}
+      ></div>
+      <ul class="tlist" class:collapsed={railW === 0} style="width: {railW}px">
+        {#each groups as g (g.cwd)}
+          <li class="tgroup">
             <button
               type="button"
-              class="tlist-row"
-              class:active={t.id === activeId}
-              onclick={() => { activeId = t.id; }}
+              class="tgroup-head"
+              title={g.cwd || 'server root'}
+              onclick={() => (folded[g.cwd] = !isFolded(g.cwd, g.mine))}
             >
-              <svg class="tlist-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2.5h12v11H2zm2.2 2.6 2.2 2.4-2.2 2.4.9.8 3-3.2-3-3.2zM8.4 10.2h4v1.2h-4z" /></svg>
-              <span class="tlist-name">{i + 1}: {t.title}</span>
-              <span
-                class="tlist-kill"
-                title="Kill terminal"
-                role="button"
-                tabindex="-1"
-                onclick={(e) => { e.stopPropagation(); kill(t.id); }}
-                onkeydown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); kill(t.id); } }}
-              >×</span>
+              <span class="tgroup-chev" class:open={!isFolded(g.cwd, g.mine)}>▸</span>
+              <span class="tgroup-name">{leafOf(g.cwd) || 'root'}</span>
+              <span class="tgroup-count">{g.items.length}</span>
             </button>
+            {#if !isFolded(g.cwd, g.mine)}
+              <ul class="tgroup-body">
+                {#each g.items as t (t.id)}
+                  <li>
+                    <button
+                      type="button"
+                      class="tlist-row"
+                      class:active={t.id === activeId}
+                      onclick={() => { activeId = t.id; }}
+                    >
+                      <svg class="tlist-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2.5h12v11H2zm2.2 2.6 2.2 2.4-2.2 2.4.9.8 3-3.2-3-3.2zM8.4 10.2h4v1.2h-4z" /></svg>
+                      <span class="tlist-name">{terms.indexOf(t) + 1}: {t.title}</span>
+                      <span
+                        class="tlist-kill"
+                        title="Kill terminal"
+                        role="button"
+                        tabindex="-1"
+                        onclick={(e) => { e.stopPropagation(); kill(t.id); }}
+                        onkeydown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); kill(t.id); } }}
+                      >×</span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -235,6 +325,59 @@
   .tempty button:hover {
     border-color: #e58520;
   }
+  /* 4px of grab area with no visual weight until hovered. touch-action has to
+     be none or a touch drag scrolls the panel instead of resizing it. */
+  .trail-grip {
+    flex: 0 0 auto;
+    width: 4px;
+    background: transparent;
+    cursor: col-resize;
+    touch-action: none;
+  }
+  .trail-grip:hover { background: #e58520; }
+  .tgroup { list-style: none; }
+  .tgroup-head {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    padding: 2px 6px;
+    border: none;
+    background: transparent;
+    color: #8a8a8a;
+    font-size: 11px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .tgroup-head:hover { background: #272727; }
+  .tgroup-chev {
+    flex: 0 0 auto;
+    width: 10px;
+    display: inline-block;
+    transition: transform 0.1s linear;
+  }
+  .tgroup-chev.open { transform: rotate(90deg); }
+  .tgroup-name {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tgroup-count {
+    flex: 0 0 auto;
+    padding: 0 5px;
+    border-radius: 8px;
+    background: #353535;
+    color: #949494;
+    font-size: 10px;
+    line-height: 14px;
+  }
+  .tgroup-body {
+    margin: 0;
+    padding: 0 0 2px;
+    list-style: none;
+  }
+  .tlist.collapsed { border-left: none; }
   .tlist {
     flex: 0 0 auto;
     width: 168px;

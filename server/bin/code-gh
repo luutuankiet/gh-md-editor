@@ -67,7 +67,7 @@ if [ -n "${GMD_TOKEN:-}" ]; then
   set -- "$@" -H "x-auth-token: $GMD_TOKEN"
 fi
 
-if ! out=$(curl "$@" "http://127.0.0.1:$GMD_PORT/api/open" 2>&1); then
+if ! out=$(curl "$@" "http://${GMD_HOST:-127.0.0.1}:$GMD_PORT/api/open" 2>&1); then
   echo "code-gh: $out" >&2
   exit 1
 fi

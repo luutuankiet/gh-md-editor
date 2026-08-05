@@ -1,6 +1,6 @@
 import { ensureSyntaxTree, syntaxTree } from '@codemirror/language';
 import type { EditorState } from '@codemirror/state';
-import type { Tree } from '@lezer/common';
+import type { SyntaxNode, Tree } from '@lezer/common';
 
 // Same shape as the markdown outline (src/lib/markdown.ts) so one renderer
 // serves both: headings for .md tabs, declarations for code tabs.
@@ -26,6 +26,12 @@ export interface OutlineNode {
   from: number;
   to: number;
   kind?: SymbolKind;
+  // Just the declared identifier — no keywords, modifiers or parameter list.
+  // `text` keeps the full labelled line because the outline panel reads better
+  // with the signature visible; a breadcrumb or a symbol search wants the bare
+  // name, and re-deriving it from `text` by regex would be guesswork the
+  // grammar already answered.
+  name?: string;
   children: OutlineNode[];
 }
 
@@ -131,24 +137,77 @@ function labelFor(state: EditorState, from: number, to: number): string {
   return trim(raw) || trim(line.text);
 }
 
+// Which child of a declaration holds its identifier. The grammars disagree on
+// the spelling — VariableDefinition (JS/TS), VariableName (Python),
+// BoundIdentifier (Rust), FieldIdentifier/TypeIdentifier (C family),
+// DefinitionName (Go) — but all of them end in one of three suffixes. Matching
+// the suffix covers grammars nobody has tested here yet; enumerating each
+// grammar's vocabulary would silently return nothing for the next one added.
+const NAME_NODE = /(?:Definition|Identifier|Name)$/;
+// The suffix rule is deliberately loose, so verify what it caught actually
+// looks like an identifier: a `PropertyName` can be a quoted string, a
+// computed key, or a whole destructuring pattern.
+const NAME_OK = /^[A-Za-z_$@#][\w$@#.-]{0,63}$/;
+const NAME_FANOUT = 8;
+
+// First identifier-ish child of a declaration, searched two levels deep:
+// direct children cover most grammars, the extra level covers wrappers like
+// Python's DecoratedStatement and Go's TypeDeclaration -> TypeSpec.
+function nameFor(state: EditorState, node: SyntaxNode, depth = 2): string | undefined {
+  let child = node.firstChild;
+  for (let i = 0; child && i < NAME_FANOUT; i++, child = child.nextSibling) {
+    if (!NAME_NODE.test(child.name)) continue;
+    const raw = state.doc.sliceString(child.from, Math.min(child.to, child.from + 80));
+    if (NAME_OK.test(raw)) return raw;
+  }
+  if (depth <= 1) return undefined;
+  child = node.firstChild;
+  for (let i = 0; child && i < NAME_FANOUT; i++, child = child.nextSibling) {
+    const nested = nameFor(state, child, depth - 1);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+// FALLBACK's shapes again, this time capturing the identifier after the
+// keyword: `export async function load(x)` -> `load`, `const rows = []` ->
+// `rows`. Same source of truth problem as always — kept adjacent to FALLBACK
+// so the two stay in step.
+const FALLBACK_NAME =
+  /^(?:export\s+)?(?:default\s+)?(?:(?:public|private|protected|static)\s+)*(?:async\s+)?(?:function|class|interface|type|enum|struct|impl|trait|module|namespace|def|fn|func|const|let|var|sub|proc)\s*\*?\s+([A-Za-z_$][\w$]*)/;
+
 // Indentation-nested scan, used when there is no parse tree to walk.
 function fallbackOutline(state: EditorState): OutlineNode[] {
   const roots: OutlineNode[] = [];
   const stack: { indent: number; node: OutlineNode }[] = [];
   const total = Math.min(state.doc.lines, MAX_FALLBACK_LINES);
   let count = 0;
-  for (let i = 1; i <= total && count < MAX_NODES; i++) {
+  // End of the last line that carried content. Blocks close here rather than at
+  // the dedented line that revealed the close, so a declaration does not absorb
+  // the blank run that follows it.
+  let lastEnd = 0;
+  for (let i = 1; i <= total; i++) {
     const line = state.doc.line(i);
     const body = line.text.trimStart();
+    // Blank lines carry no indentation signal. Reading one as column zero would
+    // close every open declaration at the first empty line inside a function.
+    if (!body) continue;
+    const indent = line.text.length - body.length;
+    // No parse tree here, so a declaration's block is the run of deeper-indented
+    // lines that follows it, and this line stepping back out is what ends it.
+    // Spans matter beyond double-click-to-select: the breadcrumb asks which
+    // declaration encloses a position, which a header-only span never answers.
+    while (stack.length && indent <= stack[stack.length - 1].indent) {
+      stack.pop()!.node.to = lastEnd;
+    }
+    lastEnd = line.to;
+    if (count >= MAX_NODES) continue;
     if (!FALLBACK.test(body)) continue;
     const text = trim(body);
     if (!text) continue;
     const keyword = body.match(/[a-z]+/)?.[0] ?? '';
     const kind = refine(KIND_BY_KEYWORD[keyword], body);
-    const indent = line.text.length - body.length;
-    while (stack.length && indent <= stack[stack.length - 1].indent) stack.pop();
-    // No parse tree here, so the block is the run of deeper-indented lines
-    // that follows — resolved once the scan reaches a shallower line below.
+    const name = body.match(FALLBACK_NAME)?.[1];
     const node: OutlineNode = {
       level: stack.length + 1,
       text,
@@ -156,14 +215,15 @@ function fallbackOutline(state: EditorState): OutlineNode[] {
       from: line.from,
       to: line.to,
       kind,
+      name,
       children: [],
     };
     (stack.length ? stack[stack.length - 1].node.children : roots).push(node);
-    // Every open ancestor now extends at least to the end of this line.
-    for (const s of stack) s.node.to = line.to;
     stack.push({ indent, node });
     count += 1;
   }
+  // Whatever is still open runs to the end of the scanned region.
+  while (stack.length) stack.pop()!.node.to = lastEnd;
   return roots;
 }
 
@@ -203,6 +263,7 @@ function jsonOutline(state: EditorState, tree: Tree): OutlineNode[] {
         from: n.from,
         to: n.to,
         kind,
+        name,
         children: [],
       };
       (stack.length ? stack[stack.length - 1].node.children : roots).push(node);
@@ -242,6 +303,7 @@ export function outlineFromState(state: EditorState): OutlineNode[] {
         from: n.from,
         to: n.to,
         kind,
+        name: nameFor(state, n.node),
         children: [],
       };
       (stack.length ? stack[stack.length - 1].node.children : roots).push(node);

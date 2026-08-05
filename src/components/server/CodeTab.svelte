@@ -15,16 +15,22 @@
     foldGutter,
     foldKeymap,
     foldService,
+    syntaxTree,
   } from '@codemirror/language';
+  import { highlightTree } from '@lezer/highlight';
   import { indentFoldService } from '../../lib/fold-indent';
   import { TAB_DND_MIME, PATH_DND_MIME } from '../../lib/dnd';
   import { search, searchKeymap, getSearchQuery, searchPanelOpen } from '@codemirror/search';
   import { selectAllOccurrences } from '../../lib/select-occurrences';
   import { indentationMarkers } from '@replit/codemirror-indentation-markers';
+  import { indentRainbow } from '../../lib/indent-rainbow';
+  import { dotenvCloak, setCloak, cloakState } from '../../lib/dotenv-cloak';
+  import { isDotenvFile } from '../../lib/lang-dotenv';
   import { wordHighlight, wordMatchRanges } from '../../lib/word-highlight';
-  import { monokaiCodeBundle } from '../../lib/monokai-dimmed';
+  import { monokaiCodeBundle, monokaiCodeHighlight } from '../../lib/monokai-dimmed';
 
   import { outlineFromState } from '../../lib/code-outline';
+  import type { OutlineNode } from '../../lib/code-outline';
   import { LANGS, describeFor } from '../../lib/lang-detect';
   import { expandSelection, shrinkSelection, resetSelectionHistory } from '../../lib/expand-selection';
   import { formatDocumentText } from '../../lib/format-doc';
@@ -431,10 +437,210 @@
   function pushOutline(vw: EditorView) {
     clearTimeout(outlineTimer);
     outlineTimer = setTimeout(() => {
+      const nodes = outlineFromState(vw.state);
+      outlineNodes = nodes;
+      hasOutline = nodes.length > 0;
       window.dispatchEvent(new CustomEvent('gmd:outline', {
-        detail: { name: filename, nodes: outlineFromState(vw.state) },
+        detail: { name: filename, nodes },
       }));
+      syncCrumbs(vw);
     }, 200);
+  }
+
+  // --- symbol breadcrumb -----------------------------------------------------
+  // The strip above the editor naming the declaration the caret sits inside.
+  // It reads the same outline the sidebar does, and that outline comes from the
+  // editor's active grammar rather than from the filename — which is what makes
+  // it work on an unsaved buffer whose language was picked by hand from the
+  // corner dropdown, where there is no extension to detect.
+  let outlineNodes: OutlineNode[] = [];
+  let hasOutline = $state(false);
+  let crumbs = $state<OutlineNode[]>([]);
+  let crumbFrame = 0;
+
+  function chainAt(nodes: OutlineNode[], pos: number): OutlineNode[] {
+    for (const n of nodes) {
+      if (pos < n.from || pos > n.to) continue;
+      return [n, ...chainAt(n.children, pos)];
+    }
+    return [];
+  }
+
+  // What the strip reports on: the caret while it is on screen, the top visible
+  // line once the reader has scrolled away from it. Following the caret alone
+  // leaves the strip naming a symbol nowhere near what is being read.
+  function anchorPos(vw: EditorView): number {
+    const box = vw.scrollDOM.getBoundingClientRect();
+    const head = vw.state.selection.main.head;
+    const onScreen = head >= vw.viewport.from && head <= vw.viewport.to;
+    const coords = onScreen ? vw.coordsAtPos(head) : null;
+    if (coords && coords.top >= box.top && coords.bottom <= box.bottom) return head;
+    return vw.posAtCoords({ x: box.left + 4, y: box.top + 2 }) ?? vw.viewport.from;
+  }
+
+  // Coalesced to one frame: this runs on every cursor move and scroll tick, and
+  // stays cheap only because it walks the already-debounced outline rather than
+  // re-parsing. A stale walk for one debounce interval is invisible; a parse per
+  // scroll frame would not be.
+  function syncCrumbs(vw: EditorView) {
+    cancelAnimationFrame(crumbFrame);
+    crumbFrame = requestAnimationFrame(() => {
+      syncSticky(vw);
+      const next = outlineNodes.length ? chainAt(outlineNodes, anchorPos(vw)) : [];
+      // An unchanged path returns the same node objects, so an identity check
+      // keeps a long scroll from re-rendering the strip on every frame.
+      if (next.length === crumbs.length && next.every((n, i) => n === crumbs[i])) return;
+      crumbs = next;
+    });
+  }
+
+  // Scrolling inside an already-rendered viewport produces no view update, so
+  // the pinned rows would only refresh when CodeMirror happened to re-render.
+  $effect(() => {
+    const v = view;
+    if (!v) return;
+    const onScroll = () => syncSticky(v);
+    v.scrollDOM.addEventListener('scroll', onScroll, { passive: true });
+    return () => v.scrollDOM.removeEventListener('scroll', onScroll);
+  });
+
+  // --- go to definition ------------------------------------------------------
+  // Ctrl/Cmd+click, the VS Code chord. Alt+click stays multi-cursor, which is
+  // the split the markdown editor already documents.
+  function localDef(
+    nodes: OutlineNode[],
+    word: string,
+    state: EditorState,
+    clicked: number,
+  ): OutlineNode | null {
+    for (const n of nodes) {
+      const header = state.doc.lineAt(n.from);
+      // Clicking the declaration itself should not jump to the declaration.
+      const onItself = clicked >= header.from && clicked <= header.to;
+      if (n.name === word && !onItself) return n;
+      const nested = localDef(n.children, word, state, clicked);
+      if (nested) return nested;
+    }
+    return null;
+  }
+
+  // Same-file definitions resolve from the outline already in hand: no round
+  // trip, and it is by far the common case. Only a miss reaches the server.
+  async function goToDefinition(vw: EditorView, pos: number) {
+    const w = vw.state.wordAt(pos);
+    if (!w) return;
+    const word = vw.state.sliceDoc(w.from, w.to);
+    if (!/^[A-Za-z_$][\w$]*$/.test(word)) return;
+    const here = localDef(outlineNodes, word, vw.state, pos);
+    if (here) {
+      vw.dispatch({ selection: EditorSelection.cursor(here.from), scrollIntoView: true });
+      vw.focus();
+      return;
+    }
+    try {
+      const r = await fetch(`/api/defs?name=${encodeURIComponent(word)}`);
+      const j = (await r.json()) as { hits?: { path: string; line: number }[]; error?: string };
+      const hits = j.hits ?? [];
+      if (!hits.length) {
+        showNotice(j.error ? `Definition lookup: ${j.error}` : `No definition found for “${word}”`);
+        return;
+      }
+      window.dispatchEvent(new CustomEvent('gmd:open-request', {
+        detail: { kind: 'file', path: hits[0].path, line: hits[0].line },
+      }));
+      // Opening the first and saying so beats a picker for the common case of
+      // one real definition plus a re-export.
+      if (hits.length > 1) showNotice(`${hits.length} candidates for “${word}” — opened the first`);
+    } catch {
+      showNotice('Definition lookup failed');
+    }
+  }
+
+  // --- sticky scroll ---------------------------------------------------------
+  // The enclosing declarations, pinned over the top of the viewport once their
+  // own lines have scrolled past. Deliberately translucent: these rows cover
+  // real code, and being able to read what is underneath is what keeps them
+  // from feeling like the editor has lost two lines.
+  const STICKY_ROW_H = 20;
+  const STICKY_MAX = 5;
+  let stickyRows = $state<{ line: number; html: string }[]>([]);
+  let stickyKey = '';
+  let stickyFont = $state('');
+  let stickyPad = $state(8);
+
+  const escHtml = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // Re-run the editor's own highlighter over one line so a pinned row looks
+  // like the code it stands for. The class names come from the same
+  // HighlightStyle the view is using, and CodeMirror registers those rules
+  // document-wide, so they apply outside .cm-editor too.
+  function stickyHtml(state: EditorState, from: number, to: number): string {
+    const tree = syntaxTree(state);
+    const style = isDark ? monokaiCodeHighlight : defaultHighlightStyle;
+    let out = '';
+    let pos = from;
+    try {
+      highlightTree(tree, style, (f, t, classes) => {
+        if (f > pos) out += escHtml(state.doc.sliceString(pos, f));
+        out += `<span class="${classes}">${escHtml(state.doc.sliceString(f, t))}</span>`;
+        pos = t;
+      }, from, to);
+    } catch {
+      return escHtml(state.doc.sliceString(from, to));
+    }
+    if (pos < to) out += escHtml(state.doc.sliceString(pos, to));
+    return out;
+  }
+
+  function syncSticky(vw: EditorView) {
+    if (!outlineNodes.length) {
+      if (stickyRows.length) { stickyRows = []; stickyKey = ''; }
+      return;
+    }
+    const box = vw.scrollDOM.getBoundingClientRect();
+    // Probe below the rows already pinned, not at the very top: probing the
+    // covered line makes a row hide itself and reappear on the next frame.
+    const probeY = box.top + stickyRows.length * STICKY_ROW_H + 2;
+    const topPos = vw.posAtCoords({ x: box.left + 4, y: probeY }) ?? vw.viewport.from;
+    const topLine = vw.state.doc.lineAt(topPos);
+    const rows: { line: number; html: string }[] = [];
+    for (const n of chainAt(outlineNodes, topPos)) {
+      const dl = vw.state.doc.line(Math.min(Math.max(1, n.line), vw.state.doc.lines));
+      // Its own line is still on screen — pinning a copy of a visible line is
+      // just covering the line below it for nothing.
+      if (dl.from >= topLine.from) break;
+      rows.push({ line: dl.number, html: stickyHtml(vw.state, dl.from, dl.to) });
+      if (rows.length >= STICKY_MAX) break;
+    }
+    const key = rows.map((r) => r.line).join(',');
+    if (key === stickyKey) return;
+    stickyKey = key;
+    stickyRows = rows;
+    if (rows.length) {
+      // Match the editor's metrics exactly, read from the live view rather than
+      // duplicated in CSS: the theme owns the font and the gutter owns its own
+      // width, and a pinned row that does not line up reads as a rendering bug.
+      const cs = getComputedStyle(vw.contentDOM);
+      stickyFont = `font-family:${cs.fontFamily};font-size:${cs.fontSize}`;
+      const gutters = vw.dom.querySelector('.cm-gutters') as HTMLElement | null;
+      stickyPad = (gutters?.offsetWidth ?? 0) + 4;
+    }
+  }
+
+  function gotoLine(line: number) {
+    const vw = view;
+    if (!vw) return;
+    const pos = vw.state.doc.line(Math.min(Math.max(1, line), vw.state.doc.lines)).from;
+    vw.dispatch({ selection: EditorSelection.cursor(pos), effects: EditorView.scrollIntoView(pos, { y: 'start' }) });
+    vw.focus();
+  }
+
+  function gotoCrumb(n: OutlineNode) {
+    const vw = view;
+    if (!vw) return;
+    vw.dispatch({ selection: EditorSelection.cursor(n.from), scrollIntoView: true });
+    vw.focus();
   }
 
   // The shell asks for a fresh push whenever the active tab changes.
@@ -445,6 +651,19 @@
     };
     window.addEventListener('gmd:outline-request', on);
     return () => window.removeEventListener('gmd:outline-request', on);
+  });
+
+  // Palette toggle for the value cloak. Lives on a window event because a code
+  // tab has no toolbar of its own to hang a button from.
+  $effect(() => {
+    const on = () => {
+      const vw = view;
+      if (!vw) return;
+      const current = vw.state.field(cloakState, false)?.on ?? false;
+      vw.dispatch({ effects: setCloak.of(!current) });
+    };
+    window.addEventListener('gmd:toggle-cloak', on);
+    return () => window.removeEventListener('gmd:toggle-cloak', on);
   });
 
   // Format Document. A refusal (wrong language, unparseable buffer) is
@@ -688,6 +907,11 @@
           hideFirstIndent: false,
           colors: { light: '#d0d7de', dark: '#3c3c3c', activeLight: '#606060', activeDark: '#949494' },
         }),
+        // Beside the guides, not instead of them: the guides say which block a
+        // line belongs to, the tint says how deep it is.
+        indentRainbow,
+        // Inert until the filename effect below arms it for a .env file.
+        dotenvCloak,
         search({ top: true }),
         wordHighlight,
         // Empty until the file turns out to be tracked, and it carries the
@@ -721,6 +945,17 @@
         // drop/dragover: tab drags carry a custom MIME, but preventDefault here
         // guarantees CodeMirror never treats a tab drag as text insertion.
         EditorView.domEventHandlers({
+          mousedown: (event, vw) => {
+            if (event.button !== 0 || event.altKey || event.shiftKey) return false;
+            if (!event.metaKey && !event.ctrlKey) return false;
+            const pos = vw.posAtCoords({ x: event.clientX, y: event.clientY });
+            if (pos == null) return false;
+            // CodeMirror's own Mod+click adds a second cursor. Claim the event
+            // before that runs, or the jump lands with a stray caret behind it.
+            event.preventDefault();
+            void goToDefinition(vw, pos);
+            return true;
+          },
           keydown: (event, vw) => {
             if (event.altKey && !event.metaKey && !event.ctrlKey && event.code === 'KeyZ') {
               event.preventDefault();
@@ -800,6 +1035,7 @@
             u.transactions.some((tr) => tr.effects.length > 0)
           ) {
             recomputeTicks(u.view);
+            syncCrumbs(u.view);
           }
         }),
         EditorView.theme({
@@ -963,6 +1199,12 @@
     });
     pushOutline(created);
 
+    // Opening a file should leave the caret in the editor. Without this the
+    // document keeps body focus, so the first Mod-F after a click reaches the
+    // browser's own find bar instead of the editor's. Deferred a frame so the
+    // view is laid out before it takes focus.
+    const focusFrame = requestAnimationFrame(() => created.focus());
+
     // Ticks on container resize (splitter drag) + initial pass. `created` is
     // a local and the tick fns only write state — no tracked reads added.
     const ro = new ResizeObserver(() => recomputeTicks(created));
@@ -970,6 +1212,8 @@
     recomputeTicks(created);
 
     return () => {
+      cancelAnimationFrame(focusFrame);
+      cancelAnimationFrame(crumbFrame);
       ro.disconnect();
       created.destroy();
       untrack(() => {
@@ -987,6 +1231,10 @@
     if (!untrack(() => view)) return;
     const detected = describeFor(name);
     untrack(() => {
+      // Env files open covered. Anything else opens clear — including a preview
+      // tab reused for a different file, which is why this is unconditional
+      // rather than only armed on a match.
+      view?.dispatch({ effects: setCloak.of(isDotenvFile(name)) });
       selectedLanguage = detected ? detected.name : PLAIN;
       void applyLanguage(selectedLanguage).then(() => {
         const vw = view;
@@ -1133,30 +1381,61 @@
 </script>
 
 <div class="code-container">
-  <div class="code-host" bind:this={host}></div>
-  <div class="editor-tick-rail" aria-hidden="true">
-    {#each wordTicks as y, i (i + ':cword')}
-      <span class="tick word" style="top: {y}px"></span>
-    {/each}
-    {#each matchTicks as y, i (i + ':cmatch')}
-      <span class="tick match" style="top: {y}px"></span>
-    {/each}
-    {#if currentTickY !== null}
-      <span class="tick current" style="top: {currentTickY}px"></span>
-    {/if}
+  <!-- Height is reserved for the whole file rather than per-position: showing
+       the strip only where a symbol encloses the caret makes the editor jump a
+       row on every scroll past a top-level gap. -->
+  {#if hasOutline}
+    <div class="symbol-crumbs" aria-label="Symbol path">
+      {#each crumbs as c, i (c.from + ':' + i)}
+        {#if i > 0}<span class="crumb-sep" aria-hidden="true">›</span>{/if}
+        <button type="button" class="crumb" title={c.text} onclick={() => gotoCrumb(c)}>
+          {c.name ?? c.text}
+        </button>
+      {/each}
+    </div>
+  {/if}
+  <div class="code-body">
+    <div class="code-host" bind:this={host}></div>
+    <div class="sticky-stack" style={stickyFont}>
+      {#each stickyRows as r (r.line)}
+        <button
+          type="button"
+          class="sticky-row"
+          title="Line {r.line}"
+          onclick={() => gotoLine(r.line)}
+        ><span class="sticky-ln" style="width: {stickyPad}px">{r.line}</span>{@html r.html}</button>
+      {/each}
+    </div>
+    <div class="editor-tick-rail" aria-hidden="true">
+      {#each wordTicks as y, i (i + ':cword')}
+        <span class="tick word" style="top: {y}px"></span>
+      {/each}
+      {#each matchTicks as y, i (i + ':cmatch')}
+        <span class="tick match" style="top: {y}px"></span>
+      {/each}
+      {#if currentTickY !== null}
+        <span class="tick current" style="top: {currentTickY}px"></span>
+      {/if}
+    </div>
+    <select
+      class="lang-picker"
+      class:hidden={searchOpen}
+      bind:value={selectedLanguage}
+      onchange={() => void applyLanguage(selectedLanguage).then(() => {
+        // A hand-picked grammar has to re-feed the outline itself. Nothing else
+        // fires on this path, and on an unsaved buffer the filename effect — the
+        // only other feeder — never will, so the strip would stay empty.
+        const vw = view;
+        if (vw) pushOutline(vw);
+      })}
+      title="Syntax language"
+      aria-label="Syntax language"
+    >
+      {#each languageNames as name (name)}
+        <option value={name}>{name}</option>
+      {/each}
+    </select>
   </div>
-  <select
-    class="lang-picker"
-    class:hidden={searchOpen}
-    bind:value={selectedLanguage}
-    onchange={() => void applyLanguage(selectedLanguage)}
-    title="Syntax language"
-    aria-label="Syntax language"
-  >
-    {#each languageNames as name (name)}
-      <option value={name}>{name}</option>
-    {/each}
-  </select>
 </div>
 {#if notice}
   <div class="notice">{notice}</div>
@@ -1168,6 +1447,102 @@
     height: 100%;
     width: 100%;
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  /* The tick rail and the language picker are positioned against this box, not
+     against the container, so the breadcrumb strip above cannot skew them. */
+  .code-body {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+  }
+  /* Not `.crumbs`: the tab header already owns that name for the file path, and
+     two breadcrumbs on one screen are confusing enough without sharing one. */
+  .symbol-crumbs {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    height: 22px;
+    padding: 0 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: nowrap;
+    background: #232323;
+    border-bottom: 1px solid #404040;
+    scrollbar-width: none;
+  }
+  .symbol-crumbs::-webkit-scrollbar {
+    display: none;
+  }
+  .crumb {
+    background: none;
+    border: none;
+    padding: 1px 3px;
+    border-radius: 3px;
+    font: inherit;
+    font-size: 11px;
+    line-height: 1.4;
+    color: #949494;
+    cursor: pointer;
+  }
+  .crumb:hover {
+    color: #c5c8c6;
+    background: #2d2d2d;
+  }
+  .symbol-crumbs .crumb:last-child {
+    color: #c5c8c6;
+  }
+  .crumb-sep {
+    color: #6e7681;
+    font-size: 11px;
+  }
+  /* Right edge stops short of the tick rail so scrollbar marks stay readable. */
+  .sticky-stack {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 24px;
+    z-index: 4;
+    pointer-events: none;
+  }
+  .sticky-row {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    height: 20px;
+    line-height: 20px;
+    text-align: left;
+    white-space: pre;
+    overflow: hidden;
+    border: none;
+    /* Translucent on purpose — enough of the covered code shows through to
+       stay oriented, not so much that either layer becomes hard to read. */
+    background: rgba(30, 30, 30, 0.78);
+    color: #c5c8c6;
+    font: inherit;
+    cursor: pointer;
+    pointer-events: auto;
+  }
+  .sticky-row:hover {
+    background: rgba(45, 45, 45, 0.92);
+  }
+  /* The gutter underneath shows the numbers of the lines being covered, which
+     are not these lines. Carry each pinned row's own number instead. */
+  .sticky-ln {
+    display: inline-block;
+    box-sizing: border-box;
+    padding-right: 8px;
+    text-align: right;
+    color: #6e7681;
+    /* Opaque, unlike the rest of the row: the gutter beneath is showing the
+       numbers of the covered lines, and two sets of digits in one cell is
+       unreadable. Transparency is worth having over code, not over numbers. */
+    background: #1e1e1e;
+  }
+  .sticky-stack .sticky-row:last-child {
+    box-shadow: 0 1px 0 rgba(80, 80, 80, 0.45);
   }
   .code-host {
     height: 100%;

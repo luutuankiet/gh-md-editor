@@ -13,7 +13,7 @@
   interface Tab {
     path: string;
     name: string;
-    kind: 'md' | 'code' | 'diff' | 'merge';
+    kind: 'md' | 'code' | 'diff' | 'merge' | 'graph';
     pinned: boolean;
     content: string;
     savedContent: string;
@@ -31,13 +31,16 @@
     // Present on kind === 'diff' tabs: which repo/file/side the tab shows.
     git?: { repo: string; path: string; staged: boolean; untracked: boolean; base?: string; baseLabel?: string; to?: string; toLabel?: string };
     // Present on kind === 'diff' tabs opened by a compare command: two
-    // arbitrary inputs instead of a git side. rightText holds pasted content,
-    // which lives in memory only.
-    cmp?: { leftPath: string; rightPath?: string; rightText?: string; rightLabel: string };
+    // arbitrary inputs instead of a git side. Either column can be a path on
+    // disk or text that lives in memory only — pasted content, or the buffer of
+    // an unsaved tab, which `rightTab` names so edits can flow back into it.
+    cmp?: { leftPath?: string; leftText?: string; leftLabel: string; rightPath?: string; rightText?: string; rightLabel: string; rightTab?: string };
     // Present on kind === 'merge' tabs: which conflicted file to resolve. The
     // tab holds no content of its own — the merge view owns the three sides
     // and the working copy it writes back.
     merge?: { repo: string; path: string };
+    // Present on kind === 'graph' tabs: which repository's history to draw.
+    graph?: { repo: string };
   }
 
   import OutlinePanel from './server/OutlinePanel.svelte';
@@ -99,9 +102,18 @@
         ? 'folder'
         : qoQuery.startsWith('@')
           ? 'symbol'
-          : 'file'
+          : qoQuery.startsWith(':')
+            ? 'ref'
+            : 'file'
   );
-  let qoTerm = $derived(qoQuery.replace(/^[>#@]\s*/, '').trim());
+  let qoTerm = $derived(qoQuery.replace(/^[>#@:]\s*/, '').trim());
+
+  // `:` is the ref picker. Which repository it acts on is filled in before the
+  // modal opens — the modal itself stays repo-agnostic.
+  type RefRow = { name: string; kind: 'local' | 'remote' | 'tag'; sha: string; author: string; when: string; subject: string };
+  let qoRefRepo = $state('');
+  let qoRefHead = $state('');
+  let qoRefs = $state<RefRow[]>([]);
   // Never show results that belong to a mode other than the one being typed.
   let qoShown = $derived(qoResultsMode === qoMode ? qoResults : []);
 
@@ -188,6 +200,7 @@
     { label: 'Open File…', run: () => { browse = { mode: 'file', action: 'same' }; } },
     { label: 'Close All Editor Tabs', run: closeAllTabs },
     { label: 'Close Other Editor Tabs', run: closeOtherTabs },
+    { label: 'Git Graph', hint: 'anchored repo', run: () => openGraph(gitAnchor) },
     { label: 'Refresh Explorer', run: () => window.dispatchEvent(new CustomEvent('gmd:refresh-explorer')) },
     { label: 'Refresh Outline', run: refreshOutline },
     { label: 'Show Outline', run: () => { layout.showLeft = true; sideView = 'explorer'; toggleOutline(true); } },
@@ -196,6 +209,8 @@
     { label: 'Select All Occurrences', hint: 'Mod+Shift+D', run: () => window.dispatchEvent(new CustomEvent('gmd:select-all-occurrences')) },
     { label: 'Compare Active File With…', run: () => { if (compareSource()) browse = { mode: 'compare', action: 'same' }; } },
     { label: 'Compare Active File With Clipboard', run: () => void compareWithClipboard() },
+    { label: 'Checkout Branch…', hint: 'anchored repository', run: () => void openRefPicker(gitAnchor) },
+    { label: 'Toggle Hidden Values', hint: '.env files', run: () => window.dispatchEvent(new CustomEvent('gmd:toggle-cloak')) },
     { label: 'Toggle Git Blame', hint: 'code editors', run: toggleBlame },
     { label: 'Toggle Inline Blame', hint: 'current line, code editors', run: toggleInlineBlame },
     { label: 'Upgrade Server', hint: 'restarts — kills terminal sessions', run: () => void upgradeServer() },
@@ -207,7 +222,7 @@
   async function qoSearch() {
     // Commands and symbols are filtered in memory; only files and folders
     // involve the server.
-    if (qoMode === 'cmd' || qoMode === 'symbol') { qoSel = 0; return; }
+    if (qoMode === 'cmd' || qoMode === 'symbol' || qoMode === 'ref') { qoSel = 0; return; }
     // Pin the mode at request time: the box can flip between send and receive.
     const mode = qoMode === 'folder' ? 'folder' : 'file';
     if (!qoTerm) {
@@ -373,6 +388,30 @@
         run: c.run,
       }));
     }
+    if (qoMode === 'ref') {
+      const needle = qoTerm.toLowerCase();
+      const rows = needle ? qoRefs.filter((r) => r.name.toLowerCase().includes(needle)) : qoRefs;
+      const items: QoItem[] = rows.map((r) => ({
+        key: `ref:${r.kind}:${r.name}`,
+        label: r.name,
+        detail: [r.sha, r.author, r.when, r.subject].filter(Boolean).join(' · '),
+        glyph: r.name === qoRefHead ? '●' : r.kind === 'tag' ? '⚑' : r.kind === 'remote' ? '☁' : '⑂',
+        run: () => void gitCheckout(qoRefRepo, r.name),
+      }));
+      // The typed name doubles as a new-branch offer, but only while it is not
+      // already a ref — otherwise the create row shadows the one meant to be
+      // picked.
+      if (qoTerm && !qoRefs.some((r) => r.name === qoTerm)) {
+        items.unshift({
+          key: `ref:new:${qoTerm}`,
+          label: `Create branch “${qoTerm}”`,
+          detail: `branching from ${qoRefHead || 'HEAD'}`,
+          glyph: '＋',
+          run: () => void gitBranch(qoRefRepo, qoTerm),
+        });
+      }
+      return items;
+    }
     if (qoMode === 'symbol') {
       const needle = qoTerm.toLowerCase();
       return flattenOutline(outlineNodes)
@@ -437,7 +476,9 @@
         ? 'Type a folder path to open as a workspace'
         : qoMode === 'symbol'
           ? 'Type a symbol name from the active file'
-          : 'Search files by name — > commands, # folders, @ symbols'
+          : qoMode === 'ref'
+            ? `Switch branch in ${qoRefRepo || 'this repository'} — type a new name to create one`
+            : 'Search files by name — > commands, # folders, @ symbols'
   );
 
   // Never a blank panel: every empty-list case says why it is empty.
@@ -446,14 +487,70 @@
       ? `Search failed: ${qoError}`
       : qoLoading
         ? 'Searching…'
-        : qoMode === 'symbol'
-          ? 'No symbols in the active file'
+        : qoMode === 'ref'
+          ? 'No branches or tags in this repository'
+          : qoMode === 'symbol'
+            ? 'No symbols in the active file'
           : qoTerm
             ? 'No matching results'
             : qoMode === 'folder'
               ? 'No recent workspaces yet — type a path'
               : 'No recently opened files yet — type to search'
   );
+
+  // Ref picker. The status bar owns which repository is anchored and hands it
+  // over; refs are fetched after the modal is already on screen so a cold git
+  // call never delays it.
+  async function openRefPicker(repo: string) {
+    qoRefRepo = repo;
+    qoRefs = [];
+    qoRefHead = '';
+    qoShow(':');
+    try {
+      const r = await fetch(`/api/git/refs?repo=${encodeURIComponent(repo)}`);
+      const d = await r.json();
+      if (!r.ok) { qoError = d.error ?? `HTTP ${r.status}`; return; }
+      qoRefs = d.details ?? [];
+      qoRefHead = d.head ?? '';
+      qoError = '';
+    } catch (e) {
+      qoError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function gitRefAction(body: Record<string, unknown>) {
+    try {
+      const r = await fetch('/api/git/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        // A refused checkout (dirty tree, name already taken) is the one case
+        // where the modal earns its place back on screen — the message is
+        // actionable and the list is still the right next thing to touch.
+        qoError = d.error ?? `HTTP ${r.status}`;
+        qoOpen = true;
+        return;
+      }
+    } catch (e) {
+      qoError = e instanceof Error ? e.message : String(e);
+      qoOpen = true;
+      return;
+    }
+    // Status bar, source control and the change gutters all refresh off this
+    // one event rather than polling for a move they cannot see.
+    window.dispatchEvent(new CustomEvent('gmd:git-changed'));
+  }
+
+  const gitCheckout = (repo: string, ref: string) => gitRefAction({ op: 'checkout', repo, ref });
+  const gitBranch = (repo: string, name: string) => gitRefAction({ op: 'branch', repo, name });
+
+  // Source-control rows open the change; this opens the file. Repo paths come
+  // back relative to the served root, the same space the explorer works in.
+  const openRepoFile = (repo: string, p: string) =>
+    void openFile(repo ? `${repo}/${p}` : p, { pinned: false });
 
   function qoShow(prefix: string) {
     qoQuery = prefix;
@@ -530,7 +627,7 @@
     if (b.mode === 'workspace') openWorkspaceIn(p, b.action);
     else if (b.mode === 'compare') {
       const t = compareSource();
-      if (t) openCompare({ leftPath: t.path, rightPath: p, rightLabel: baseName(p) });
+      if (t) openCompare(compareAgainst(t, { path: p, label: baseName(p) }));
     } else void openFile(p, { pinned: true });
   }
 
@@ -610,16 +707,20 @@
   // a file opens pinned, since asking for it by name is a deliberate act.
   $effect(() => {
     const onOpenRequest = (e: Event) => {
-      const d = (e as CustomEvent).detail as { kind?: string; path?: string; reuse?: boolean } | null;
+      const d = (e as CustomEvent).detail as
+        { kind?: string; path?: string; reuse?: boolean; line?: number } | null;
       if (!d?.path) return;
       if (d.kind === 'folder') openWorkspaceIn(d.path, d.reuse ? 'same' : 'tab');
-      else void openFile(d.path, { pinned: true });
+      else void openFile(d.path, { pinned: true, line: d.line });
     };
     window.addEventListener('gmd:open-request', onOpenRequest);
     return () => window.removeEventListener('gmd:open-request', onOpenRequest);
   });
 
   import QuickOpen from './server/QuickOpen.svelte';
+  import StatusBar from './server/StatusBar.svelte';
+  import GitGraphTab from './server/GitGraphTab.svelte';
+  import { estimateTokens } from '../lib/token-estimate';
   import type { QoItem } from '../lib/quickopen';
   import TerminalPanel from './server/TerminalPanel.svelte';
   import SearchPanel from './server/SearchPanel.svelte';
@@ -679,7 +780,10 @@
     window.addEventListener('pointerup', onUp);
   }
 
-  let rootInfo = $state<{ root: string; sep: string } | null>(null);
+  let rootInfo = $state<{ root: string; sep: string; host?: string } | null>(null);
+  // Which repository every git segment in the status bar refers to. Owned here
+  // rather than in the bar so palette commands can act on the same choice.
+  let gitAnchor = $state('');
 
   // ---- Editor groups: split view. Tabs live in groups; groups render side-by-side. ----
   interface Group {
@@ -716,6 +820,38 @@
         : folder
   );
 
+  // Tab identity: active file first, workspace leaf second. Same ordering as
+  // VS Code, and the reason is the same — a row of pinned tabs is only
+  // distinguishable by whatever survives the truncation, which is the head.
+  const leafOf = (p: string) => {
+    const t = p.replace(/\/+$/, '');
+    const i = t.lastIndexOf('/');
+    return i === -1 ? t : t.slice(i + 1);
+  };
+  $effect(() => {
+    // host:anchor, because a row of browser tabs pointed at different machines
+    // is otherwise indistinguishable once the browser truncates them.
+    const leaf = leafOf(title) || 'gh-md-editor';
+    const anchor = rootInfo?.host ? `${rootInfo.host}:${leaf}` : leaf;
+    const name = activeTab?.name;
+    document.title = name ? `${name} — ${anchor}` : anchor;
+  });
+
+  // Size of the active buffer in the unit that matters when it is headed for a
+  // model. A single pass over the text is cheap, but not on every keystroke of
+  // a large file — so it settles first, then counts.
+  let activeTokens = $state(0);
+  $effect(() => {
+    const t = activeTab;
+    const text = t && (t.kind === 'md' || t.kind === 'code') && !t.binary ? t.content : '';
+    if (!text) {
+      activeTokens = 0;
+      return;
+    }
+    const timer = setTimeout(() => { activeTokens = estimateTokens(text); }, 400);
+    return () => clearTimeout(timer);
+  });
+
   $effect(() => {
     fetch('/api/root')
       .then((r) => r.json())
@@ -749,9 +885,10 @@
           kind: t.kind,
           pinned: t.pinned,
           git: t.git,
-          // A pasted compare holds its right side in memory only — nothing on
-          // disk can re-derive it, so it deliberately does not survive a reload.
-          cmp: t.cmp?.rightPath ? t.cmp : undefined,
+          // A compare with a column held in memory — pasted text, an unsaved
+          // buffer — has nothing on disk to re-derive it from, so it
+          // deliberately does not survive a reload.
+          cmp: t.cmp?.leftPath && t.cmp?.rightPath ? t.cmp : undefined,
           untitled: t.untitled,
           // Untitled buffers live nowhere else; dirty files carry their draft.
           content: t.untitled && t.content.length <= DRAFT_CAP ? t.content : undefined,
@@ -791,6 +928,8 @@
           tab = { path: st.path, name: st.name ?? st.path, kind: 'code', pinned: true, content: st.content ?? '', savedContent: '', mtimeMs: 0, untitled: true };
         } else if (st.kind === 'diff' && st.cmp) {
           tab = { path: st.path, name: st.name ?? st.path, kind: 'diff', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0, cmp: st.cmp };
+        } else if (st.kind === 'graph' && st.graph) {
+          tab = { path: st.path, name: st.name ?? st.path, kind: 'graph', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0, graph: st.graph };
         } else if (st.kind === 'diff' && st.git) {
           // Diff tabs own no content — DiffTab re-derives from git on mount.
           tab = { path: st.path, name: st.name ?? st.path, kind: 'diff', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0, git: st.git };
@@ -1002,6 +1141,39 @@
     activeGroupId = home.id;
   }
 
+  // History gets a tab rather than a side panel: it wants the full width, and
+  // what it opens are diffs and files, which live in tabs beside it anyway.
+  function openGraph(repo: string) {
+    const key = `gmd-graph:${repo}`;
+    for (const g of groups) {
+      const existing = g.tabs.find((t) => t.path === key);
+      if (existing) {
+        activeGroupId = g.id;
+        g.activePath = key;
+        return;
+      }
+    }
+    const tab: Tab = {
+      path: key,
+      name: repo ? `Git Graph: ${baseName(repo)}` : 'Git Graph',
+      kind: 'graph',
+      // Pinned on purpose: the graph is a place you work from, and every diff
+      // opened out of it would otherwise recycle the preview slot it sits in
+      // and close the graph behind you.
+      pinned: true,
+      content: '',
+      savedContent: '',
+      mtimeMs: 0,
+      graph: { repo },
+    };
+    const home = groups.includes(activeGroup) ? activeGroup : groups[0];
+    const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
+    if (previewIdx >= 0) home.tabs[previewIdx] = tab;
+    else home.tabs.push(tab);
+    home.activePath = key;
+    activeGroupId = home.id;
+  }
+
   // Conflict resolution gets its own kind rather than a third diff mode: the
   // file exists in four versions at once here (base, current, incoming and the
   // working copy being written), which is more than a two-sided diff can say.
@@ -1036,8 +1208,8 @@
   // Compare two inputs. Unlike openDiff there is no repo and no index: the
   // server shells `git diff --no-index`, so the hunks arrive in the shape
   // DiffTab already renders.
-  function openCompare(cmp: { leftPath: string; rightPath?: string; rightText?: string; rightLabel: string }) {
-    const key = `gmd-cmp:${cmp.leftPath}:${cmp.rightPath ?? cmp.rightLabel}`;
+  function openCompare(cmp: NonNullable<Tab['cmp']>) {
+    const key = `gmd-cmp:${cmp.leftPath ?? cmp.leftLabel}:${cmp.rightPath ?? cmp.rightTab ?? cmp.rightLabel}`;
     for (const g of groups) {
       const existing = g.tabs.find((t) => t.path === key);
       if (existing) {
@@ -1051,7 +1223,7 @@
     }
     const tab: Tab = {
       path: key,
-      name: `${baseName(cmp.leftPath)} ↔ ${cmp.rightLabel}`,
+      name: `${cmp.leftPath ? baseName(cmp.leftPath) : cmp.leftLabel} ↔ ${cmp.rightLabel}`,
       kind: 'diff',
       pinned: false,
       content: '',
@@ -1071,8 +1243,33 @@
   // and an unsaved buffer have no path to hand to git.
   function compareSource(): Tab | null {
     const t = activeTab;
-    if (!t || t.untitled || t.binary || t.kind === 'diff') return null;
+    if (!t || t.binary || (t.kind !== 'md' && t.kind !== 'code')) return null;
     return t;
+  }
+
+  // Build a compare against whatever is on screen. An unsaved buffer has no
+  // path to hand git, so it rides along as text — and it takes the RIGHT
+  // column, because that is the editable side in every other diff the app
+  // shows: the thing being measured against goes on the left, read-only.
+  function compareAgainst(t: Tab, other: { path?: string; text?: string; label: string }): NonNullable<Tab['cmp']> {
+    if (!t.untitled) {
+      return { leftPath: t.path, leftLabel: baseName(t.path), rightPath: other.path, rightText: other.text, rightLabel: other.label };
+    }
+    return { leftPath: other.path, leftText: other.text, leftLabel: other.label, rightText: t.content, rightLabel: t.name, rightTab: t.path };
+  }
+
+  // A scratch column has no file to save to, so the diff hands its edits back
+  // here instead — into the compare payload, and into the unsaved tab that owns
+  // the buffer, so switching away from the diff does not lose the work.
+  function applyScratch(tab: Tab, text: string) {
+    if (!tab.cmp) return;
+    tab.cmp.rightText = text;
+    const owner = tab.cmp.rightTab;
+    if (!owner) return;
+    for (const g of groups) {
+      const o = g.tabs.find((t) => t.path === owner);
+      if (o) o.content = text;
+    }
   }
 
   let pasteCompare = $state(false);
@@ -1087,7 +1284,7 @@
     try {
       const text = await navigator.clipboard?.readText();
       if (typeof text === 'string' && text.length) {
-        openCompare({ leftPath: t.path, rightText: text, rightLabel: 'clipboard' });
+        openCompare(compareAgainst(t, { text, label: 'clipboard' }));
         return;
       }
     } catch { /* fall through to the armed paste bar */ }
@@ -1101,7 +1298,7 @@
     const t = compareSource();
     pasteCompare = false;
     pasteText = '';
-    if (t && text) openCompare({ leftPath: t.path, rightText: text, rightLabel: 'clipboard' });
+    if (t && text) openCompare(compareAgainst(t, { text, label: 'clipboard' }));
   }
 
   function cancelPasteCompare() {
@@ -1129,6 +1326,11 @@
 
   async function saveTab(tab: Tab) {
     if (tab.binary || tab.error) return;
+    // Only the kinds that own a text buffer can be written back. A diff, merge
+    // or graph tab carries a real file path but an empty `content`, so Mod+S on
+    // one used to PUT an empty body over the very file it was showing. Those
+    // views own their own writeback where they have one.
+    if (tab.kind !== 'code' && tab.kind !== 'md') return;
     if (tab.untitled) { saveAs = { tab }; return; }
     const put = (baseMtimeMs: number) =>
       fetch('/api/file', {
@@ -1137,24 +1339,32 @@
         body: JSON.stringify({ path: tab.path, content: tab.content, baseMtimeMs }),
       });
 
-    const res = await put(tab.mtimeMs);
-    if (res.ok) {
-      const data = await res.json();
-      tab.mtimeMs = data.mtimeMs;
-      tab.savedContent = tab.content;
-      tab.stale = false;
-      return;
-    }
-    if (res.status === 409) {
+    // A save that fails silently is worse than one that fails loudly: the tab
+    // keeps its dirty mark, the user reads that as rendering lag, and the edit
+    // is gone the next time the file is read. Every exit below reports.
+    const failed = async (r: Response) => {
+      const d = await r.json().catch(() => ({}));
+      window.alert(`Could not save ${tab.name}: ${d.error ?? `HTTP ${r.status}`}`);
+    };
+
+    try {
+      const res = await put(tab.mtimeMs);
+      if (res.ok) {
+        const data = await res.json();
+        tab.mtimeMs = data.mtimeMs;
+        tab.savedContent = tab.content;
+        tab.stale = false;
+        return;
+      }
+      if (res.status !== 409) return await failed(res);
       const data = await res.json();
       if (window.confirm('File changed on disk since you opened it. Overwrite disk version?')) {
         const res2 = await put(data.mtimeMs);
-        if (res2.ok) {
-          const d2 = await res2.json();
-          tab.mtimeMs = d2.mtimeMs;
-          tab.savedContent = tab.content;
-          tab.stale = false;
-        }
+        if (!res2.ok) return await failed(res2);
+        const d2 = await res2.json();
+        tab.mtimeMs = d2.mtimeMs;
+        tab.savedContent = tab.content;
+        tab.stale = false;
       } else {
         // Discard local edits, take the disk version.
         tab.content = data.content;
@@ -1162,6 +1372,10 @@
         tab.mtimeMs = data.mtimeMs;
         tab.stale = false;
       }
+    } catch (e) {
+      // A dropped connection lands here — otherwise an unhandled rejection and
+      // no sign anywhere that the file is still unsaved.
+      window.alert(`Could not save ${tab.name}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -1414,6 +1628,18 @@
 
   $effect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // This listener is on window in the CAPTURE phase, so it sees every
+      // chord before xterm does — and the bottom panel is a real shell. Ctrl+L
+      // clears the screen, Ctrl+B is tmux's prefix, Ctrl+S and Ctrl+G belong to
+      // readline, and Alt+key is Meta. Swallowing those to toggle a sidebar is
+      // what makes an embedded terminal feel broken, so while the shell has
+      // focus only the chords it has no claim on stay ours: the
+      // Shift-augmented ones, and the two that act on the panel itself.
+      const inShell = !!(e.target as HTMLElement | null)?.closest?.('.xterm');
+      const workbenchClaim =
+        (e.metaKey || e.ctrlKey) &&
+        (e.shiftKey || e.code === 'Digit1' || e.code === 'ArrowUp' || e.code === 'ArrowDown');
+      if (inShell && !workbenchClaim) return;
       if ((e.metaKey || e.ctrlKey) && e.code === 'KeyS') {
         e.preventDefault();
         if (activeTab) void saveTab(activeTab).then(() => window.dispatchEvent(new CustomEvent('gmd:git-refresh')));
@@ -1673,7 +1899,7 @@
         {/if}
       </div>
       <div class="side-view" class:hidden={sideView !== 'search'}>
-        <SearchPanel onOpen={(p, line) => openFile(p, { pinned: false, line })} />
+        <SearchPanel {folder} onOpen={(p, line) => openFile(p, { pinned: false, line })} />
       </div>
       <div class="side-view" class:hidden={sideView !== 'compare'}>
         <TreeComparePanel visible={layout.showLeft && sideView === 'compare'} onOpenDiff={openDiff} />
@@ -1761,9 +1987,11 @@
                   {:else if at.binary}
                     <div class="placeholder">{at.name} is a binary file.</div>
                   {:else if at.kind === 'diff' && at.cmp}
-                    <DiffTab compare={at.cmp} />
+                    <DiffTab compare={at.cmp} onScratch={(text) => applyScratch(at, text)} />
                   {:else if at.kind === 'diff' && at.git}
                     <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} to={at.git.to ?? ''} toLabel={at.git.toLabel ?? ''} />
+                  {:else if at.kind === 'graph' && at.graph}
+                    <GitGraphTab repo={at.graph.repo} onOpenDiff={openDiff} onOpenFile={openRepoFile} />
                   {:else if at.kind === 'merge' && at.merge}
                     <MergeTab repo={at.merge.repo} path={at.merge.path} />
                   {:else if at.kind === 'md'}
@@ -1817,9 +2045,17 @@
     </div>
     <aside class="rightpanel" class:hidden={!layout.showRight} style="flex-basis: {layout.rightW}px">
       <div class="panel-title">Source Control</div>
-      <SourceControlPanel visible={layout.showRight} onOpenDiff={openDiff} onOpenMerge={openMerge} />
+      <SourceControlPanel visible={layout.showRight} onOpenDiff={openDiff} onOpenMerge={openMerge} onOpenFile={openRepoFile} onOpenGraph={openGraph} />
     </aside>
   </div>
+  <StatusBar
+    host={rootInfo?.host ?? ''}
+    {folder}
+    bind:anchor={gitAnchor}
+    tokens={activeTokens}
+    tokenLabel={activeTab?.name ?? ''}
+    onPickRef={(repo) => void openRefPicker(repo)}
+  />
 </div>
 
 {#if saveAs}

@@ -38,7 +38,12 @@
     const el = inputEl;
     if (!el) return;
     el.focus();
-    el.select();
+    // A mode sigil (`>`, `#`, `:`, `@`) is a prefix, not a value: selecting it
+    // means the first keystroke replaces it and the palette silently falls back
+    // to file mode. Park the caret after it instead, and keep select-all for the
+    // genuinely pre-filled case — the folder picker opens on a real path.
+    if (/^[>#:@]?$/.test(el.value)) el.setSelectionRange(el.value.length, el.value.length);
+    else el.select();
   });
 
   // Keep the highlighted row visible as the arrows walk past the fold.

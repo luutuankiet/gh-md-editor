@@ -1,10 +1,15 @@
 <script lang="ts">
   import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
 
-  let { visible = true, onOpenDiff, onOpenMerge }: {
+  let { visible = true, onOpenDiff, onOpenMerge, onOpenFile, onOpenGraph }: {
     visible?: boolean;
     onOpenDiff: (repo: string, file: { path: string; staged: boolean; untracked?: boolean }) => void;
     onOpenMerge: (repo: string, path: string) => void;
+    // The working-tree file itself rather than the change to it: clicking a row
+    // answers "what did I do here", this answers "take me to it".
+    onOpenFile: (repo: string, path: string) => void;
+    // History for the repository this panel is currently showing.
+    onOpenGraph: (repo: string) => void;
   } = $props();
 
   interface RepoInfo { repo: string; branch?: string; ahead?: number; behind?: number; changes?: number; error?: string }
@@ -89,8 +94,19 @@
     }
     busy = false;
     await refresh();
+    // The status bar and anything else watching git state update off this
+    // event rather than polling for changes they cannot see.
+    if (ok) window.dispatchEvent(new CustomEvent('gmd:git-changed'));
     return ok;
   }
+
+  // The reverse direction: a branch switched from the status bar rewrites
+  // every row in this panel.
+  $effect(() => {
+    const on = () => void refresh();
+    window.addEventListener('gmd:git-changed', on);
+    return () => window.removeEventListener('gmd:git-changed', on);
+  });
 
   async function commit() {
     if (busy || (!message.trim() && !amend)) return;
@@ -251,6 +267,12 @@
       <img class="ficon" alt="" aria-hidden="true" src={fileIconUrl(leafName(f.path))} />
       <span class="fname">{leafName(f.path)}</span>
       <span class="actions">
+        <button
+          type="button"
+          class="icon-btn"
+          title="Open file"
+          onclick={(e) => { e.stopPropagation(); onOpenFile(repo, f.path); }}
+        >↗</button>
         {#if isStaged}
           <button type="button" class="icon-btn" title="Unstage" onclick={(e) => { e.stopPropagation(); void action({ op: 'unstage', paths: [f.path] }); }}>−</button>
         {:else}
@@ -270,6 +292,7 @@
         <option value={r.repo} disabled={!!r.error}>{r.repo}{r.error ? ' ⚠' : ''}</option>
       {/each}
     </select>
+    <button type="button" class="icon-btn" title="Git Graph" onclick={() => onOpenGraph(repo)}>⎇</button>
     <button type="button" class="icon-btn" title="Refresh" onclick={() => void loadRepos()}>⟳</button>
   </div>
   {#if status}

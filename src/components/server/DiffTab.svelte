@@ -1,5 +1,5 @@
 <script lang="ts">
-  let { repo = '', path = '', staged = false, untracked = false, compare = null, base = '', baseLabel = '', to = '', toLabel = '' }: {
+  let { repo = '', path = '', staged = false, untracked = false, compare = null, onScratch = undefined, base = '', baseLabel = '', to = '', toLabel = '' }: {
     repo?: string;
     path?: string;
     staged?: boolean;
@@ -15,9 +15,12 @@
     to?: string;
     toLabel?: string;
     // Set instead of repo/path when the tab came from a compare command: two
-    // arbitrary inputs, no repo, no index side. rightText carries pasted
-    // content, which has no path of its own.
-    compare?: { leftPath: string; rightPath?: string; rightText?: string; rightLabel: string } | null;
+    // arbitrary inputs, no repo, no index side. Either column can be text held
+    // in memory — pasted content, or an unsaved buffer — which has no path.
+    compare?: { leftPath?: string; leftText?: string; leftLabel?: string; rightPath?: string; rightText?: string; rightLabel: string; rightTab?: string } | null;
+    // Called when the editable column has no file behind it to save to: the new
+    // text goes back to whoever owns the buffer instead.
+    onScratch?: (text: string) => void;
   } = $props();
 
   import { untrack } from 'svelte';
@@ -36,7 +39,7 @@
 
   // What the diff is *about* — drives the header and the grammar pick. A
   // compare has no repo-relative path, so its left input names the tab.
-  const subject = $derived(compare ? compare.leftPath : path);
+  const subject = $derived(compare ? (compare.leftPath || compare.rightPath || compare.leftLabel || compare.rightLabel) : path);
 
   // Two commits, no working tree — nothing here can be staged or reverted.
   const readOnly = $derived(!!to);
@@ -96,6 +99,18 @@
     try { localStorage.setItem(DIFFVIEW_KEY, v); } catch { /* private mode */ }
   }
 
+  const DIFFWRAP_KEY = 'ghmd.diffWrap';
+  let wrap = $state((typeof localStorage !== 'undefined' ? localStorage.getItem(DIFFWRAP_KEY) : null) === '1');
+  function setWrap(on: boolean) {
+    wrap = on;
+    try { localStorage.setItem(DIFFWRAP_KEY, on ? '1' : '0'); } catch { /* private mode */ }
+    // A full rebuild rather than a compartment reconfigure: the merge view
+    // measures chunk heights when its field is installed, so changing what a
+    // line occupies underneath it leaves the two sides aligned to stale rows.
+    pendingScroll = scroller()?.scrollTop ?? null;
+    docsVersion++;
+  }
+
   interface SplitCell { line: DiffLine; idx: number }
   interface SplitRow { left: SplitCell | null; right: SplitCell | null }
   // Pair deletions with the additions that replaced them: context rows span
@@ -123,6 +138,20 @@
     return rows;
   }
 
+  // The wire shape of a compare. The in-memory columns are read UNTRACKED on
+  // purpose: an edit in a scratch pane flows back out to the tab that owns the
+  // buffer, and re-reading it here would have the load effect refetch and
+  // rebuild the editor under the user's cursor, mid-keystroke.
+  function comparePayload() {
+    if (!compare) return null;
+    const c = compare;
+    return {
+      leftPath: c.leftPath,
+      rightPath: c.rightPath,
+      ...untrack(() => ({ leftText: c.leftText, rightText: c.rightText })),
+    };
+  }
+
   async function load(auto = false) {
     // A background reload keeps the current diff on screen while it runs: the
     // spinner would otherwise flash on every window focus.
@@ -135,7 +164,7 @@
         ? await fetch('/api/diff/compare', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(compare),
+            body: JSON.stringify(comparePayload()),
           })
         : await fetch(`/api/git/diff?${new URLSearchParams({ repo, path, staged: staged ? '1' : '0', untracked: untracked ? '1' : '0', ...(base ? { base } : {}), ...(to ? { to } : {}) })}`);
       const d = await r.json();
@@ -179,12 +208,16 @@
   // Root-relative, which is what every file and git endpoint takes. `repo` is
   // itself root-relative and `path` is relative to the repo.
   const fullPath = $derived(compare ? '' : repo ? `${repo}/${path}` : path);
-  // Where an edit lands. A pasted right side has no file, so it has none.
+  // Where an edit lands. A scratch right side has no file, so it has none.
   const rightSavePath = $derived(compare ? compare.rightPath ?? '' : fullPath);
-  // The incoming side is only a file on disk in the working-tree shapes. A
-  // staged diff's right side is the index and a pinned `to` is a commit —
-  // neither is a thing an editor can write back to.
-  const editable = $derived(!to && !staged && (compare ? !!compare.rightPath : true));
+  // Whether the incoming pane takes typing at all. A staged diff's right side
+  // is the index and a pinned `to` is a commit — neither is a document anyone
+  // can edit. A compare always is: a column with no file behind it is still a
+  // buffer, and editing it is the whole point of comparing against one.
+  const writable = $derived(!to && !staged);
+  // Whether those edits have anywhere on disk to go. When they do not they go
+  // back to the tab that owns the buffer instead — see save().
+  const savable = $derived(writable && !!rightSavePath);
 
   let leftText = $state<string | null>(null);
   let rightText = $state<string | null>(null);
@@ -239,7 +272,12 @@
   }
 
   async function fetchLeft(): Promise<string | null> {
-    if (compare) return (await fetchFile(compare.leftPath)).content;
+    if (compare) {
+      const c = compare;
+      const mem = untrack(() => c.leftText);
+      if (typeof mem === 'string') return mem;
+      return c.leftPath ? (await fetchFile(c.leftPath)).content : '';
+    }
     if (untracked) return '';
     // A pinned base wins; a staged diff measures against HEAD; otherwise the
     // index (falling back to HEAD), which is what makes the view show UNSTAGED
@@ -249,8 +287,10 @@
 
   async function fetchRight(): Promise<string | null> {
     if (compare) {
-      if (typeof compare.rightText === 'string') return compare.rightText;
-      return compare.rightPath ? (await fetchFile(compare.rightPath)).content : '';
+      const c = compare;
+      const mem = untrack(() => c.rightText);
+      if (typeof mem === 'string') return mem;
+      return c.rightPath ? (await fetchFile(c.rightPath)).content : '';
     }
     if (to) return await fetchShow(fullPath, { ref: to });
     if (staged) return await fetchShow(fullPath, { stage: '0' });
@@ -352,6 +392,10 @@
       ]),
       monokaiCodeBundle,
       langExt,
+      // Off by default: a diff is read by column as much as by line, and
+      // reflowing each side on its own width destroys that alignment. On
+      // demand it is still the only way to read a long prose line whole.
+      ...(wrap ? [EditorView.lineWrapping] : []),
       EditorView.theme({
         '&': { height: '100%' },
         '.cm-scroller': { fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace", fontSize: '12px', lineHeight: '1.5' },
@@ -387,7 +431,7 @@
       highlightChanges: true,
       allowInlineDiffs: true,
       collapseUnchanged: { margin: 3, minSize: 4 },
-      mergeControls: editable ? mergeControl : false,
+      mergeControls: writable ? mergeControl : false,
     });
   }
 
@@ -401,8 +445,8 @@
           doc: r,
           extensions: [
             ...baseExtensions(),
-            EditorState.readOnly.of(!editable),
-            ...(editable ? [highlightActiveLine(), onEdit()] : []),
+            EditorState.readOnly.of(!writable),
+            ...(writable ? [highlightActiveLine(), onEdit()] : []),
           ],
         },
         parent: h,
@@ -413,16 +457,17 @@
         gutter: true,
         // Arrows that copy a chunk from the base onto the working copy — the
         // revert, without leaving the diff. Pointless when nothing is writable.
-        ...(editable ? { revertControls: 'a-to-b' as const } : {}),
+        ...(writable ? { revertControls: 'a-to-b' as const } : {}),
       });
+      syncX(mv.a.scrollDOM, mv.b.scrollDOM);
     } else {
       uv = new EditorView({
         doc: r,
         parent: h,
         extensions: [
           ...baseExtensions(),
-          EditorState.readOnly.of(!editable),
-          ...(editable ? [highlightActiveLine(), onEdit()] : []),
+          EditorState.readOnly.of(!writable),
+          ...(writable ? [highlightActiveLine(), onEdit()] : []),
           unifiedExt(l),
         ],
       });
@@ -434,8 +479,53 @@
     }
   }
 
+  // The merge package gives each side its own scroller, so a view that only
+  // lines up vertically is half a diff. Mirroring scrollLeft needs the guard:
+  // the assignment fires the peer's own scroll event, which would assign
+  // straight back and pin the pair mid-gesture.
+  let syncing = false;
+  let unsync: (() => void) | null = null;
+  function syncX(a: HTMLElement, b: HTMLElement) {
+    const mirror = (from: HTMLElement, to: HTMLElement) => () => {
+      if (syncing) return;
+      syncing = true;
+      to.scrollLeft = from.scrollLeft;
+      requestAnimationFrame(() => { syncing = false; });
+    };
+    const ab = mirror(a, b);
+    const ba = mirror(b, a);
+    a.addEventListener('scroll', ab, { passive: true });
+    b.addEventListener('scroll', ba, { passive: true });
+    unsync = () => {
+      a.removeEventListener('scroll', ab);
+      b.removeEventListener('scroll', ba);
+      unsync = null;
+    };
+  }
+
+  // Same lockstep for the patch renderer's two columns, which are plain divs
+  // rather than editors and so need their own listeners.
+  function syncCols(node: HTMLElement) {
+    let held = false;
+    const offs: (() => void)[] = [];
+    const cols = [...node.querySelectorAll('.splitcol')] as HTMLElement[];
+    const on = (from: HTMLElement, to: HTMLElement) => {
+      const h = () => {
+        if (held) return;
+        held = true;
+        to.scrollLeft = from.scrollLeft;
+        requestAnimationFrame(() => { held = false; });
+      };
+      from.addEventListener('scroll', h, { passive: true });
+      offs.push(() => from.removeEventListener('scroll', h));
+    };
+    if (cols.length === 2) { on(cols[0], cols[1]); on(cols[1], cols[0]); }
+    return { destroy() { for (const off of offs) off(); } };
+  }
+
   function destroyEditor() {
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    unsync?.();
     mv?.destroy();
     uv?.destroy();
     mv = null;
@@ -455,16 +545,27 @@
   });
 
   function scheduleSave() {
-    if (!editable) return;
+    if (!writable) return;
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => { saveTimer = null; void save(); }, 900);
   }
 
   async function save() {
     const b = mv ? mv.b : uv;
-    if (!editable || !rightSavePath || !b) return;
+    if (!writable || !b) return;
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
     const content = b.state.doc.toString();
+    if (!savable) {
+      // Nothing on disk to write to, so the edit goes back to whoever owns the
+      // buffer and the hunks refresh against it. The auto path deliberately:
+      // the text already on screen is the text that was just typed, and a
+      // rebuild would cost the cursor for nothing.
+      rightText = content;
+      dirty = false;
+      onScratch?.(content);
+      void load(true);
+      return;
+    }
     saving = true;
     try {
       const r = await fetch('/api/file', {
@@ -595,15 +696,20 @@
   <div class="diff-head">
     <span class="diff-path" title={subject}>{subject}</span>
     <span class="diff-side">{compare ? `vs ${compare.rightLabel}` : to ? `${toLabel || to.slice(0, 7)} vs ${baseLabel || base.slice(0, 7)}` : base ? `vs ${baseLabel || base.slice(0, 7)}` : staged ? 'staged' : untracked ? 'untracked' : 'working tree'}</span>
-    {#if shownView !== 'hunks' && editable}
+    {#if shownView !== 'hunks' && writable}
       {#if dirty}
-        <button type="button" class="pill dirtypill" title="Unsaved edits — click to save now" onclick={() => void save()}>● unsaved</button>
+        <button type="button" class="pill dirtypill" title={savable ? 'Unsaved edits — click to save now' : 'Unsaved edits — click to fold them back into the buffer'} onclick={() => void save()}>● unsaved</button>
       {:else if saving}
         <span class="pill">saving…</span>
+      {:else if !savable}
+        <span class="pill" title="This side is a buffer, not a file — edits stay in the tab that owns it">scratch</span>
       {/if}
     {:else if shownView !== 'hunks'}
       <span class="pill">read-only</span>
     {/if}
+    <span class="viewtoggle">
+      <button type="button" class:on={wrap} title="Word wrap both panes" onclick={() => setWrap(!wrap)}>Wrap</button>
+    </span>
     <span class="viewtoggle">
       <button type="button" class:on={shownView === 'split'} disabled={cmBlocked} onclick={() => setView('split')}>Split</button>
       <button type="button" class:on={shownView === 'inline'} disabled={cmBlocked} onclick={() => setView('inline')}>Inline</button>
@@ -611,7 +717,7 @@
     </span>
     <button type="button" class="icon-btn" title="Reload both sides from disk" onclick={reloadAll}>⟳</button>
   </div>
-  {#if shownView !== 'hunks' && editable && repo && !compare}
+  {#if shownView !== 'hunks' && savable && repo && !compare}
     <!-- Commit without switching tabs: the file is staged first, so the commit
          captures exactly what is on screen rather than whatever happened to be
          in the index already. -->
@@ -658,8 +764,11 @@
                 <span class="selcount">read-only</span>
               {:else if compare}
                 <!-- VS Code's per-change arrows: copy this change onto either
-                     side. Pasted text has no file, so no right target then. -->
-                <button type="button" onclick={() => void applyCompare(hi, 'left')}>⇤ Apply {sel[hi]?.size ? 'selected' : 'hunk'} to left</button>
+                     side. A column with no file behind it is not a target —
+                     the split view edits it directly instead. -->
+                {#if compare.leftPath}
+                  <button type="button" onclick={() => void applyCompare(hi, 'left')}>⇤ Apply {sel[hi]?.size ? 'selected' : 'hunk'} to left</button>
+                {/if}
                 {#if compare.rightPath}
                   <button type="button" onclick={() => void applyCompare(hi, 'right')}>Apply {sel[hi]?.size ? 'selected' : 'hunk'} to right ⇥</button>
                 {/if}
@@ -675,7 +784,7 @@
           </div>
           {#if view === 'split'}
             {@const rows = splitRows(h)}
-            <div class="splitwrap">
+            <div class="splitwrap" class:wrapon={wrap} use:syncCols>
               {#each [0, 1] as side (side)}
               <div class="splitcol">
                 {#each rows as row, ri (ri)}
@@ -789,6 +898,19 @@
   .difftab :global(.cm-mergeView),
   .difftab :global(.cm-mergeViewEditors) { height: 100%; }
   .difftab :global(.cm-mergeViewEditor) { min-width: 0; }
+  /* The package hands the container the vertical scroll and leaves each
+     editor overflow-hidden, which is why a line wider than its pane simply
+     vanished off the right edge instead of revealing a scrollbar. Restore
+     that axis per side; script keeps the two sides in lockstep. */
+  .difftab :global(.cm-merge-a .cm-scroller),
+  .difftab :global(.cm-merge-b .cm-scroller) {
+    overflow-x: auto;
+    /* Setting one axis to `auto` promotes the computed value of the other from
+       `visible` to `auto`. That handed each side its own vertical scrollbar and
+       left the merge container — the element that actually owns vertical
+       scroll — with nothing to scroll once the pane got short. */
+    overflow-y: hidden;
+  }
   .difftab :global(.cm-merge-a .cm-changedLine),
   .difftab :global(.cm-deletedChunk) { background: rgba(248, 81, 73, 0.13); }
   .difftab :global(.cm-merge-a .cm-changedText),
@@ -1049,8 +1171,10 @@
   /* Each side is its own horizontal scroller, VS Code style. A grid with
      max-content tracks does NOT work here: the tracks can never exceed the
      grid container's width, so long lines just painted across the gutter into
-     the other column. Two independent scroll boxes also mean a wide old
-     version doesn't drag the new one sideways.
+     the other column.
+     The two boxes scroll independently in the DOM but are mirrored from
+     script: reading a diff means comparing the same column on both sides, so
+     letting one drift sideways from the other defeats the whole view.
      overflow-y stays effectively visible: the columns are never height-capped,
      so nothing ever overflows vertically and .hunks keeps owning that axis. */
   .splitwrap {
@@ -1063,6 +1187,11 @@
     overflow-x: auto;
   }
   .splitcol + .splitcol { border-left: 1px solid #404040; }
+  /* Wrapped: nothing overflows, so those scrollers would render a dead track.
+     Rows give up their max-content width and reflow in place instead. */
+  .splitwrap.wrapon .splitcol { overflow-x: hidden; }
+  .splitwrap.wrapon .scell { width: auto; white-space: pre-wrap; }
+  .splitwrap.wrapon .scell .text { overflow-wrap: anywhere; }
   .scell {
     display: flex;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;

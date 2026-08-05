@@ -24,6 +24,13 @@ async function loadDotenv(): Promise<LanguageSupport> {
 // `.production`. LanguageDescription.matchFilename tries filename patterns
 // before extensions, so this wins over any accidental extension collision.
 // `foo.env` is covered too, for the rarer extension-style naming.
+// Same predicate the LanguageDescription below matches on, exported so the
+// value cloak can auto-arm without duplicating the rule or reaching into
+// CodeMirror's matcher.
+export function isDotenvFile(name: string): boolean {
+  return /^\.env(\.[^.]+)*$/.test(name) || /\.env$/.test(name);
+}
+
 export const dotenvLanguage = LanguageDescription.of({
   name: 'dotenv',
   alias: ['env', 'environment'],

@@ -1,12 +1,14 @@
 <script lang="ts">
   import { untrack, tick } from 'svelte';
   import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
+  import { estimateTokens, formatTokens } from '../../lib/token-estimate';
 
   type EntryType = 'dir' | 'file' | 'link';
 
   interface TreeNode {
     name: string;
     type: EntryType;
+    ignored?: boolean;
     path: string;
     expanded: boolean;
     loading: boolean;
@@ -81,10 +83,11 @@
       try { msg = (await res.json()).error ?? msg; } catch { /* keep status */ }
       throw new Error(msg);
     }
-    const data = await res.json() as { entries: { name: string; type: EntryType }[] };
+    const data = await res.json() as { entries: { name: string; type: EntryType; ignored?: boolean }[] };
     return data.entries.map((e) => ({
       name: e.name,
       type: e.type,
+      ignored: e.ignored,
       path: joinPath(path, e.name),
       expanded: false,
       loading: false,
@@ -400,9 +403,22 @@
     return dragPaths.some((p) => dest === p || dest.startsWith(`${p}/`) || parentOf(p) === dest);
   }
 
+  // A drag from the desktop or another window carries 'Files' and no tree
+  // paths. Same gesture, different meaning — copy in, rather than move around
+  // — so the two are told apart before anything else happens.
+  function isFileDrag(e: DragEvent) {
+    return !!e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files');
+  }
+
   function handleRowDragOver(e: DragEvent, node: TreeNode) {
-    if (!dragPaths.length) return;
     const dest = dropParentFor(node);
+    if (isFileDrag(e)) {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      if (dropDir !== dest) dropDir = dest;
+      return;
+    }
+    if (!dragPaths.length) return;
     if (badDrop(dest)) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
@@ -418,8 +434,20 @@
     const paths = dragPaths;
     dragPaths = [];
     dropDir = null;
+    if (isFileDrag(e) && e.dataTransfer) return void uploadDrop(e.dataTransfer, dest);
     if (!paths.length || badDrop(dest)) return;
     void moveEntries(paths.map((p) => ({ from: p, to: joinIn(dest, baseOf(p)) })));
+  }
+
+  function handleRootDragOver(e: DragEvent) {
+    if (isFileDrag(e)) {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      return;
+    }
+    if (!dragPaths.length) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
   }
 
   function handleRootDrop(e: DragEvent) {
@@ -427,6 +455,7 @@
     const paths = dragPaths;
     dragPaths = [];
     dropDir = null;
+    if (isFileDrag(e) && e.dataTransfer) return void uploadDrop(e.dataTransfer, folder);
     if (!paths.length) return;
     void moveEntries(
       paths
@@ -465,6 +494,22 @@
     onOpenWorkspace(path);
   }
 
+  // Double-click on blank tree space is VS Code's "new file here". Guarded on
+  // the target being the container itself, so a double-click that lands on a
+  // row (expand, rename) keeps its own behaviour. Creates at the workspace
+  // root, which is the only parent blank space can mean.
+  // Blank space and the header buttons both mean "at the top level", which the
+  // context-menu path cannot express — that one always has a row to anchor to.
+  function createAtRoot(type: EntryType) {
+    menu = null;
+    editing = { mode: 'create', parent: folder, type, name: '' };
+  }
+
+  function handleRootDblClick(e: MouseEvent) {
+    if (e.target !== treeEl) return;
+    createAtRoot('file');
+  }
+
   function showToast(msg: string) {
     toast = msg;
     clearTimeout(toastTimer);
@@ -497,7 +542,13 @@
       if (!r.ok) { showToast(d.error ?? `HTTP ${r.status}`); return; }
       if (!d.files) { showToast('Nothing to copy (binary or empty).'); return; }
       await toClipboard(d.payload);
-      showToast(`Copied ${d.files} file${d.files === 1 ? '' : 's'}${d.skipped ? ` (${d.skipped} skipped)` : ''}.`);
+      // The point of copying files as context is pasting them into a model, so
+      // the size that matters is tokens, not files or bytes.
+      const tokens = formatTokens(estimateTokens(d.payload));
+      showToast(
+        `Copied ${d.files} file${d.files === 1 ? '' : 's'} · ~${tokens} tokens` +
+          (d.skipped ? ` (${d.skipped} skipped)` : ''),
+      );
     } catch (e) {
       showToast(e instanceof Error ? e.message : String(e));
     }
@@ -556,7 +607,9 @@
   // through fetch buys both: bytes as they land, and an abort that propagates
   // to the server — it awaits every socket write, so a cancelled reader stops
   // the walk rather than leaving it zipping into the void.
-  interface DlJob {
+  // One card per transfer, download or upload alike: both want a name, a bar
+  // and a cancel button, and two stacks would fight over the same corner.
+  interface Job {
     id: number;
     name: string;
     got: number;
@@ -565,10 +618,13 @@
     est: boolean;
     state: 'active' | 'done' | 'error' | 'cancelled';
     error?: string;
-    ctl: AbortController;
+    // A download aborts a fetch and an upload aborts an XHR; the card only
+    // needs to know that something can be stopped.
+    cancel: () => void;
+    verb: string;
   }
-  let dls = $state<DlJob[]>([]);
-  let dlSeq = 0;
+  let jobs = $state<Job[]>([]);
+  let jobSeq = 0;
 
   function fmtBytes(n: number): string {
     if (n < 1024) return `${n} B`;
@@ -584,8 +640,8 @@
     return /filename="([^"]+)"/i.exec(cd)?.[1] ?? '';
   }
 
-  function dropJob(job: DlJob, after: number) {
-    setTimeout(() => { dls = dls.filter((j) => j.id !== job.id); }, after);
+  function dropJob(job: Job, after: number) {
+    setTimeout(() => { jobs = jobs.filter((j) => j.id !== job.id); }, after);
   }
 
   async function download(paths: string[]) {
@@ -593,18 +649,19 @@
     if (!paths.length) return;
     const qs = paths.map((p) => `path=${encodeURIComponent(p)}`).join('&');
     const ctl = new AbortController();
-    dls = [...dls, {
-      id: ++dlSeq,
+    jobs = [...jobs, {
+      id: ++jobSeq,
       name: paths.length === 1 ? paths[0].split('/').pop() ?? 'download' : `${paths.length} items`,
       got: 0,
       total: 0,
       est: false,
       state: 'active',
-      ctl,
+      verb: 'Saved',
+      cancel: () => ctl.abort(),
     }];
     // Mutations have to go through the state proxy the array handed back, not
     // the literal above, or the card never repaints.
-    const job = dls[dls.length - 1];
+    const job = jobs[jobs.length - 1];
     try {
       const r = await fetch(`/api/download?${qs}&base=${encodeURIComponent(folder)}`, { signal: ctl.signal });
       if (!r.ok) {
@@ -655,6 +712,122 @@
     }
   }
 
+  // --- upload ---------------------------------------------------------------
+
+  interface Picked { file: File; rel: string }
+
+  let overwriteAsk = $state<
+    { names: string[]; resolve: (v: 'overwrite' | 'skip' | null) => void } | null
+  >(null);
+
+  // Only webkitGetAsEntry can see inside a dropped folder — DataTransfer.files
+  // lists the top level and omits directories outright, so a dropped tree
+  // would otherwise arrive as nothing at all.
+  async function walkEntry(entry: FileSystemEntry, prefix: string, out: Picked[]) {
+    if (entry.isFile) {
+      const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
+      out.push({ file, rel: prefix + entry.name });
+      return;
+    }
+    if (!entry.isDirectory) return;
+    const reader = (entry as FileSystemDirectoryEntry).createReader();
+    // readEntries hands back one batch at a time and signals the end with an
+    // empty one, so a single call quietly truncates a large folder.
+    for (;;) {
+      const batch = await new Promise<FileSystemEntry[]>((res, rej) => reader.readEntries(res, rej));
+      if (!batch.length) break;
+      for (const child of batch) await walkEntry(child, `${prefix}${entry.name}/`, out);
+    }
+  }
+
+  async function uploadDrop(dt: DataTransfer, dest: string) {
+    // Both reads happen before the first await: the DataTransfer is neutered
+    // the moment the drop handler returns.
+    const entries = Array.from(dt.items ?? [])
+      .map((it) => (typeof it.webkitGetAsEntry === 'function' ? it.webkitGetAsEntry() : null))
+      .filter((x): x is FileSystemEntry => !!x);
+    const flat = Array.from(dt.files ?? []).map((file) => ({ file, rel: file.name }));
+    let picked: Picked[] = [];
+    try {
+      for (const entry of entries) await walkEntry(entry, '', picked);
+    } catch (e) {
+      showToast(`Could not read the drop: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    if (!picked.length) picked = flat;
+    await uploadFiles(dest, picked);
+  }
+
+  async function uploadFiles(dest: string, picked: Picked[]) {
+    if (!picked.length) return;
+    let queue = picked.map((p) => ({ ...p, path: joinIn(dest, p.rel) }));
+    let existing: string[] = [];
+    try {
+      const qs = queue.map((t) => `path=${encodeURIComponent(t.path)}`).join('&');
+      const r = await fetch(`/api/exists?${qs}`);
+      if (r.ok) existing = (await r.json()).existing ?? [];
+    } catch { /* a failed probe just means no prompt — the writes still answer */ }
+    if (existing.length) {
+      const answer = await new Promise<'overwrite' | 'skip' | null>((resolve) => {
+        overwriteAsk = { names: existing, resolve };
+      });
+      overwriteAsk = null;
+      if (!answer) return;
+      if (answer === 'skip') {
+        const clash = new Set(existing);
+        queue = queue.filter((t) => !clash.has(t.path));
+      }
+      if (!queue.length) { showToast('Nothing to upload — every file was already there.'); return; }
+    }
+
+    const total = queue.reduce((n, t) => n + t.file.size, 0);
+    let sent = 0;
+    let stopped = false;
+    let live: XMLHttpRequest | null = null;
+    jobs = [...jobs, {
+      id: ++jobSeq,
+      name: queue.length === 1 ? queue[0].rel : `${queue.length} files`,
+      got: 0,
+      total,
+      est: false,
+      state: 'active',
+      verb: 'Uploaded',
+      cancel: () => { stopped = true; live?.abort(); },
+    }];
+    const job = jobs[jobs.length - 1];
+    const failed: string[] = [];
+    for (const t of queue) {
+      if (stopped) break;
+      // XHR rather than fetch: only its upload object reports progress, and a
+      // bar that jumps from 0 to 100 is not a progress bar.
+      const result = await new Promise<string>((resolve) => {
+        const xhr = new XMLHttpRequest();
+        live = xhr;
+        xhr.open('POST', '/api/upload');
+        xhr.setRequestHeader('x-gmd-path', encodeURIComponent(t.path));
+        xhr.upload.onprogress = (ev) => { job.got = sent + ev.loaded; };
+        xhr.onload = () => {
+          if (xhr.status === 200) return resolve('');
+          let msg = `HTTP ${xhr.status}`;
+          try { msg = JSON.parse(xhr.responseText).error ?? msg; } catch { /* keep the status */ }
+          resolve(msg);
+        };
+        xhr.onerror = () => resolve('network error');
+        xhr.onabort = () => { stopped = true; resolve('cancelled'); };
+        xhr.send(t.file);
+      });
+      live = null;
+      sent += t.file.size;
+      job.got = sent;
+      if (result && result !== 'cancelled') failed.push(`${t.rel}: ${result}`);
+    }
+    job.state = stopped ? 'cancelled' : failed.length ? 'error' : 'done';
+    if (failed.length) job.error = failed[0];
+    dropJob(job, failed.length ? 8000 : 3000);
+    await refresh();
+    if (failed.length) showToast(`Uploaded ${queue.length - failed.length}, failed ${failed.length}: ${failed[0]}`);
+  }
+
   function terminalHere(node: { path: string; type: EntryType }) {
     menu = null;
     // Files spawn the shell in their parent folder.
@@ -703,6 +876,7 @@
       class:selected={selectionExplicit && selected.has(node.path)}
       class:active={node.path === activeRow}
       class:droptarget={dropDir === node.path}
+      class:ignored={node.ignored}
       data-path={node.path}
       style="padding-left: {8 + depth * 14}px"
       draggable="true"
@@ -743,6 +917,12 @@
 <div class="explorer">
   <div class="ehead">
     <span class="etitle">Explorer</span>
+    <button type="button" class="ebtn" title="New file" aria-label="New file" onclick={() => createAtRoot('file')}>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h4.5V13H4.5V3h4.25v3.25H12V7.5h1.5V5zM11.25 9.5v2.25H9v1.5h2.25V15.5h1.5v-2.25H15v-1.5h-2.25V9.5z" /></svg>
+    </button>
+    <button type="button" class="ebtn" title="New folder" aria-label="New folder" onclick={() => createAtRoot('dir')}>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 2.5h4.2l1.3 1.6H14.5V8H13V5.6H6.3L5 4H3v7.4h5.5v1.5h-7zM11.25 9.5v2.25H9v1.5h2.25V15.5h1.5v-2.25H15v-1.5h-2.25V9.5z" /></svg>
+    </button>
     <button
       type="button"
       class="ebtn"
@@ -772,7 +952,8 @@
   <div
     class="tree"
     bind:this={treeEl}
-    ondragover={(e) => { if (!dragPaths.length) return; e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'; }}
+    ondblclick={handleRootDblClick}
+    ondragover={handleRootDragOver}
     ondrop={handleRootDrop}
   >
     {#if rootError}
@@ -826,14 +1007,34 @@
 {#if toast}
   <div class="toast">{toast}</div>
 {/if}
-{#if dls.length}
+{#if overwriteAsk}
+  <!-- Not a native confirm(): the answer is three-way, and seeing what is
+       about to be overwritten is the whole reason for asking. -->
+  <div class="ovw-back">
+    <div class="ovw" role="dialog" aria-modal="true" aria-label="Files already exist">
+      <div class="ovw-title">
+        {overwriteAsk.names.length === 1 ? '1 file already exists' : `${overwriteAsk.names.length} files already exist`}
+      </div>
+      <ul class="ovw-list">
+        {#each overwriteAsk.names.slice(0, 8) as n (n)}<li>{n}</li>{/each}
+        {#if overwriteAsk.names.length > 8}<li class="more">…and {overwriteAsk.names.length - 8} more</li>{/if}
+      </ul>
+      <div class="ovw-btns">
+        <button type="button" onclick={() => overwriteAsk?.resolve(null)}>Cancel</button>
+        <button type="button" onclick={() => overwriteAsk?.resolve('skip')}>Skip existing</button>
+        <button type="button" class="primary" onclick={() => overwriteAsk?.resolve('overwrite')}>Overwrite</button>
+      </div>
+    </div>
+  </div>
+{/if}
+{#if jobs.length}
   <div class="dl-stack">
-    {#each dls as j (j.id)}
+    {#each jobs as j (j.id)}
       <div class="dl">
         <div class="dl-top">
           <span class="dl-name" title={j.name}>{j.name}</span>
           {#if j.state === 'active'}
-            <button type="button" class="dl-x" title="Cancel download" aria-label="Cancel download" onclick={() => j.ctl.abort()}>✕</button>
+            <button type="button" class="dl-x" title="Cancel" aria-label="Cancel transfer" onclick={() => j.cancel()}>✕</button>
           {/if}
         </div>
         <div class="dl-bar" class:indet={j.state === 'active' && !j.total}>
@@ -845,7 +1046,7 @@
         <div class="dl-sub">
           {#if j.state === 'error'}{j.error}
           {:else if j.state === 'cancelled'}Cancelled.
-          {:else if j.state === 'done'}Saved · {fmtBytes(j.got)}
+          {:else if j.state === 'done'}{j.verb} · {fmtBytes(j.got)}
           {:else}{fmtBytes(j.got)}{#if j.total}&nbsp;of {j.est ? '~' : ''}{fmtBytes(j.total)}{/if}{/if}
         </div>
       </div>
@@ -974,6 +1175,10 @@
     flex: 1 0 auto;
   }
   .name.dir { font-weight: 600; }
+  /* Same signal VS Code gives a gitignored path: dimmed, never hidden. The
+     row stays fully interactive — build output is still worth opening. */
+  .row.ignored .name { color: #6e7681; }
+  .row.ignored .icon { opacity: 0.5; }
   .loading { color: #949494; }
   .error {
     padding: 8px 12px;
@@ -1004,6 +1209,54 @@
     cursor: pointer;
   }
   .ctx-item:hover { background: #444444; }
+  .ovw-back {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 40;
+  }
+  .ovw {
+    width: 380px;
+    max-width: calc(100vw - 32px);
+    background: #272727;
+    border: 1px solid #505050;
+    border-radius: 4px;
+    padding: 12px 14px;
+    color: #c5c8c6;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    font-size: 13px;
+  }
+  .ovw-title { margin-bottom: 8px; }
+  .ovw-list {
+    max-height: 140px;
+    overflow: auto;
+    margin: 0 0 12px;
+    padding-left: 16px;
+    color: #949494;
+    font-size: 12px;
+  }
+  .ovw-list .more { list-style: none; margin-left: -16px; }
+  .ovw-btns {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .ovw-btns button {
+    background: #2d2d2d;
+    border: 1px solid #505050;
+    border-radius: 3px;
+    color: #c5c8c6;
+    padding: 4px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .ovw-btns button:hover { background: #3a3a3a; }
+  .ovw-btns button.primary { background: #0e639c; border-color: #0e639c; color: #ffffff; }
+  .ovw-btns button.primary:hover { background: #1177bb; }
+
   .dl-stack {
     position: fixed;
     right: 16px;

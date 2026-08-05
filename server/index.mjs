@@ -93,7 +93,8 @@ try {
 } catch { /* no prebuilt for this platform — fall back below */ }
 if (!rgBin && onPath('rg')) rgBin = 'rg';
 import { spawn, spawnSync } from 'node:child_process';
-import { createReadStream, closeSync, mkdirSync, openSync, statSync, promises as fs } from 'node:fs';
+import { createReadStream, createWriteStream, closeSync, mkdirSync, openSync, statSync, promises as fs } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
@@ -246,7 +247,9 @@ const MIME = {
 // --- API handlers ----------------------------------------------------------
 
 async function apiRoot(res) {
-  sendJson(res, 200, { root: ROOT, sep: path.sep });
+  // The hostname is what lets one browser tab be told apart from another when
+  // several machines are each serving a workspace of their own.
+  sendJson(res, 200, { root: ROOT, sep: path.sep, host: os.hostname() });
 }
 
 // One directory per call — the lazy-tree contract. The client fetches a
@@ -268,7 +271,24 @@ async function apiTree(res, params) {
     (a.type === 'dir' ? 0 : 1) - (b.type === 'dir' ? 0 : 1) ||
     a.name.localeCompare(b.name)
   );
+  const ignored = ignoredNames(abs, out);
+  for (const e of out) if (ignored.has(e.name)) e.ignored = true;
   sendJson(res, 200, { entries: out });
+}
+
+// One spawn per directory listing, never one per entry: the plumbing reads
+// NUL-delimited paths from stdin and echoes back only the ignored ones, so a
+// single call answers the whole level. Exit 1 (nothing matched) and 128 (not
+// a work tree) are both silent no-ops — a folder outside any repo simply has
+// nothing to dim.
+function ignoredNames(dir, entries) {
+  const set = new Set();
+  if (!entries.length) return set;
+  const input = entries.map((e) => e.name).join('\0') + '\0';
+  const r = git(['check-ignore', '--stdin', '-z'], dir, input);
+  if (r.code !== 0) return set;
+  for (const name of r.out.split('\0')) if (name) set.add(name);
+  return set;
 }
 
 // Directory listing for the workspace browser. Unlike /api/tree this speaks
@@ -376,6 +396,21 @@ async function apiContext(res, params) {
   sendJson(res, 200, { payload: `<context>\n${blocks.join('\n')}\n</context>\n`, files: blocks.length, skipped });
 }
 
+// Publishing a temp file under its real name. rename() is the atomic form and
+// stays the default, but some destinations cannot be replaced by a
+// directory-entry swap at all — a bind-mounted file, a target on another
+// filesystem — and there the destination inode has to survive the write, so
+// its bytes are overwritten in place instead.
+async function commitTemp(tmp, abs) {
+  try {
+    return await fs.rename(tmp, abs);
+  } catch (e) {
+    if (!['EBUSY', 'EPERM', 'EXDEV'].includes(e?.code)) throw e;
+  }
+  await fs.copyFile(tmp, abs);
+  await fs.rm(tmp, { force: true }).catch(() => {});
+}
+
 // Conditional write: the client sends the mtime it loaded the file at.
 // If the disk copy is newer (someone else wrote it), respond 409 with the
 // disk content so the client can show the VS Code-style conflict prompt.
@@ -407,12 +442,74 @@ async function apiFilePut(req, res) {
     if (createDirs) await fs.mkdir(path.dirname(abs), { recursive: true });
     // Atomic-ish write: temp file + rename, same dir so rename stays atomic.
     const tmp = path.join(path.dirname(abs), `.${path.basename(abs)}.gmd-tmp-${process.pid}`);
-    await fs.writeFile(tmp, content, 'utf8');
-    await fs.rename(tmp, abs);
+    try {
+      await fs.writeFile(tmp, content, 'utf8');
+      await commitTemp(tmp, abs);
+    } catch (e) {
+      // Otherwise a save that failed halfway leaves its scratch dotfile sitting
+      // beside the file the user was editing, forever.
+      await fs.rm(tmp, { force: true }).catch(() => {});
+      throw e;
+    }
     const st2 = await fs.stat(abs);
     sendJson(res, 200, { mtimeMs: st2.mtimeMs, size: st2.size });
   } catch (e) {
     sendJson(res, 500, { error: String(e.message ?? e) });
+  }
+}
+
+// --- upload (drop files into the explorer) ----------------------------------
+//   GET  /api/exists?path=<rel>&path=<rel>  → which of these are already there
+//   POST /api/upload   (x-gmd-path: <urlencoded rel>)  → body streamed to disk
+// The overwrite question is answered once, before any bytes move: a drop of
+// forty files must not mean forty prompts, and a 409 partway through means the
+// client already pushed a whole file to learn it was not wanted.
+async function apiExists(res, params) {
+  const rels = params.getAll('path').filter((p) => typeof p === 'string' && p.length);
+  const existing = [];
+  for (const rel of rels) {
+    const abs = resolveSafe(rel);
+    if (!abs) continue;
+    // Echoed back verbatim: a normalised form would not match the entries the
+    // client is holding, and it is comparing strings.
+    if (await fs.stat(abs).then(() => true, () => false)) existing.push(rel);
+  }
+  sendJson(res, 200, { existing });
+}
+
+let uploadSeq = 0;
+
+// One file per request, body straight to disk. This is the one endpoint that
+// can be handed a gigabyte, so nothing buffers it — which also means no
+// multipart parser, and the destination rides in a header instead.
+async function apiUpload(req, res) {
+  let rel;
+  try {
+    rel = decodeURIComponent(String(req.headers['x-gmd-path'] ?? ''));
+  } catch {
+    return sendJson(res, 400, { error: 'malformed x-gmd-path' });
+  }
+  if (!rel) return sendJson(res, 400, { error: 'x-gmd-path required' });
+  const abs = resolveSafe(rel);
+  if (!abs) return sendJson(res, 400, { error: 'path escapes root' });
+  const tmp = path.join(path.dirname(abs), `.${path.basename(abs)}.gmd-up-${process.pid}-${uploadSeq++}`);
+  try {
+    const st = await fs.stat(abs).catch((e) => (e.code === 'ENOENT' ? null : Promise.reject(e)));
+    if (st?.isDirectory()) return sendJson(res, 400, { error: `a folder already lives at ${rel}` });
+    // A dropped folder arrives as a flat list of nested paths, so the parents
+    // are made on the way in rather than in a round-trip per level.
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    // Temp file then rename, same directory: a half-uploaded file never
+    // appears under the name something else may already be reading.
+    await pipeline(req, createWriteStream(tmp));
+    await commitTemp(tmp, abs);
+    fileListCache.clear();
+    const st2 = await fs.stat(abs);
+    sendJson(res, 200, { path: toClientPath(abs), size: st2.size, mtimeMs: st2.mtimeMs });
+  } catch (e) {
+    // Otherwise an aborted upload leaves a dotfile in the tree nobody asked for.
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    sendJson(res, 500, { error: String(e?.message ?? e) });
   }
 }
 
@@ -996,22 +1093,75 @@ function proxyUpgrade(req, socket, head, target, url) {
 
 // --- static client ---------------------------------------------------------
 
-async function serveStatic(res, urlPath) {
+// Vite emits every asset under /assets/ with a content hash in its name, so the
+// URL changes whenever the bytes do. That is the one case where a year-long
+// immutable cache is safe — and it is what turns a reload on a slow link into
+// no transfer at all. index.html carries those hashed URLs, so it must always
+// be revalidated or a deploy would never reach an already-open tab.
+function cacheControlFor(urlPath) {
+  return urlPath.startsWith('/assets/')
+    ? 'public, max-age=31536000, immutable'
+    : 'no-cache';
+}
+
+// Only text-shaped assets have sidecars; see scripts/precompress.mjs.
+const PRECOMPRESSED = new Set(['.js', '.css', '.html', '.svg', '.json', '.map', '.txt', '.ico']);
+
+// Serve a sidecar the client admits it can decode, brotli first. Falls through
+// to the plain file when no sidecar exists, so a dist built without the
+// precompress step still serves correctly.
+async function encodedVariant(abs, accept) {
+  if (!PRECOMPRESSED.has(path.extname(abs))) return null;
+  for (const [enc, suffix] of [['br', '.br'], ['gzip', '.gz']]) {
+    if (!accept.includes(enc)) continue;
+    try {
+      const st = await fs.stat(abs + suffix);
+      return { file: abs + suffix, enc, size: st.size };
+    } catch { /* no sidecar for this one */ }
+  }
+  return null;
+}
+
+async function serveStatic(req, res, urlPath) {
   let rel = urlPath === '/' ? '/index.html' : urlPath;
   const abs = path.resolve(DIST, '.' + rel);
   if (!abs.startsWith(DIST)) {
     res.writeHead(400);
     return res.end('bad path');
   }
+  const accept = String(req.headers['accept-encoding'] ?? '');
   try {
+    const st = await fs.stat(abs);
+    // Tagged from the ORIGINAL's size and mtime, never the sidecar's: the two
+    // are interchangeable representations, and tagging them apart would make a
+    // client that switches encodings refetch for nothing.
+    const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+    const headers = {
+      'content-type': MIME[path.extname(abs)] ?? 'application/octet-stream',
+      'cache-control': cacheControlFor(urlPath),
+      etag,
+      // A shared cache keyed on URL alone would hand a brotli body to a client
+      // that never asked for one.
+      vary: 'accept-encoding',
+    };
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, headers);
+      return res.end();
+    }
+    const variant = await encodedVariant(abs, accept);
+    if (variant) {
+      const buf = await fs.readFile(variant.file);
+      res.writeHead(200, { ...headers, 'content-encoding': variant.enc, 'content-length': String(buf.length) });
+      return res.end(buf);
+    }
     const buf = await fs.readFile(abs);
-    res.writeHead(200, { 'content-type': MIME[path.extname(abs)] ?? 'application/octet-stream' });
+    res.writeHead(200, { ...headers, 'content-length': String(buf.length) });
     res.end(buf);
   } catch {
     // SPA fallback → index.html; if the dist doesn't exist at all, hint dev flow.
     try {
       const buf = await fs.readFile(path.join(DIST, 'index.html'));
-      res.writeHead(200, { 'content-type': MIME['.html'] });
+      res.writeHead(200, { 'content-type': MIME['.html'], 'cache-control': 'no-cache' });
       res.end(buf);
     } catch {
       res.writeHead(503, { 'content-type': 'text/plain' });
@@ -1039,7 +1189,10 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/browse' && req.method === 'GET') return await apiBrowse(res, url.searchParams);
     if (url.pathname === '/api/file' && req.method === 'GET') return await apiFileGet(res, url.searchParams);
     if (url.pathname === '/api/file' && req.method === 'PUT') return await apiFilePut(req, res);
+    if (url.pathname === '/api/exists' && req.method === 'GET') return await apiExists(res, url.searchParams);
+    if (url.pathname === '/api/upload' && req.method === 'POST') return await apiUpload(req, res);
     if (url.pathname === '/api/search' && req.method === 'GET') return apiSearch(req, res, url.searchParams);
+    if (url.pathname === '/api/defs' && req.method === 'GET') return apiDefs(req, res, url.searchParams);
     if (url.pathname === '/api/context' && req.method === 'GET') return await apiContext(res, url.searchParams);
     if (url.pathname === '/api/download' && req.method === 'GET') return await apiDownload(res, url.searchParams);
     if (url.pathname === '/api/git/repos' && req.method === 'GET') return await apiGitRepos(res, url.searchParams);
@@ -1048,6 +1201,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/diff/compare' && req.method === 'POST') return await apiDiffCompare(req, res);
     if (url.pathname === '/api/diff/apply' && req.method === 'POST') return await apiDiffApply(req, res);
     if (url.pathname === '/api/git/refs' && req.method === 'GET') return await apiGitRefs(res, url.searchParams);
+    if (url.pathname === '/api/git/log' && req.method === 'GET') return await apiGitLog(res, url.searchParams);
+    if (url.pathname === '/api/git/commit' && req.method === 'GET') return await apiGitCommit(res, url.searchParams);
     if (url.pathname === '/api/git/compare' && req.method === 'GET') return await apiGitCompare(res, url.searchParams);
     if (url.pathname === '/api/git/show' && req.method === 'GET') return await apiGitShow(res, url.searchParams);
     if (url.pathname === '/api/git/blame' && req.method === 'GET') return await apiGitBlame(res, url.searchParams);
@@ -1088,7 +1243,7 @@ const server = http.createServer(async (req, res) => {
       }
       return proxyHttp(req, res, px, url);
     }
-    return await serveStatic(res, url.pathname);
+    return await serveStatic(req, res, url.pathname);
   } catch (e) {
     sendJson(res, 500, { error: String(e?.message ?? e) });
   }
@@ -1124,6 +1279,89 @@ function charCols(text, subs) {
     buf.subarray(0, s.start).toString('utf8').length,
     buf.subarray(0, s.end).toString('utf8').length,
   ]);
+}
+
+// Go-to-definition without a language server. Ask ripgrep for the lines that
+// look like a declaration of one identifier: keyword-led (`function foo`,
+// `class Foo`, `def foo`), a Go method with a receiver, an assigned function
+// expression, or a method signature opening a block. Call sites are
+// deliberately excluded — "every mention of this word" is what the search panel
+// already answers, and mixing the two makes the jump land somewhere useless.
+const DEFS_CAP = 50;
+
+function definitionPattern(name) {
+  const id = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return [
+    `(?:^|[^\\w$.])(?:function|class|interface|type|enum|struct|impl|trait|module|namespace|def|fn|func|const|let|var|sub|proc)\\s+${id}\\b`,
+    `^\\s*func\\s+\\([^)]*\\)\\s*${id}\\b`,
+    `(?:^|[^\\w$.])${id}\\s*[:=]\\s*(?:async\\s+)?(?:function\\b|\\()`,
+    `^\\s*(?:(?:public|private|protected|static|async|export|readonly)\\s+)*${id}\\s*\\([^)]*\\)\\s*(?::[^{;]*)?\\{\\s*$`,
+  ].join('|');
+}
+
+// Buffered rather than streamed like /api/search: the cap is 50 lines, and the
+// caller is a click that has to decide between jumping and showing a list.
+function apiDefs(req, res, params) {
+  const name = params.get('name') ?? '';
+  // Anything that is not a bare identifier came from a mis-click, and would be
+  // spliced straight into a regex below.
+  if (!/^[A-Za-z_$][\w$]{0,127}$/.test(name)) return sendJson(res, 400, { error: 'not an identifier' });
+  const dir = resolveSafe(params.get('path') ?? '.');
+  if (dir === null) return sendJson(res, 400, { error: 'path escapes root' });
+
+  const rg = spawn(rgBin || 'rg', [
+    '--json',
+    '--no-messages',
+    '--case-sensitive',
+    '--max-filesize', '2M',
+    // A declaration repeated four times in one file is a re-export or an
+    // overload set; more of the same file crowds out other candidates.
+    '--max-count', '4',
+    '--max-columns', '400',
+    '-e', definitionPattern(name),
+    '--', dir || '.',
+  ], { cwd: ROOT });
+
+  const hits = [];
+  let truncated = false;
+  let tail = '';
+  let sent = false;
+  const finish = (payload) => {
+    if (sent) return;
+    sent = true;
+    sendJson(res, 200, payload);
+  };
+
+  rg.on('error', (e) => finish({
+    hits: [],
+    error: e.code === 'ENOENT' ? 'ripgrep (rg) not found on PATH' : String(e.message ?? e),
+  }));
+
+  rg.stdout.on('data', (chunk) => {
+    tail += chunk;
+    const lines = tail.split('\n');
+    tail = lines.pop() ?? '';
+    for (const l of lines) {
+      if (!l) continue;
+      let o;
+      try { o = JSON.parse(l); } catch { continue; }
+      if (o.type !== 'match') continue;
+      hits.push({
+        path: toClientPath(rgText(o.data.path)),
+        line: o.data.line_number ?? 1,
+        text: rgText(o.data.lines).replace(/\r?\n$/, '').slice(0, 400),
+      });
+      if (hits.length >= DEFS_CAP) {
+        truncated = true;
+        rg.kill('SIGKILL');
+        return;
+      }
+    }
+  });
+
+  rg.on('close', () => finish({ hits, truncated }));
+  // A click can be abandoned by closing the tab mid-scan.
+  req.on('close', () => { if (!sent) rg.kill('SIGKILL'); });
 }
 
 function apiSearch(req, res, params) {
@@ -1224,6 +1462,8 @@ function apiSearch(req, res, params) {
 //   POST /api/diff/compare         {leftPath, rightPath|rightText} → same hunks
 //   POST /api/diff/apply           apply one compare hunk onto either side
 //   GET  /api/git/refs?repo=       branch/tag names for the compare picker
+//   GET  /api/git/log?repo=&limit=  commit DAG across all refs, for the graph
+//   GET  /api/git/commit?repo=&sha= one commit's metadata + changed files
 //   GET  /api/git/compare?repo=&base=&mode=   changed files vs a base ref
 //   GET  /api/git/show?path=&stage=|&ref=     one file's committed content
 //   GET  /api/git/blame?path=                 who last touched each line
@@ -1487,18 +1727,138 @@ function resolveRef(repoAbs, ref) {
   return r.code === 0 ? r.out.trim() : null;
 }
 
+// The commit DAG, flat. Parents come back as shas rather than a nested shape
+// because the lane layout on the client walks the list top-down anyway, and a
+// tree would have to be flattened again to draw it.
+//
+// `--topo-order` rather than date order: a graph whose edges cross backwards in
+// time is unreadable, and commit dates are attacker- and rebase-controlled
+// anyway. `--all` so branches nobody has checked out still show up.
+async function apiGitLog(res, params) {
+  const abs = resolveSafe(params.get('repo') ?? '.');
+  if (!abs) return sendJson(res, 400, { error: 'repo escapes root' });
+  const asked = Number(params.get('limit') ?? 400);
+  const limit = Math.min(2000, Math.max(1, Number.isFinite(asked) ? asked : 400));
+  const SEP = '\x1f';
+  const r = git(
+    [
+      'log',
+      '--all',
+      '--topo-order',
+      `--max-count=${limit}`,
+      '--date=short',
+      `--format=%H${SEP}%P${SEP}%an${SEP}%ad${SEP}%D${SEP}%s`,
+    ],
+    abs,
+  );
+  // An empty repository is not an error — it is a graph with nothing in it.
+  if (r.code !== 0) {
+    // "No commits yet" and "this is not a repository" look identical through
+    // git log's exit code, and telling a user their history is empty when they
+    // are simply pointed at the wrong folder sends them looking for the wrong
+    // problem.
+    if (git(['rev-parse', '--git-dir'], abs).code !== 0) {
+      return sendJson(res, 400, { error: 'not a git repository' });
+    }
+    const empty = git(['rev-parse', '--verify', '-q', 'HEAD'], abs).code !== 0;
+    if (!empty) return sendJson(res, 500, { error: r.err || 'git log failed' });
+    return sendJson(res, 200, { commits: [], head: '', truncated: false });
+  }
+  const commits = [];
+  for (const line of r.out.split('\n')) {
+    if (!line) continue;
+    const [sha, parents, author, date, refs, subject] = line.split(SEP);
+    commits.push({
+      sha,
+      parents: parents ? parents.split(' ').filter(Boolean) : [],
+      author,
+      date,
+      // `%D` is "HEAD -> main, origin/main, tag: v1" — split here so the client
+      // renders badges instead of re-parsing a display string.
+      refs: refs ? refs.split(', ').filter(Boolean) : [],
+      subject,
+    });
+  }
+  const head = git(['rev-parse', 'HEAD'], abs);
+  return sendJson(res, 200, {
+    commits,
+    head: head.code === 0 ? head.out.trim() : '',
+    truncated: commits.length === limit,
+  });
+}
+
+// One commit in full: the message body plus what it touched. Two spawns rather
+// than one because a name-status listing and a formatted header cannot share a
+// single --format without the client having to find the boundary between them.
+async function apiGitCommit(res, params) {
+  const abs = resolveSafe(params.get('repo') ?? '.');
+  if (!abs) return sendJson(res, 400, { error: 'repo escapes root' });
+  const sha = String(params.get('sha') ?? '').trim();
+  // Anchored hex only: this string reaches a git argv, so a leading dash or a
+  // rev-expression must never survive validation.
+  if (!/^[0-9a-f]{4,40}$/i.test(sha)) return sendJson(res, 400, { error: 'bad sha' });
+  const SEP = '\x1f';
+  const meta = git(['show', '-s', '--date=iso', `--format=%H${SEP}%an${SEP}%ae${SEP}%ad${SEP}%P${SEP}%s${SEP}%b`, sha], abs);
+  if (meta.code !== 0) return sendJson(res, 500, { error: meta.err || 'git show failed' });
+  const [full, author, email, date, parents, subject, body] = meta.out.split(SEP);
+  // --first-parent keeps a merge commit from listing every file on the branch
+  // it absorbed; what a merge "changed" is what it changed relative to trunk.
+  const ns = git(['show', '--name-status', '--first-parent', '--format=', sha], abs);
+  const files = [];
+  for (const line of ns.out.split('\n')) {
+    if (!line) continue;
+    const parts = line.split('\t');
+    if (parts.length < 2) continue;
+    // Renames arrive as "R096\told\tnew" — the path that matters is the last.
+    files.push({
+      status: parts[0][0],
+      path: parts[parts.length - 1],
+      from: parts.length > 2 ? parts[1] : undefined,
+    });
+  }
+  return sendJson(res, 200, {
+    sha: full,
+    author,
+    email,
+    date,
+    parents: parents ? parents.split(' ').filter(Boolean) : [],
+    subject,
+    body: (body ?? '').trim(),
+    files,
+  });
+}
+
 async function apiGitRefs(res, params) {
   const abs = resolveSafe(params.get('repo') ?? '.');
   if (!abs) return sendJson(res, 400, { error: 'repo escapes root' });
+  // One spawn, six NUL-separated fields per ref: the picker wants the same
+  // subtitle a log view would show — who moved it, when, and what its tip says.
+  const FIELDS = ['refname:short', 'refname', 'objectname:short', 'authorname', 'committerdate:relative', 'contents:subject'];
   const r = git(
-    ['for-each-ref', '--sort=-committerdate', '--format=%(refname:short)', 'refs/heads', 'refs/remotes', 'refs/tags'],
+    [
+      'for-each-ref',
+      '--sort=-committerdate',
+      `--format=${FIELDS.map((f) => `%(${f})`).join('%00')}`,
+      'refs/heads',
+      'refs/remotes',
+      'refs/tags',
+    ],
     abs,
   );
   if (r.code !== 0) return sendJson(res, 500, { error: r.err || 'git for-each-ref failed' });
-  // `origin` alone is origin/HEAD's short name — an alias, not a pickable ref.
-  const refs = r.out.split('\n').filter((n) => n && n !== 'origin');
+  const details = [];
+  for (const line of r.out.split('\n')) {
+    if (!line) continue;
+    const [name, full, sha, author, when, subject] = line.split('\0');
+    // `origin` alone is origin/HEAD's short name — an alias, not a pickable ref.
+    if (!name || name === 'origin') continue;
+    const kind = full.startsWith('refs/heads/') ? 'local' : full.startsWith('refs/tags/') ? 'tag' : 'remote';
+    details.push({ name, kind, sha, author, when, subject });
+  }
+  // Kept beside `details` because the compare picker wants nothing but names.
+  const refs = details.map((d) => d.name);
   const head = git(['rev-parse', '--abbrev-ref', 'HEAD'], abs);
-  return sendJson(res, 200, { refs, head: head.code === 0 ? head.out.trim() : '' });
+  return sendJson(res, 200, { refs, details, head: head.code === 0 ? head.out.trim() : '' });
 }
 
 async function apiGitCompare(res, params) {
@@ -1776,6 +2136,45 @@ async function apiGitDiff(res, params) {
 // goes through, which means the output lands in parseDiff unchanged and the
 // browser renders it with the component it already has. --no-index exits 1
 // whenever the inputs differ, so the exit code is not an error signal.
+// Resolve the two sides of a compare down to real files. A side that exists
+// only in the browser — an unsaved buffer, pasted text — has nothing for git to
+// read, so it is given a file for the length of the request. Both sides can be
+// in memory at once (a scratch buffer against the clipboard), which is why the
+// temporary names are prefixed rather than borrowed wholesale.
+async function compareSides(body) {
+  const leftMem = typeof body.leftText === 'string';
+  const rightMem = typeof body.rightText === 'string';
+  let leftAbs = null;
+  let rightAbs = null;
+  if (!leftMem) {
+    leftAbs = resolveSafe(body.leftPath);
+    if (!leftAbs) return { error: 'left path escapes root' };
+  }
+  if (!rightMem) {
+    rightAbs = resolveSafe(body.rightPath);
+    if (!rightAbs) return { error: 'right path escapes root' };
+  }
+  let dir = null;
+  if (leftMem || rightMem) {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gmd-cmp-'));
+    // Both columns keep the basename of whichever side is a real file, so that
+    // anything keying off the extension treats them as the same kind of
+    // document. With neither side on disk there is nothing to borrow.
+    const name = path.basename(leftAbs ?? rightAbs ?? 'compared.txt');
+    if (leftMem) {
+      leftAbs = path.join(dir, `a-${name}`);
+      await fs.writeFile(leftAbs, body.leftText, 'utf8');
+    }
+    if (rightMem) {
+      rightAbs = path.join(dir, `b-${name}`);
+      await fs.writeFile(rightAbs, body.rightText, 'utf8');
+    }
+  }
+  // git needs a working directory that exists; with the left side in memory,
+  // the temporary one is the only directory guaranteed to.
+  return { leftAbs, rightAbs, dir, cwd: leftMem ? dir : path.dirname(leftAbs) };
+}
+
 async function apiDiffCompare(req, res) {
   let body;
   try {
@@ -1783,38 +2182,25 @@ async function apiDiffCompare(req, res) {
   } catch {
     return sendJson(res, 400, { error: 'invalid JSON body' });
   }
-  const leftAbs = resolveSafe(body.leftPath);
-  if (!leftAbs) return sendJson(res, 400, { error: 'left path escapes root' });
-
-  let rightAbs;
-  let tmpDir = null;
-  if (typeof body.rightText === 'string') {
-    // Pasted text exists nowhere on disk, so give it a file for the length of
-    // one diff. It borrows the left side's basename so any tooling keying off
-    // the extension treats both columns as the same kind of document.
-    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gmd-cmp-'));
-    rightAbs = path.join(tmpDir, path.basename(leftAbs));
-    await fs.writeFile(rightAbs, body.rightText, 'utf8');
-  } else {
-    rightAbs = resolveSafe(body.rightPath);
-    if (!rightAbs) return sendJson(res, 400, { error: 'right path escapes root' });
-  }
+  const s = await compareSides(body);
+  if (s.error) return sendJson(res, 400, { error: s.error });
+  const subject = body.leftPath ?? body.rightPath ?? '';
 
   try {
     const d = git(
-      ['diff', '--no-index', '--no-color', '--no-ext-diff', '-U3', '--', leftAbs, rightAbs],
-      path.dirname(leftAbs),
+      ['diff', '--no-index', '--no-color', '--no-ext-diff', '-U3', '--', s.leftAbs, s.rightAbs],
+      s.cwd,
     );
     if (d.code === -1) return sendJson(res, 500, { error: d.err });
     if (/^Binary files /m.test(d.out) || /^GIT binary patch/m.test(d.out)) {
-      return sendJson(res, 200, { path: body.leftPath, binary: true, hunks: [] });
+      return sendJson(res, 200, { path: subject, binary: true, hunks: [] });
     }
     if (d.out.length > 2 * 1024 * 1024) {
-      return sendJson(res, 200, { path: body.leftPath, tooBig: true, hunks: [] });
+      return sendJson(res, 200, { path: subject, tooBig: true, hunks: [] });
     }
-    return sendJson(res, 200, { path: body.leftPath, hunks: parseDiff(d.out) });
+    return sendJson(res, 200, { path: subject, hunks: parseDiff(d.out) });
   } finally {
-    if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    if (s.dir) await fs.rm(s.dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -1830,27 +2216,19 @@ async function apiDiffApply(req, res) {
   } catch {
     return sendJson(res, 400, { error: 'invalid JSON body' });
   }
-  const leftAbs = resolveSafe(body.leftPath);
-  if (!leftAbs) return sendJson(res, 400, { error: 'left path escapes root' });
+  const s = await compareSides(body);
+  if (s.error) return sendJson(res, 400, { error: s.error });
   const target = body.target === 'right' ? 'right' : 'left';
 
-  let rightAbs;
-  let tmpDir = null;
-  if (typeof body.rightText === 'string') {
-    // Pasted text has no file on disk to write back to.
-    if (target === 'right') return sendJson(res, 400, { error: 'pasted text has no file to apply to' });
-    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gmd-cmp-'));
-    rightAbs = path.join(tmpDir, path.basename(leftAbs));
-    await fs.writeFile(rightAbs, body.rightText, 'utf8');
-  } else {
-    rightAbs = resolveSafe(body.rightPath);
-    if (!rightAbs) return sendJson(res, 400, { error: 'right path escapes root' });
-  }
-
   try {
+    // A side held in the browser has no file behind it to rewrite. The editor
+    // owns that text and applies the change to itself instead.
+    if (typeof (target === 'right' ? body.rightText : body.leftText) === 'string') {
+      return sendJson(res, 400, { error: 'that side is not a file on disk' });
+    }
     const d = git(
-      ['diff', '--no-index', '--no-color', '--no-ext-diff', '-U3', '--', leftAbs, rightAbs],
-      path.dirname(leftAbs),
+      ['diff', '--no-index', '--no-color', '--no-ext-diff', '-U3', '--', s.leftAbs, s.rightAbs],
+      s.cwd,
     );
     if (d.code === -1) return sendJson(res, 500, { error: d.err });
     const hunks = parseDiff(d.out);
@@ -1868,7 +2246,7 @@ async function apiDiffApply(req, res) {
     // forward apply and making the RIGHT file match the left is a reverse one.
     // buildPatch's demotion rules key off the same flag, so the patch is built
     // against whichever side it will be matched with.
-    const targetAbs = target === 'right' ? rightAbs : leftAbs;
+    const targetAbs = target === 'right' ? s.rightAbs : s.leftAbs;
     const reverse = target === 'right';
     const patch = buildPatch(path.basename(targetAbs), hunk, sel, reverse);
     const args = ['apply', '--unidiff-zero', '--whitespace=nowarn'];
@@ -1881,7 +2259,7 @@ async function apiDiffApply(req, res) {
       ? sendJson(res, 200, { ok: true })
       : sendJson(res, 409, { error: r.err || 'patch does not apply — refresh' });
   } finally {
-    if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    if (s.dir) await fs.rm(s.dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -1898,6 +2276,31 @@ async function apiGitAction(req, res) {
   const fail = (r) => sendJson(res, 400, { error: r.err || `git exited ${r.code}` });
 
   switch (body.op) {
+    case 'checkout': {
+      const ref = String(body.ref ?? '').trim();
+      if (!ref) return sendJson(res, 400, { error: 'no ref' });
+      // Checking out `origin/foo` verbatim detaches HEAD, which is almost never
+      // what picking a remote branch is meant to do. Create the local tracking
+      // branch instead — unless one already exists under that name.
+      const m = /^([^/]+)\/(.+)$/.exec(ref);
+      const isRemote = !!m && git(['rev-parse', '--verify', '-q', `refs/remotes/${ref}`], abs).code === 0;
+      const localExists = !!m && git(['rev-parse', '--verify', '-q', `refs/heads/${m[2]}`], abs).code === 0;
+      const r = git(isRemote && !localExists ? ['checkout', '-b', m[2], '--track', ref] : ['checkout', ref], abs);
+      return r.code === 0 ? sendJson(res, 200, { ok: true }) : fail(r);
+    }
+    case 'branch': {
+      const name = String(body.name ?? '').trim();
+      if (!name) return sendJson(res, 400, { error: 'no branch name' });
+      const from = String(body.from ?? '').trim();
+      const r = git(from ? ['checkout', '-b', name, from] : ['checkout', '-b', name], abs);
+      return r.code === 0 ? sendJson(res, 200, { ok: true }) : fail(r);
+    }
+    case 'detach': {
+      const ref = String(body.ref ?? '').trim();
+      if (!ref) return sendJson(res, 400, { error: 'no ref' });
+      const r = git(['checkout', '--detach', ref], abs);
+      return r.code === 0 ? sendJson(res, 200, { ok: true }) : fail(r);
+    }
     case 'stage': {
       if (!paths.length) return sendJson(res, 400, { error: 'no paths' });
       const r = git(['add', '-A', '--', ...paths], abs);
@@ -1997,7 +2400,7 @@ async function apiGitAction(req, res) {
 //   DELETE /api/terminals?id=x  → {ok:true}  kill the process
 // Data plane (WS): /api/pty?id=<id>, JSON envelopes both ways:
 //   client → server: {t:'d', d:string} stdin, {t:'r', cols, rows} resize
-//   server → client: {t:'d', d:string} output, {t:'x', code} shell exited,
+//   server → client: {t:'d', d:string} output, {t:'x', code, signal} shell exited,
 //                    {t:'open', kind, path, reuse} — `code-gh` asking the tab
 //                    that owns this shell to open something
 
@@ -2068,6 +2471,16 @@ function createSession(cwd) {
       PATH: `${BIN_DIR}${path.delimiter}${process.env.PATH ?? ''}`,
       GMD_TERM_ID: id,
       GMD_PORT: String(port),
+      // The shim curls the API back, so it needs a dialable address. A
+      // wildcard bind is not one and collapses to loopback; any other bind
+      // (a tailnet address, say) is exactly what has to be dialed, because
+      // loopback may not be listening at all.
+      GMD_HOST: host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host,
+      // A login shell inherits the parent's locale, and a daemon started
+      // outside any session often has none — which is what makes vim draw
+      // its box drawing as `~` and mangle multibyte input.
+      LANG: process.env.LANG || process.env.LC_ALL || 'en_US.UTF-8',
+      COLORTERM: process.env.COLORTERM || 'truecolor',
       ...(auth ? { GMD_TOKEN: auth } : {}),
     },
   });
@@ -2075,6 +2488,7 @@ function createSession(cwd) {
     id,
     // "Open new terminal here" labels the tab with the folder it starts in.
     title: cwd && cwd !== ROOT ? `${path.basename(shell)} — ${path.basename(cwd)}` : path.basename(shell),
+    cwd: cwd ?? ROOT,
     pty: p,
     pid: p.pid,
     buf: '',
@@ -2085,11 +2499,15 @@ function createSession(cwd) {
     const frame = JSON.stringify({ t: 'd', d });
     for (const ws of s.sockets) if (ws.readyState === ws.OPEN) ws.send(frame);
   });
-  p.onExit(({ exitCode }) => {
+  p.onExit(({ exitCode, signal }) => {
     // Shell exited (or was killed) → the session is gone, exactly like a VS
     // Code terminal tab closing itself. Attached clients drop the tab.
     sessions.delete(s.id);
-    const frame = JSON.stringify({ t: 'x', code: exitCode ?? 0 });
+    // The signal rides along because without it a killed shell is
+    // indistinguishable from `exit 0` on the wire: node-pty reports exitCode 0
+    // for a SIGKILL, and the client decides whether to close the tab or keep
+    // it around with the reason on screen.
+    const frame = JSON.stringify({ t: 'x', code: exitCode ?? 0, signal: signal ?? 0 });
     for (const ws of s.sockets) {
       if (ws.readyState === ws.OPEN) {
         ws.send(frame);
@@ -2103,7 +2521,12 @@ function createSession(cwd) {
 }
 
 function sessionInfo(s) {
-  return { id: s.id, title: s.title, pid: s.pid };
+  // The working directory is what lets a client group sessions by workspace.
+  // Reported the same way the `folder` query parameter is written — relative
+  // to the served root, or absolute when the shell sits outside it.
+  const abs = s.cwd ?? ROOT;
+  const rel = abs === ROOT ? '' : path.relative(ROOT, abs);
+  return { id: s.id, title: s.title, pid: s.pid, cwd: rel.startsWith('..') ? abs : rel };
 }
 
 // Kill the shell AND everything it started. Two passes, because one is not

@@ -1,8 +1,9 @@
 <script lang="ts">
+  import { fileIconUrl } from '../../lib/file-icons';
   // Workspace search, VS Code layout, backed by the streamed /api/search
   // ripgrep endpoint. Results are rendered as they arrive rather than after
   // the scan completes — the reason the endpoint streams at all.
-  let { onOpen }: { onOpen: (path: string, line: number) => void } = $props();
+  let { onOpen, folder = '' }: { onOpen: (path: string, line: number) => void; folder?: string } = $props();
 
   type Hit = { line: number; text: string; cols: [number, number][] };
   type FileHits = { path: string; hits: Hit[] };
@@ -68,6 +69,10 @@
     running = true;
 
     const params = new URLSearchParams({ q });
+    // Scope the scan to the anchored workspace. The endpoint already accepts
+    // `path` and hands it to ripgrep positionally; without it a window opened
+    // on one folder still searched the entire served root.
+    if (folder) params.set('path', folder);
     if (matchCase) params.set('case', '1');
     if (wholeWord) params.set('word', '1');
     if (useRegex) params.set('regex', '1');
@@ -155,6 +160,32 @@
     const i = p.lastIndexOf('/');
     return i === -1 ? '' : p.slice(0, i);
   };
+
+  const TREE_KEY = 'ghmd.searchTree';
+  let asTree = $state((typeof localStorage !== 'undefined' ? localStorage.getItem(TREE_KEY) : null) !== '0');
+  function setTree(on: boolean) {
+    asTree = on;
+    try { localStorage.setItem(TREE_KEY, on ? '1' : '0'); } catch { /* private mode */ }
+  }
+  let foldedDirs = $state<Record<string, boolean>>({});
+
+  // Grouped by containing folder, not nested one node per path segment — the
+  // same call VS Code makes. A match ten levels deep then costs one row of
+  // chrome instead of ten, and folders with no hits never appear at all.
+  const groups = $derived.by(() => {
+    const by = new Map<string, FileHits[]>();
+    for (const f of files) {
+      const d = dirOf(f.path);
+      const g = by.get(d);
+      if (g) g.push(f);
+      else by.set(d, [f]);
+    }
+    return [...by].map(([dir, items]) => ({
+      dir,
+      items,
+      hits: items.reduce((n, f) => n + f.hits.length, 0),
+    }));
+  });
 </script>
 
 <div class="spanel">
@@ -187,18 +218,25 @@
     <input class="sglob" bind:value={include} placeholder="files to include" spellcheck="false" autocomplete="off" />
   </div>
 
+  {#if files.length}
+    <div class="sviewbar">
+      <button type="button" class:on={asTree} title="Group results by folder" onclick={() => setTree(true)}>Tree</button>
+      <button type="button" class:on={!asTree} title="Flat list of files" onclick={() => setTree(false)}>List</button>
+    </div>
+  {/if}
   <div class="sresults">
     {#if error}
       <div class="smsg err">{error}</div>
     {:else if query.trim() && !running && files.length === 0}
       <div class="smsg">No results</div>
     {/if}
-    {#each files as f (f.path)}
+    {#snippet fileGroup(f: FileHits, showDir: boolean)}
       <div class="sfile">
         <button type="button" class="sfile-head" onclick={() => (collapsed[f.path] = !collapsed[f.path])}>
           <svg class="chev" class:open={!collapsed[f.path]} viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5z" /></svg>
+          <img class="sicon" alt="" aria-hidden="true" src={fileIconUrl(baseOf(f.path))} />
           <span class="sfile-name">{baseOf(f.path)}</span>
-          <span class="sfile-dir">{dirOf(f.path)}</span>
+          {#if showDir}<span class="sfile-dir">{dirOf(f.path)}</span>{/if}
           <span class="sfile-count">{f.hits.length}</span>
         </button>
         {#if !collapsed[f.path]}
@@ -214,7 +252,25 @@
           </ul>
         {/if}
       </div>
-    {/each}
+    {/snippet}
+    {#if asTree}
+      {#each groups as g (g.dir)}
+        <div class="sdir">
+          <button type="button" class="sfile-head sdir-head" onclick={() => (foldedDirs[g.dir] = !foldedDirs[g.dir])}>
+            <svg class="chev" class:open={!foldedDirs[g.dir]} viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5z" /></svg>
+            <span class="sfile-name">{g.dir || '‹root›'}</span>
+            <span class="sfile-count">{g.hits}</span>
+          </button>
+          {#if !foldedDirs[g.dir]}
+            <div class="sdir-body">
+              {#each g.items as f (f.path)}{@render fileGroup(f, false)}{/each}
+            </div>
+          {/if}
+        </div>
+      {/each}
+    {:else}
+      {#each files as f (f.path)}{@render fileGroup(f, true)}{/each}
+    {/if}
     {#if truncated}
       <div class="smsg">result cap reached — narrow the query</div>
     {/if}
@@ -333,6 +389,12 @@
     cursor: pointer;
   }
   .sfile-head:hover { background: #272727; }
+  /* Same seat and size as the explorer's, so a result reads as the same file. */
+  .sicon {
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+  }
   .chev {
     flex: 0 0 auto;
     width: 12px;
@@ -407,5 +469,50 @@
     background: #3655b566;
     color: inherit;
     border-radius: 2px;
+  }
+  .sviewbar {
+    display: flex;
+    gap: 2px;
+    padding: 2px 8px 4px;
+    border-bottom: 1px solid #404040;
+  }
+  .sviewbar button {
+    border: 1px solid #505050;
+    border-radius: 3px;
+    background: #2d2d2d;
+    color: #949494;
+    font-size: 10px;
+    padding: 1px 7px;
+    cursor: pointer;
+  }
+  .sviewbar button.on {
+    background: #353535;
+    color: #c5c8c6;
+    border-color: #e58520;
+  }
+  .sdir-head { color: #8a8a8a; }
+  .sdir-body { padding-left: 12px; }
+  /* Rows size to their own content and are only FLOORED at the panel width,
+     so a long match extends the scroll region instead of being cut with an
+     ellipsis — the thing that made a hit in minified or deeply indented code
+     unreadable. Every clip below has to be lifted for that to work: an
+     ellipsis anywhere inside leaves the scroller nothing to reveal. */
+  .sresults { overflow-x: auto; }
+  .sfile-head,
+  .shit {
+    width: max-content;
+    min-width: 100%;
+  }
+  .sfile-name { max-width: none; }
+  .sfile-dir {
+    flex: 0 0 auto;
+    direction: ltr;
+    overflow: visible;
+    text-overflow: clip;
+  }
+  .shit-text {
+    flex: 0 0 auto;
+    overflow: visible;
+    text-overflow: clip;
   }
 </style>

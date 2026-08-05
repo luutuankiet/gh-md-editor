@@ -197,7 +197,7 @@ publish_ext() {
   [ -f "$vsix" ] || die "$vsix not found. Run './scripts/ship.sh build ext' first."
 
   if [ -z "${VSCE_PAT:-}" ] && command -v az >/dev/null 2>&1 && az account show >/dev/null 2>&1; then
-    azflag="--azure-credentials"
+    azflag="--azure-credential"
     info "no VSCE_PAT, but the Azure CLI is signed in - publishing as that identity"
   fi
 

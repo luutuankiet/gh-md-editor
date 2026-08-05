@@ -2085,6 +2085,25 @@ async function apiGitStatus(res, params) {
     if (f.x !== ' ' && f.x !== '?') staged.push({ path: f.path, status: f.x, orig: f.orig });
     if (f.y !== ' ') changes.push({ path: f.path, status: f.y, untracked: false });
   }
+  // A merge in progress is invisible in porcelain output — it lives in the
+  // control files git leaves in the git directory. --git-path is asked rather
+  // than assuming .git/, so a worktree or a submodule answers correctly.
+  const gitPath = (name) => {
+    const r = git(['rev-parse', '--git-path', name], abs);
+    const rel = r.code === 0 ? r.out.trim() : '';
+    return rel ? path.resolve(abs, rel) : null;
+  };
+  const mergeHead = gitPath('MERGE_HEAD');
+  const merging = mergeHead ? await fs.stat(mergeHead).then(() => true, () => false) : false;
+  let mergeMessage = '';
+  if (merging) {
+    const msgPath = gitPath('MERGE_MSG');
+    // The message git would have opened an editor with, which is exactly the
+    // default the commit box should offer. Its trailing comment block is the
+    // conflict advice, not part of the message.
+    const raw = msgPath ? await fs.readFile(msgPath, 'utf8').catch(() => '') : '';
+    mergeMessage = raw.split('\n').filter((l) => !l.startsWith('#')).join('\n').trim();
+  }
   return sendJson(res, 200, {
     repo: repoRel,
     branch: s.branch,
@@ -2095,6 +2114,8 @@ async function apiGitStatus(res, params) {
     staged,
     changes,
     conflicts,
+    merging,
+    mergeMessage,
   });
 }
 

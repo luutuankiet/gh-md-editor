@@ -1,6 +1,9 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import type { EditorView } from '@codemirror/view';
   import CodeTab from './CodeTab.svelte';
+  import MergePane from './MergePane.svelte';
+  import type { PaneAction } from './MergePane.svelte';
 
   let { repo, path }: { repo: string; path: string } = $props();
 
@@ -38,6 +41,17 @@
   let root = $state<HTMLDivElement | null>(null);
   let revealSeq = 0;
   let reveal = $state<{ line: number; seq: number } | null>(null);
+
+  // One switch for all four panes. Its own storage key: the code editor's
+  // Alt+Z setting is per-editor and this view overrides it for its own panes,
+  // which would otherwise mean toggling wrap in four places.
+  const WRAP_KEY = 'ghmd.mergeWrap';
+  let wrap = $state(false);
+  try { wrap = localStorage.getItem(WRAP_KEY) === 'on'; } catch { /* noop */ }
+  function setWrap(on: boolean) {
+    wrap = on;
+    try { localStorage.setItem(WRAP_KEY, on ? 'on' : 'off'); } catch { /* noop */ }
+  }
 
   const dirty = $derived(result !== saved);
   const leaf = $derived(path.slice(path.lastIndexOf('/') + 1));
@@ -140,6 +154,15 @@
   const conflicts = $derived(parseConflicts(result));
   const active = $derived(conflicts[current] ?? null);
 
+  // Tints every conflict still in the buffer, brightest on the selected one,
+  // so the result reads as a list of outstanding work rather than as a wall of
+  // angle brackets.
+  const marks = $derived(conflicts.map((c, i) => ({
+    from: c.start,
+    to: c.end,
+    cls: i === current ? 'cm-conflictBlockActive' : 'cm-conflictBlock',
+  })));
+
   // Resolving the last conflict must not leave the counter pointing past the
   // end. `current` is written but never tracked here — tracking it would make
   // the effect reschedule itself.
@@ -179,18 +202,6 @@
     };
   });
 
-  // Both panes and the result editor follow the selected conflict, so moving
-  // through them never means hunting for the matching region by eye.
-  $effect(() => {
-    void current;
-    void spans;
-    const r = root;
-    if (!r) return;
-    queueMicrotask(() => {
-      for (const el of r.querySelectorAll('.hit')) el.scrollIntoView({ block: 'center' });
-    });
-  });
-
   function go(delta: number) {
     if (!conflicts.length) return;
     current = (current + delta + conflicts.length) % conflicts.length;
@@ -207,15 +218,98 @@
 
   // An ordinary edit to the buffer, which is what makes every accept undoable
   // with the editor's own history and saved by the same button as a hand edit.
-  function accept(pick: 'ours' | 'theirs' | 'both' | 'base') {
+  type Pick = 'ours' | 'theirs' | 'both' | 'both-theirs' | 'base';
+
+  function replacement(c: Conflict, pick: Pick): string {
+    if (pick === 'ours') return c.ours;
+    if (pick === 'theirs') return c.theirs;
+    if (pick === 'both') return c.ours + c.theirs;
+    if (pick === 'both-theirs') return c.theirs + c.ours;
+    return c.base ?? '';
+  }
+
+  function accept(pick: Pick) {
     const c = active;
     if (!c) return;
-    const text =
-      pick === 'ours' ? c.ours :
-      pick === 'theirs' ? c.theirs :
-      pick === 'both' ? c.ours + c.theirs :
-      (c.base ?? '');
-    result = result.slice(0, c.start) + text + result.slice(c.end);
+    result = result.slice(0, c.start) + replacement(c, pick) + result.slice(c.end);
+  }
+
+  // Back to front so that each splice leaves the offsets of the conflicts
+  // still to come untouched.
+  function acceptAll(pick: Pick) {
+    const cs = conflicts;
+    if (!cs.length) return;
+    let next = result;
+    for (let i = cs.length - 1; i >= 0; i--) {
+      const c = cs[i];
+      next = next.slice(0, c.start) + replacement(c, pick) + next.slice(c.end);
+    }
+    result = next;
+    current = 0;
+  }
+
+  // Accepting neither side means the region goes back to what both branches
+  // started from, which is only knowable when the markers carry an ancestor
+  // section — that is, when the file was written in the diff3 conflict style.
+  const canIgnore = $derived(active?.base !== null && active?.base !== undefined);
+  const IGNORE_TITLE = 'Take neither change: restore this region to the common ancestor';
+  const IGNORE_BLOCKED = 'Needs the diff3 conflict style — these markers carry no common ancestor to restore';
+
+  const currentActions = $derived.by<PaneAction[]>(() => (active ? [
+    { label: 'Accept Current', title: 'Replace this conflict with the version from this branch', run: () => accept('ours') },
+    { label: 'Accept Combination (Current First)', title: 'Keep both versions, this branch first', run: () => accept('both') },
+    { label: 'Ignore', title: canIgnore ? IGNORE_TITLE : IGNORE_BLOCKED, run: () => accept('base'), disabled: !canIgnore },
+  ] : []));
+
+  const incomingActions = $derived.by<PaneAction[]>(() => (active ? [
+    { label: 'Accept Incoming', title: 'Replace this conflict with the version being merged in', run: () => accept('theirs') },
+    { label: 'Accept Combination (Incoming First)', title: 'Keep both versions, incoming first', run: () => accept('both-theirs') },
+    { label: 'Ignore', title: canIgnore ? IGNORE_TITLE : IGNORE_BLOCKED, run: () => accept('base'), disabled: !canIgnore },
+  ] : []));
+
+  const baseActions = $derived.by<PaneAction[]>(() => (active?.base ? [
+    { label: 'Accept Base', title: 'Replace this conflict with the common ancestor, discarding both changes', run: () => accept('base') },
+  ] : []));
+
+  // Lockstep scrolling across the reference panes and the result. The three
+  // sides are different lengths, so this matches by fraction rather than by
+  // line: exact alignment is not on offer, but keeping four panes roughly in
+  // the same neighbourhood is most of the value.
+  const paneViews = new Map<string, EditorView>();
+  let syncing = false;
+
+  // Keyed by slot rather than collected in a set: a side can unmount on its
+  // own when it turns out not to exist in that version, and a set would have
+  // to guess which entry that was.
+  function registerPane(v: EditorView | null, slot: 'ours' | 'base' | 'theirs') {
+    if (v) paneViews.set(slot, v);
+    else paneViews.delete(slot);
+  }
+
+  function resultScroller(): HTMLElement | null {
+    return root?.querySelector('.result-editor .cm-scroller') ?? null;
+  }
+
+  function mirror(el: HTMLElement, frac: number, left: number) {
+    const span = el.scrollHeight - el.clientHeight;
+    el.scrollTop = span > 0 ? frac * span : 0;
+    el.scrollLeft = left;
+  }
+
+  function syncFrom(src: EditorView) {
+    if (syncing) return;
+    syncing = true;
+    const s = src.scrollDOM;
+    const span = s.scrollHeight - s.clientHeight;
+    const frac = span > 0 ? s.scrollTop / span : 0;
+    for (const v of paneViews.values()) {
+      if (v !== src) mirror(v.scrollDOM, frac, s.scrollLeft);
+    }
+    const rs = resultScroller();
+    if (rs) mirror(rs, frac, s.scrollLeft);
+    // Released on the next frame: the mirrored writes fire their own scroll
+    // events, and without the guard the panes would drive each other forever.
+    requestAnimationFrame(() => { syncing = false; });
   }
 
   async function save(): Promise<boolean> {
@@ -258,7 +352,7 @@
       });
       const d = await r.json();
       if (!r.ok) { error = d.error ?? `HTTP ${r.status}`; return; }
-      notice = 'Marked resolved and staged.';
+      notice = 'Resolved and staged. Finish the merge from the Source Control panel.';
       window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -268,19 +362,25 @@
   }
 </script>
 
-{#snippet pane(title: string, label: string, text: string | null, span: [number, number] | null, pick: 'ours' | 'theirs' | 'base' | null)}
+{#snippet pane(title: string, label: string, text: string | null, span: [number, number] | null, actions: PaneAction[], slot: 'ours' | 'base' | 'theirs')}
   <div class="pane">
     <div class="pane-head">
       <span class="pane-title">{title}</span>
       <span class="pane-label" title={label}>{label}</span>
-      {#if pick}
-        <button type="button" class="btn" disabled={!active} onclick={() => accept(pick)} title="Replace the selected conflict with this version">Accept</button>
-      {/if}
     </div>
     {#if text === null}
       <div class="pane-empty">not present in this version</div>
     {:else}
-      <pre class="pane-body">{#if span}{text.slice(0, span[0])}<mark class="hit">{text.slice(span[0], span[1])}</mark>{text.slice(span[1])}{:else}{text}{/if}</pre>
+      <MergePane
+        {text}
+        filename={leaf}
+        {span}
+        {wrap}
+        {actions}
+        reveal={current}
+        onview={(v) => registerPane(v, slot)}
+        onscroll={syncFrom}
+      />
     {/if}
   </div>
 {/snippet}
@@ -292,13 +392,15 @@
       <span class="counter">Conflict {current + 1} of {conflicts.length}</span>
       <button type="button" class="btn" onclick={() => go(-1)} title="Previous conflict">↑</button>
       <button type="button" class="btn" onclick={() => go(1)} title="Next conflict">↓</button>
-      <button type="button" class="btn" onclick={() => accept('both')} title="Keep both versions, current first">Accept both</button>
+      <button type="button" class="btn" onclick={() => acceptAll('ours')} title="Resolve every remaining conflict with this branch's version">All current</button>
+      <button type="button" class="btn" onclick={() => acceptAll('theirs')} title="Resolve every remaining conflict with the incoming version">All incoming</button>
     {:else if !loading}
       <span class="counter clean">No conflicts remain</span>
     {/if}
     <span class="spacer"></span>
+    <button type="button" class="btn" class:on={wrap} onclick={() => setWrap(!wrap)} title="Word wrap in every pane">Wrap</button>
     <button type="button" class="btn" disabled={busy || !dirty} onclick={() => void save()}>{dirty ? 'Save' : 'Saved'}</button>
-    <button type="button" class="btn primary" disabled={busy} onclick={() => void complete()} title="Save and stage, which is what clears the conflict in git">Mark resolved</button>
+    <button type="button" class="btn primary" disabled={busy} onclick={() => void complete()} title="Save and stage, which is what clears the conflict in git">Complete Merge</button>
   </div>
   {#if error}<div class="banner err">{error}</div>{/if}
   {#if notice}<div class="banner">{notice}</div>{/if}
@@ -306,14 +408,14 @@
     <div class="banner">Loading…</div>
   {:else}
     <div class="panes">
-      {@render pane('Current', active?.oursLabel ?? 'in this branch', ours, spans.ours, 'ours')}
+      {@render pane('Current', active?.oursLabel ?? 'in this branch', ours, spans.ours, currentActions, 'ours')}
       <!-- The ancestor is always shown — seeing what the line started as is
            most of why this view exists — but it can only be accepted when the
            markers carry an ancestor section to accept, which is to say when
            the file was written in the diff3 conflict style. Offering the
            button otherwise would splice in nothing and read as a delete. -->
-      {@render pane('Base', 'common ancestor', base, spans.base, active?.base ? 'base' : null)}
-      {@render pane('Incoming', active?.theirsLabel ?? 'being merged in', theirs, spans.theirs, 'theirs')}
+      {@render pane('Base', 'common ancestor', base, spans.base, baseActions, 'base')}
+      {@render pane('Incoming', active?.theirsLabel ?? 'being merged in', theirs, spans.theirs, incomingActions, 'theirs')}
     </div>
     <div class="result">
       <div class="pane-head">
@@ -321,7 +423,7 @@
         <span class="pane-label">working copy — edit freely</span>
       </div>
       <div class="result-editor">
-        <CodeTab bind:value={result} filename={leaf} gitPath="" {reveal} />
+        <CodeTab bind:value={result} filename={leaf} gitPath="" {reveal} {wrap} {marks} />
       </div>
     </div>
   {/if}
@@ -363,6 +465,7 @@
   .btn:hover:not(:disabled) { background: #3a3a3a; }
   .btn:disabled { opacity: 0.5; cursor: default; }
   .btn.primary { border-color: #e58520; }
+  .btn.on { border-color: #e58520; color: #e58520; }
   .banner {
     flex: 0 0 auto;
     padding: 3px 8px;
@@ -403,25 +506,10 @@
     white-space: nowrap;
     color: #949494;
   }
-  .pane-body {
-    flex: 1 1 0;
-    min-height: 0;
-    margin: 0;
-    padding: 4px 6px;
-    overflow: auto;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12px;
-    line-height: 1.4;
-  }
   .pane-empty {
     flex: 1 1 0;
     padding: 8px;
     color: #949494;
-  }
-  .hit {
-    background: rgba(229, 133, 32, 0.22);
-    color: inherit;
-    outline: 1px solid rgba(229, 133, 32, 0.6);
   }
   .result {
     flex: 1 1 0;

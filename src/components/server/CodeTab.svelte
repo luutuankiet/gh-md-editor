@@ -411,7 +411,7 @@
     );
   }
 
-  let { value = $bindable(''), filename, gitPath = '', reveal = null }: {
+  let { value = $bindable(''), filename, gitPath = '', reveal = null, wrap = null, marks = [] }: {
     value?: string;
     filename: string;
     // Workspace-relative path, empty for an unsaved buffer. Used only to ask
@@ -423,6 +423,13 @@
     // `select` carries a range to highlight instead of just placing the cursor,
     // which is how an outline double-click selects a whole declaration.
     reveal?: { line: number; seq: number; select?: { from: number; to: number } } | null;
+    // Host-driven word wrap. The merge view owns one wrap switch for all four
+    // of its panes, so a non-null value here wins over this editor's own
+    // Alt/Opt+Z setting; null leaves the local toggle in charge.
+    wrap?: boolean | null;
+    // Regions the host wants tinted — conflict blocks, in the merge view.
+    // Purely decorative: nothing here changes the document.
+    marks?: { from: number; to: number; cls: string }[];
   } = $props();
 
   let host: HTMLDivElement;
@@ -715,6 +722,7 @@
   const languageCompartment = new Compartment();
   const themeCompartment = new Compartment();
   const wrapCompartment = new Compartment();
+  const markCompartment = new Compartment();
 
   // Word wrap: off by default for code (VS Code parity, and the point of the
   // horizontal scrollbar), toggled with Alt/Opt+Z. Its own storage key — the
@@ -922,6 +930,7 @@
         changePeeks,
         changePeekDecorations,
         wrapCompartment.of(wrapEnabled ? EditorView.lineWrapping : []),
+        markCompartment.of([]),
         languageCompartment.of([]),
         themeCompartment.of(untrack(() => isDark) ? darkBundle : lightBundle),
         // After the theme compartment on purpose: the syntax bundles ship their
@@ -937,6 +946,13 @@
             backgroundColor: 'rgba(248, 81, 73, 0.25)',
             outline: '1px solid rgba(248, 81, 73, 0.9)',
             borderRadius: '2px',
+          },
+          // Host-supplied marks. Faint for every conflict still in the buffer,
+          // stronger for the one the merge toolbar is pointing at.
+          '.cm-conflictBlock': { backgroundColor: 'rgba(229, 133, 32, 0.09)' },
+          '.cm-conflictBlockActive': {
+            backgroundColor: 'rgba(229, 133, 32, 0.2)',
+            outline: '1px solid rgba(229, 133, 32, 0.5)',
           },
         }),
         // Alt/Opt+Z toggles wrap. Firefox on macOS delivers `Ω` as event.key
@@ -1327,6 +1343,31 @@
     void gitPath;
     if (!untrack(() => view)) return;
     untrack(() => { void loadBlame(); });
+  });
+
+  $effect(() => {
+    const w = wrap;
+    const v = view;
+    if (w === null || w === undefined || !v) return;
+    wrapEnabled = w;
+    v.dispatch({ effects: wrapCompartment.reconfigure(w ? EditorView.lineWrapping : []) });
+  });
+
+  $effect(() => {
+    const ms = marks;
+    const v = view;
+    if (!v) return;
+    const doc = v.state.doc;
+    const ranges = [];
+    for (const m of ms) {
+      // Clamped: the host recomputes marks from its own copy of the text, so
+      // a mark can briefly describe a document that has already shrunk.
+      const from = Math.min(Math.max(0, m.from), doc.length);
+      const to = Math.min(Math.max(from, m.to), doc.length);
+      if (to <= from) continue;
+      ranges.push(Decoration.mark({ class: m.cls }).range(from, to));
+    }
+    v.dispatch({ effects: markCompartment.reconfigure(EditorView.decorations.of(RangeSet.of(ranges, true))) });
   });
 
   $effect(() => {

@@ -18,6 +18,7 @@
   import { html as htmlLang } from '@codemirror/lang-html';
   import { css as cssLang } from '@codemirror/lang-css';
   import { editorThemeExtensions } from '../lib/editor-theme';
+  import { wrapPref } from '../lib/wrap-pref.svelte';
   import type { EffectiveTheme, ThemeChoice } from '../lib/theme';
   import ThemeToggle from './ThemeToggle.svelte';
 
@@ -82,16 +83,27 @@
   const themeCompartment = new Compartment();
 
   const wrapCompartment = new Compartment();
-  let wrapEnabled = true;
-  try { wrapEnabled = localStorage.getItem('gmd:wrap') !== 'off'; } catch { /* noop */ }
+
+  // Word wrap is one app-wide preference, so Alt+Z here also settles the code
+  // editor, the diff panes, the merge view and the search results. `applied` is
+  // what this editor last reconfigured to, so the effect below can tell an echo
+  // of our own toggle from a change made on one of those other surfaces.
+  let appliedWrap = wrapPref.on;
 
   function toggleWrap(vw: EditorView) {
-    wrapEnabled = !wrapEnabled;
-    try { localStorage.setItem('gmd:wrap', wrapEnabled ? 'on' : 'off'); } catch { /* noop */ }
+    wrapPref.toggle();
+    appliedWrap = wrapPref.on;
     vw.dispatch({
-      effects: wrapCompartment.reconfigure(wrapEnabled ? EditorView.lineWrapping : []),
+      effects: wrapCompartment.reconfigure(appliedWrap ? EditorView.lineWrapping : []),
     });
   }
+
+  $effect(() => {
+    const on = wrapPref.on;
+    if (!localView || on === appliedWrap) return;
+    appliedWrap = on;
+    localView.dispatch({ effects: wrapCompartment.reconfigure(on ? EditorView.lineWrapping : []) });
+  });
 
   // v0.6.6: editor-pane-only font size (Cmd+= / Cmd+- / Cmd+0) via Compartment-
   // reconfigure of EditorView.theme. Persists across reloads. Preview pane is
@@ -374,7 +386,7 @@
         // defaultHighlightStyle fallback (covers fenced-code nested grammars
         // that emit tags our markdown style doesn't claim) plus editor chrome.
         themeCompartment.of(editorThemeExtensions(effectiveTheme)),
-        wrapCompartment.of(wrapEnabled ? EditorView.lineWrapping : []),
+        wrapCompartment.of(untrack(() => wrapPref.on) ? EditorView.lineWrapping : []),
         fontSizeCompartment.of(makeFontSizeTheme(currentFontSize)),
         markdownLang({ base: markdownLanguage, addKeymap: true, codeLanguages: MARKDOWN_CODE_LANGS }),
         markdownAutoPair,

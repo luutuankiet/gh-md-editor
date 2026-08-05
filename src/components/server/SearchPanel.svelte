@@ -1,5 +1,6 @@
 <script lang="ts">
   import { fileIconUrl } from '../../lib/file-icons';
+  import { wrapPref } from '../../lib/wrap-pref.svelte';
   // Workspace search, VS Code layout, backed by the streamed /api/search
   // ripgrep endpoint. Results are rendered as they arrive rather than after
   // the scan completes — the reason the endpoint streams at all.
@@ -224,7 +225,7 @@
       <button type="button" class:on={!asTree} title="Flat list of files" onclick={() => setTree(false)}>List</button>
     </div>
   {/if}
-  <div class="sresults">
+  <div class="sresults" class:wrapon={wrapPref.on}>
     {#if error}
       <div class="smsg err">{error}</div>
     {:else if query.trim() && !running && files.length === 0}
@@ -514,5 +515,22 @@
     flex: 0 0 auto;
     overflow: visible;
     text-overflow: clip;
+  }
+
+  /* Wrap on: give up that horizontal scroller and let a long hit take as many
+     rows as it needs. Every max-content width above has to come back to 100%
+     first — leave one in place and the row keeps sizing to its longest line,
+     so there is nothing for the wrap to happen inside. */
+  .sresults.wrapon { overflow-x: hidden; }
+  .sresults.wrapon .sfile-head,
+  .sresults.wrapon .shit {
+    width: 100%;
+    min-width: 0;
+  }
+  .sresults.wrapon .shit-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 </style>

@@ -34,6 +34,7 @@
   import { LANGS, describeFor } from '../../lib/lang-detect';
   import { expandSelection, shrinkSelection, resetSelectionHistory } from '../../lib/expand-selection';
   import { formatDocumentText } from '../../lib/format-doc';
+  import { wrapPref } from '../../lib/wrap-pref.svelte';
 
 
   // --- inline change gutter ---------------------------------------------------
@@ -411,7 +412,7 @@
     );
   }
 
-  let { value = $bindable(''), filename, gitPath = '', reveal = null, wrap = null, marks = [] }: {
+  let { value = $bindable(''), filename, gitPath = '', reveal = null, marks = [] }: {
     value?: string;
     filename: string;
     // Workspace-relative path, empty for an unsaved buffer. Used only to ask
@@ -423,10 +424,6 @@
     // `select` carries a range to highlight instead of just placing the cursor,
     // which is how an outline double-click selects a whole declaration.
     reveal?: { line: number; seq: number; select?: { from: number; to: number } } | null;
-    // Host-driven word wrap. The merge view owns one wrap switch for all four
-    // of its panes, so a non-null value here wins over this editor's own
-    // Alt/Opt+Z setting; null leaves the local toggle in charge.
-    wrap?: boolean | null;
     // Regions the host wants tinted — conflict blocks, in the merge view.
     // Purely decorative: nothing here changes the document.
     marks?: { from: number; to: number; cls: string }[];
@@ -724,17 +721,16 @@
   const wrapCompartment = new Compartment();
   const markCompartment = new Compartment();
 
-  // Word wrap: off by default for code (VS Code parity, and the point of the
-  // horizontal scrollbar), toggled with Alt/Opt+Z. Its own storage key — the
-  // markdown cockpit owns `gmd:wrap` and wants the opposite default.
-  const WRAP_KEY = 'ghmd.codeWrap';
-  let wrapEnabled = false;
-  try { wrapEnabled = localStorage.getItem(WRAP_KEY) === 'on'; } catch { /* noop */ }
+  // Word wrap follows one app-wide preference. Alt/Opt+Z here also settles the
+  // markdown editor, the diff panes, the merge view and the search results, and
+  // the choice survives a reload. `applied` is what this editor last
+  // reconfigured to, so the effect below ignores the echo of our own toggle.
+  let appliedWrap = wrapPref.on;
 
   function toggleWrap(vw: EditorView) {
-    wrapEnabled = !wrapEnabled;
-    try { localStorage.setItem(WRAP_KEY, wrapEnabled ? 'on' : 'off'); } catch { /* noop */ }
-    vw.dispatch({ effects: wrapCompartment.reconfigure(wrapEnabled ? EditorView.lineWrapping : []) });
+    wrapPref.toggle();
+    appliedWrap = wrapPref.on;
+    vw.dispatch({ effects: wrapCompartment.reconfigure(appliedWrap ? EditorView.lineWrapping : []) });
   }
 
   const PLAIN = 'plain text';
@@ -929,7 +925,7 @@
         diffCompartment.of([]),
         changePeeks,
         changePeekDecorations,
-        wrapCompartment.of(wrapEnabled ? EditorView.lineWrapping : []),
+        wrapCompartment.of(untrack(() => wrapPref.on) ? EditorView.lineWrapping : []),
         markCompartment.of([]),
         languageCompartment.of([]),
         themeCompartment.of(untrack(() => isDark) ? darkBundle : lightBundle),
@@ -1346,10 +1342,10 @@
   });
 
   $effect(() => {
-    const w = wrap;
+    const w = wrapPref.on;
     const v = view;
-    if (w === null || w === undefined || !v) return;
-    wrapEnabled = w;
+    if (!v || w === appliedWrap) return;
+    appliedWrap = w;
     v.dispatch({ effects: wrapCompartment.reconfigure(w ? EditorView.lineWrapping : []) });
   });
 

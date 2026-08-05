@@ -33,6 +33,7 @@
   import { grammarFor } from '../../lib/lang-detect';
   import { monokaiCodeBundle } from '../../lib/monokai-dimmed';
   import { scopeForFilename, highlightToLines, type Tok } from '../../lib/diff-highlight';
+  import { wrapPref } from '../../lib/wrap-pref.svelte';
 
   interface DiffLine { t: '+' | '-' | ' ' | '\\'; n: number | null; o: number | null; text: string }
   interface Hunk { oldStart: number; oldLines: number; newStart: number; newLines: number; section: string; lines: DiffLine[] }
@@ -99,17 +100,20 @@
     try { localStorage.setItem(DIFFVIEW_KEY, v); } catch { /* private mode */ }
   }
 
-  const DIFFWRAP_KEY = 'ghmd.diffWrap';
-  let wrap = $state((typeof localStorage !== 'undefined' ? localStorage.getItem(DIFFWRAP_KEY) : null) === '1');
-  function setWrap(on: boolean) {
-    wrap = on;
-    try { localStorage.setItem(DIFFWRAP_KEY, on ? '1' : '0'); } catch { /* private mode */ }
-    // A full rebuild rather than a compartment reconfigure: the merge view
-    // measures chunk heights when its field is installed, so changing what a
-    // line occupies underneath it leaves the two sides aligned to stale rows.
+  // Wrap is app-wide, so the patch columns below and the CodeMirror panes agree
+  // with the editor tabs without a second switch to find.
+  const wrap = $derived(wrapPref.on);
+  // A full rebuild rather than a compartment reconfigure: the merge view
+  // measures chunk heights when its field is installed, so changing what a line
+  // occupies underneath it leaves the two sides aligned to stale rows.
+  let builtWrap = wrapPref.on;
+  $effect(() => {
+    const on = wrapPref.on;
+    if (on === builtWrap) return;
+    builtWrap = on;
     pendingScroll = scroller()?.scrollTop ?? null;
     docsVersion++;
-  }
+  });
 
   interface SplitCell { line: DiffLine; idx: number }
   interface SplitRow { left: SplitCell | null; right: SplitCell | null }
@@ -708,7 +712,7 @@
       <span class="pill">read-only</span>
     {/if}
     <span class="viewtoggle">
-      <button type="button" class:on={wrap} title="Word wrap both panes" onclick={() => setWrap(!wrap)}>Wrap</button>
+      <button type="button" class:on={wrap} title="Word wrap — one setting for every editor, diff and search result" onclick={() => wrapPref.toggle()}>Wrap</button>
     </span>
     <span class="viewtoggle">
       <button type="button" class:on={shownView === 'split'} disabled={cmBlocked} onclick={() => setView('split')}>Split</button>

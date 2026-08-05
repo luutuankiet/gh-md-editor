@@ -4,6 +4,7 @@
   import CodeTab from './CodeTab.svelte';
   import MergePane from './MergePane.svelte';
   import type { PaneAction } from './MergePane.svelte';
+  import { wrapPref } from '../../lib/wrap-pref.svelte';
 
   let { repo, path }: { repo: string; path: string } = $props();
 
@@ -42,16 +43,9 @@
   let revealSeq = 0;
   let reveal = $state<{ line: number; seq: number } | null>(null);
 
-  // One switch for all four panes. Its own storage key: the code editor's
-  // Alt+Z setting is per-editor and this view overrides it for its own panes,
-  // which would otherwise mean toggling wrap in four places.
-  const WRAP_KEY = 'ghmd.mergeWrap';
-  let wrap = $state(false);
-  try { wrap = localStorage.getItem(WRAP_KEY) === 'on'; } catch { /* noop */ }
-  function setWrap(on: boolean) {
-    wrap = on;
-    try { localStorage.setItem(WRAP_KEY, on ? 'on' : 'off'); } catch { /* noop */ }
-  }
+  // One switch for all four panes here — and for every other text surface in
+  // the app, which is the whole point of it living outside this component.
+  const wrap = $derived(wrapPref.on);
 
   const dirty = $derived(result !== saved);
   const leaf = $derived(path.slice(path.lastIndexOf('/') + 1));
@@ -398,7 +392,7 @@
       <span class="counter clean">No conflicts remain</span>
     {/if}
     <span class="spacer"></span>
-    <button type="button" class="btn" class:on={wrap} onclick={() => setWrap(!wrap)} title="Word wrap in every pane">Wrap</button>
+    <button type="button" class="btn" class:on={wrap} onclick={() => wrapPref.toggle()} title="Word wrap — one setting for every pane, editor, diff and search result">Wrap</button>
     <button type="button" class="btn" disabled={busy || !dirty} onclick={() => void save()}>{dirty ? 'Save' : 'Saved'}</button>
     <button type="button" class="btn primary" disabled={busy} onclick={() => void complete()} title="Save and stage, which is what clears the conflict in git">Complete Merge</button>
   </div>
@@ -423,7 +417,7 @@
         <span class="pane-label">working copy — edit freely</span>
       </div>
       <div class="result-editor">
-        <CodeTab bind:value={result} filename={leaf} gitPath="" {reveal} {wrap} {marks} />
+        <CodeTab bind:value={result} filename={leaf} gitPath="" {reveal} {marks} />
       </div>
     </div>
   {/if}

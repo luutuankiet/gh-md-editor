@@ -19,16 +19,32 @@ export const cloakState = StateField.define<CloakState>({
   create: () => ({ on: false, revealed: new Set<number>() }),
   update(value, tr) {
     let next = value;
+    let touched = false;
     for (const e of tr.effects) {
       // Re-cloaking forgets every reveal: leaving them remembered would mean a
       // file that looks protected while three lines are still readable.
-      if (e.is(setCloak)) next = { on: e.value, revealed: new Set<number>() };
+      if (e.is(setCloak)) { next = { on: e.value, revealed: new Set<number>() }; touched = true; }
       else if (e.is(revealCloakLine)) {
         const revealed = new Set(next.revealed);
         if (revealed.has(e.value)) revealed.delete(e.value);
         else revealed.add(e.value);
         next = { on: next.on, revealed };
+        touched = true;
       }
+    }
+
+    // A reveal lasts exactly as long as the cursor stays on the line it
+    // uncovered. Without this the file quietly accumulates readable lines: one
+    // click each, none of them ever covered again until the whole file is
+    // toggled. Skipped on the transaction that did the revealing, whose
+    // selection is the one being moved onto the line.
+    if (!touched && next.revealed.size && (tr.selection || tr.docChanged)) {
+      const live = new Set<number>();
+      for (const r of tr.state.selection.ranges) {
+        const n = tr.state.doc.lineAt(r.head).number;
+        if (next.revealed.has(n)) live.add(n);
+      }
+      if (live.size !== next.revealed.size) next = { on: next.on, revealed: live };
     }
     return next;
   },
@@ -56,7 +72,14 @@ class CloakWidget extends WidgetType {
     span.addEventListener('mousedown', (e) => {
       e.preventDefault();
       const pos = view.posAtDOM(span);
-      view.dispatch({ effects: revealCloakLine.of(view.state.doc.lineAt(pos).number) });
+      // The reveal is anchored to the cursor, so the click has to place one —
+      // otherwise the value would uncover under a cursor parked on some other
+      // line and vanish again on the very next keystroke.
+      view.dispatch({
+        effects: revealCloakLine.of(view.state.doc.lineAt(pos).number),
+        selection: { anchor: pos },
+      });
+      view.focus();
     });
     return span;
   }
@@ -121,10 +144,11 @@ export const dotenvCloak = [
         this.decorations = build(view);
       }
       update(u: ViewUpdate) {
-        const toggled = u.transactions.some((t) =>
-          t.effects.some((e) => e.is(setCloak) || e.is(revealCloakLine)),
-        );
-        if (u.docChanged || u.viewportChanged || toggled) this.decorations = build(u.view);
+        // The field allocates a new value only when the cloak really changed, so
+        // identity is the whole test — it catches the toggle, a click, and a
+        // reveal expiring because the cursor walked off its line.
+        const moved = u.startState.field(cloakState, false) !== u.state.field(cloakState, false);
+        if (u.docChanged || u.viewportChanged || moved) this.decorations = build(u.view);
       }
     },
     { decorations: (v) => v.decorations },

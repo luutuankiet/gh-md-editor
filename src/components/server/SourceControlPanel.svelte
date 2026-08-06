@@ -541,8 +541,7 @@
     padding: 2px 10px;
     cursor: pointer;
     white-space: nowrap;
-    width: max-content;
-    min-width: 100%;
+    width: 100%;
     box-sizing: border-box;
   }
   .filerow:hover { background: rgba(110, 118, 129, 0.12); }
@@ -554,12 +553,15 @@
     background: #353535;
     pointer-events: none;
   }
-  /* Grow to keep the badge on the right edge of short rows, but never shrink:
-     a long name widens the row and the list scrolls sideways to it. The old
-     `direction: rtl` went with the ellipsis — it clipped from the left, at the
-     cost of rendering a leading dot at the wrong end (`.env` as `env.`). */
+  /* The status letter is what the row exists to report, so it holds its place
+     and the name gives way — the trade every git sidebar makes. Widening the
+     row instead pushed the letter past the right edge, where only a sideways
+     scroll found it. Clipped names are recovered from the row's title. */
   .fname {
-    flex: 1 0 auto;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
     text-align: left;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
     font-size: 11.5px;
@@ -567,6 +569,7 @@
   .actions { display: none; gap: 2px; }
   .filerow:hover .actions { display: flex; }
   .badge {
+    flex: 0 0 12px;
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
     font-weight: 700;
     font-size: 11px;

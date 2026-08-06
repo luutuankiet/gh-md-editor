@@ -691,6 +691,29 @@
     });
   });
 
+  // Which file groups are folded shut. A peek over a busy symbol opens with a
+  // dozen files in it, and the first question is usually "which files", not
+  // "which lines" — folding is how that view is reached without scrolling past
+  // the hits to find out.
+  let peekFolded = $state<string[]>([]);
+
+  const peekAllFolded = $derived(peekGroups.length > 0 && peekFolded.length >= peekGroups.length);
+
+  function toggleGroup(p: string) {
+    peekFolded = peekFolded.includes(p) ? peekFolded.filter((x) => x !== p) : [...peekFolded, p];
+  }
+
+  function toggleAllGroups() {
+    peekFolded = peekAllFolded ? [] : peekGroups.map((g) => g.path);
+  }
+
+  // Arrow keys walk what is on screen. A hit inside a folded group is not on
+  // screen, so stepping into it would move the preview to a location the list
+  // is no longer showing.
+  function visibleHits(): number[] {
+    return peekGroups.filter((g) => !peekFolded.includes(g.path)).flatMap((g) => g.hits.map((h) => h.i));
+  }
+
   function closePeek() {
     peek = null;
     view?.focus();
@@ -702,6 +725,7 @@
 
   async function openPeek(name: string) {
     if (!gitPath) return;
+    peekFolded = [];
     peek = { name, loading: true, hits: [], truncated: false, sel: 0, preview: null };
     try {
       const r = await fetch(
@@ -772,10 +796,25 @@
       return;
     }
     if (e.key === 'Enter') { e.preventDefault(); peekOpen(p.sel); return; }
+    // Left folds the group holding the selection, right unfolds it — the same
+    // pair every tree in this app answers to.
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      const g = peekGroups.find((x) => x.hits.some((h) => h.i === p.sel));
+      if (!g) return;
+      e.preventDefault();
+      const folded = peekFolded.includes(g.path);
+      if (e.key === 'ArrowLeft' ? !folded : folded) toggleGroup(g.path);
+      return;
+    }
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
     e.preventDefault();
-    const n = p.hits.length;
-    if (n) void loadPreview((p.sel + (e.key === 'ArrowDown' ? 1 : n - 1)) % n);
+    const vis = visibleHits();
+    if (!vis.length) return;
+    const at = vis.indexOf(p.sel);
+    // A selection hidden by a fold has no neighbour to step from, so the walk
+    // restarts at the top of what is visible.
+    const next = at < 0 ? 0 : (at + (e.key === 'ArrowDown' ? 1 : vis.length - 1)) % vis.length;
+    void loadPreview(vis[next]);
   }
 
   // --- symbol breadcrumb -----------------------------------------------------
@@ -1953,6 +1992,14 @@
           <span class="peek-count">
             {peek.loading ? 'searching…' : `${peek.hits.length}${peek.truncated ? '+' : ''} references`}
           </span>
+          {#if peekGroups.length > 1}
+            <button
+              type="button"
+              class="peek-fold"
+              title={peekAllFolded ? 'Show every hit again' : 'Fold every file shut — file names and counts only'}
+              onclick={toggleAllGroups}
+            >{peekAllFolded ? 'expand all' : 'collapse all'}</button>
+          {/if}
           <button type="button" class="peek-close" title="Close (Esc)" onclick={closePeek}>✕</button>
         </div>
         <div class="peek-body">
@@ -1970,24 +2017,34 @@
           </div>
           <div class="peek-locs">
             {#each peekGroups as g (g.path)}
+              {@const folded = peekFolded.includes(g.path)}
               <div class="peek-group">
-                <div class="peek-file">
+                <button
+                  type="button"
+                  class="peek-file"
+                  aria-expanded={!folded}
+                  title={folded ? 'Show these hits' : 'Fold this file shut'}
+                  onclick={() => toggleGroup(g.path)}
+                >
+                  <span class="peek-chev" class:folded>⌄</span>
                   <span class="peek-base">{g.base}</span>
                   <span class="peek-dir" title={g.dir}>{g.dir}</span>
                   <span class="peek-n">{g.hits.length}</span>
-                </div>
-                {#each g.hits as h (h.i)}
-                  <button
-                    type="button"
-                    class="peek-hit"
-                    class:sel={peek?.sel === h.i}
-                    title="Enter or double-click to open"
-                    onclick={() => void loadPreview(h.i)}
-                    ondblclick={() => peekOpen(h.i)}
-                  >
-                    <span class="peek-hln">{h.line}</span><span class="peek-htext">{h.pre}<mark>{h.mid}</mark>{h.post}</span>
-                  </button>
-                {/each}
+                </button>
+                {#if !folded}
+                  {#each g.hits as h (h.i)}
+                    <button
+                      type="button"
+                      class="peek-hit"
+                      class:sel={peek?.sel === h.i}
+                      title="Enter or double-click to open"
+                      onclick={() => void loadPreview(h.i)}
+                      ondblclick={() => peekOpen(h.i)}
+                    >
+                      <span class="peek-hln">{h.line}</span><span class="peek-htext">{h.pre}<mark>{h.mid}</mark>{h.post}</span>
+                    </button>
+                  {/each}
+                {/if}
               </div>
             {/each}
           </div>
@@ -2122,12 +2179,50 @@
     background: #1b1b1b;
     padding: 2px 0 6px;
   }
+  .peek-fold {
+    flex: 0 0 auto;
+    border: none;
+    background: none;
+    padding: 0 4px;
+    color: #8a8a8a;
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .peek-fold:hover {
+    color: #d4d4d4;
+    text-decoration: underline;
+  }
   .peek-file {
     display: flex;
     align-items: baseline;
     gap: 6px;
+    width: 100%;
     padding: 3px 8px 2px;
+    border: none;
+    background: none;
+    text-align: left;
+    font: inherit;
     font-size: 11px;
+    cursor: pointer;
+  }
+  .peek-file:hover {
+    background: #232323;
+  }
+  /* Points down at an open group, right at a folded one — the direction the
+     hits would travel, which is the convention every tree here already uses. */
+  .peek-chev {
+    flex: 0 0 auto;
+    display: inline-block;
+    width: 9px;
+    color: #8a8a8a;
+    font-size: 10px;
+    line-height: 1;
+    transform-origin: 50% 40%;
+    transition: transform 90ms linear;
+  }
+  .peek-chev.folded {
+    transform: rotate(-90deg);
   }
   .peek-base {
     color: #d4d4d4;

@@ -170,23 +170,88 @@
   }
   let foldedDirs = $state<Record<string, boolean>>({});
 
-  // Grouped by containing folder, not nested one node per path segment — the
-  // same call VS Code makes. A match ten levels deep then costs one row of
-  // chrome instead of ten, and folders with no hits never appear at all.
-  const groups = $derived.by(() => {
-    const by = new Map<string, FileHits[]>();
-    for (const f of files) {
+  interface DirNode { name: string; dir: string; items: FileHits[]; kids: DirNode[]; hits: number }
+
+  // A real hierarchy, one node per path segment, with single-child chains
+  // squashed into one "src / lib" row. Grouping by whole folder string instead
+  // put every folder at the same level, which in a large workspace is a flat
+  // list of long paths wearing a chevron.
+  function buildDirTree(list: FileHits[]): DirNode {
+    const root: DirNode = { name: '', dir: '', items: [], kids: [], hits: 0 };
+    for (const f of list) {
       const d = dirOf(f.path);
-      const g = by.get(d);
-      if (g) g.push(f);
-      else by.set(d, [f]);
+      const segs = d ? d.split('/') : [];
+      let node = root;
+      for (let i = 0; i < segs.length; i++) {
+        const dir = segs.slice(0, i + 1).join('/');
+        let kid = node.kids.find((k) => k.dir === dir);
+        if (!kid) {
+          kid = { name: segs[i], dir, items: [], kids: [], hits: 0 };
+          node.kids.push(kid);
+        }
+        node = kid;
+      }
+      node.items.push(f);
     }
-    return [...by].map(([dir, items]) => ({
-      dir,
-      items,
-      hits: items.reduce((n, f) => n + f.hits.length, 0),
-    }));
-  });
+    squashDirs(root);
+    countHits(root);
+    return root;
+  }
+
+  function squashDirs(n: DirNode) {
+    while (n.dir && !n.items.length && n.kids.length === 1) {
+      const only = n.kids[0];
+      n.name = `${n.name} / ${only.name}`;
+      n.dir = only.dir;
+      n.items = only.items;
+      n.kids = only.kids;
+    }
+    for (const k of n.kids) squashDirs(k);
+  }
+
+  // A folder's count is everything beneath it, so a collapsed row still says
+  // how much it is hiding.
+  function countHits(n: DirNode): number {
+    n.hits = n.items.reduce((s, f) => s + f.hits.length, 0) + n.kids.reduce((s, k) => s + countHits(k), 0);
+    return n.hits;
+  }
+
+  // Insertion order, deliberately unsorted: results stream in as ripgrep finds
+  // them, and re-sorting on every arrival would make rows jump under the
+  // cursor mid-scan.
+  const tree = $derived(buildDirTree(files));
+
+  function eachDir(n: DirNode, out: string[] = []): string[] {
+    for (const k of n.kids) { out.push(k.dir); eachDir(k, out); }
+    return out;
+  }
+
+  // "Everything shut" is the only state worth detecting: it decides whether
+  // the header button offers to collapse or to restore.
+  const allShut = $derived(files.length > 0 && files.every((f) => collapsed[f.path]));
+
+  function toggleAll() {
+    if (allShut) {
+      foldedDirs = {};
+      collapsed = {};
+      return;
+    }
+    const fd: Record<string, boolean> = {};
+    for (const d of eachDir(tree)) fd[d] = true;
+    foldedDirs = fd;
+    const c: Record<string, boolean> = {};
+    for (const f of files) c[f.path] = true;
+    collapsed = c;
+  }
+
+  function clearSearch() {
+    query = '';
+    files = [];
+    total = 0;
+    truncated = false;
+    error = null;
+    input?.focus();
+  }
 </script>
 
 <div class="spanel">
@@ -223,6 +288,26 @@
     <div class="sviewbar">
       <button type="button" class:on={asTree} title="Group results by folder" onclick={() => setTree(true)}>Tree</button>
       <button type="button" class:on={!asTree} title="Flat list of files" onclick={() => setTree(false)}>List</button>
+      <span class="sv-gap"></span>
+      <button
+        type="button"
+        class="sv-icon"
+        title={allShut ? 'Expand all' : 'Collapse all'}
+        aria-label={allShut ? 'Expand all' : 'Collapse all'}
+        onclick={toggleAll}
+      >
+        {#if allShut}
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 7 8 3.4 12 7" /><path d="M4 9 8 12.6 12 9" /></svg>
+        {:else}
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3.4 8 7l4-3.6" /><path d="M4 12.6 8 9l4 3.6" /></svg>
+        {/if}
+      </button>
+      <button type="button" class="sv-icon" title="Search again" aria-label="Search again" onclick={() => run()}>
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.2a4.8 4.8 0 1 0 4.6 6.1" /><path d="M8 1.2v4h4" /></svg>
+      </button>
+      <button type="button" class="sv-icon" title="Clear results" aria-label="Clear results" onclick={clearSearch}>
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+      </button>
     </div>
   {/if}
   <div class="sresults" class:wrapon={wrapPref.on}>
@@ -231,9 +316,9 @@
     {:else if query.trim() && !running && files.length === 0}
       <div class="smsg">No results</div>
     {/if}
-    {#snippet fileGroup(f: FileHits, showDir: boolean)}
+    {#snippet fileGroup(f: FileHits, showDir: boolean, depth: number)}
       <div class="sfile">
-        <button type="button" class="sfile-head" onclick={() => (collapsed[f.path] = !collapsed[f.path])}>
+        <button type="button" class="sfile-head" style="padding-left: {6 + depth * 10}px" onclick={() => (collapsed[f.path] = !collapsed[f.path])}>
           <svg class="chev" class:open={!collapsed[f.path]} viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5z" /></svg>
           <img class="sicon" alt="" aria-hidden="true" src={fileIconUrl(baseOf(f.path))} />
           <span class="sfile-name">{baseOf(f.path)}</span>
@@ -241,7 +326,7 @@
           <span class="sfile-count">{f.hits.length}</span>
         </button>
         {#if !collapsed[f.path]}
-          <ul class="shits">
+          <ul class="shits" style="padding-left: {10 + depth * 10}px">
             {#each f.hits as h, hi (hi)}
               <li>
                 <button type="button" class="shit" onclick={() => onOpen(f.path, h.line)}>
@@ -254,23 +339,32 @@
         {/if}
       </div>
     {/snippet}
-    {#if asTree}
-      {#each groups as g (g.dir)}
+    <!-- Recursive: a folder renders its own children through the same snippet. -->
+    {#snippet dirTree(node: DirNode, depth: number)}
+      {#each node.kids as k (k.dir)}
         <div class="sdir">
-          <button type="button" class="sfile-head sdir-head" onclick={() => (foldedDirs[g.dir] = !foldedDirs[g.dir])}>
-            <svg class="chev" class:open={!foldedDirs[g.dir]} viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5z" /></svg>
-            <span class="sfile-name">{g.dir || '‹root›'}</span>
-            <span class="sfile-count">{g.hits}</span>
+          <button
+            type="button"
+            class="sfile-head sdir-head"
+            style="padding-left: {6 + depth * 10}px"
+            title={k.dir}
+            onclick={() => (foldedDirs[k.dir] = !foldedDirs[k.dir])}
+          >
+            <svg class="chev" class:open={!foldedDirs[k.dir]} viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5z" /></svg>
+            <span class="sfile-name">{k.name}</span>
+            <span class="sfile-count">{k.hits}</span>
           </button>
-          {#if !foldedDirs[g.dir]}
-            <div class="sdir-body">
-              {#each g.items as f (f.path)}{@render fileGroup(f, false)}{/each}
-            </div>
+          {#if !foldedDirs[k.dir]}
+            <div class="sdir-body">{@render dirTree(k, depth + 1)}</div>
           {/if}
         </div>
       {/each}
+      {#each node.items as f (f.path)}{@render fileGroup(f, false, depth)}{/each}
+    {/snippet}
+    {#if asTree}
+      {@render dirTree(tree, 0)}
     {:else}
-      {#each files as f (f.path)}{@render fileGroup(f, true)}{/each}
+      {#each files as f (f.path)}{@render fileGroup(f, true, 0)}{/each}
     {/if}
     {#if truncated}
       <div class="smsg">result cap reached — narrow the query</div>
@@ -532,5 +626,19 @@
     min-width: 0;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+  .sv-gap { flex: 1; }
+  .sv-icon {
+    line-height: 0;
+    padding: 2px;
+  }
+  .sv-icon svg {
+    width: 13px;
+    height: 13px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
 </style>

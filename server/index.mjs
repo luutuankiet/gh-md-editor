@@ -902,6 +902,64 @@ async function apiMoveEntry(req, res) {
   sendJson(res, 200, { moved, errors });
 }
 
+// "report.md" -> "report copy.md" -> "report copy 2.md", the same ladder a
+// desktop file manager walks. A leading dot is the whole name (.gitignore),
+// not an extension, so only an inner dot splits.
+async function freeName(abs) {
+  try { await fs.stat(abs); } catch { return abs; }
+  const dir = path.dirname(abs);
+  const base = path.basename(abs);
+  const dot = base.lastIndexOf('.');
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const ext = dot > 0 ? base.slice(dot) : '';
+  for (let n = 1; n < 500; n++) {
+    const cand = path.join(dir, n === 1 ? `${stem} copy${ext}` : `${stem} copy ${n}${ext}`);
+    try { await fs.stat(cand); } catch { return cand; }
+  }
+  throw new Error('too many copies of that name');
+}
+
+// Explorer paste after a copy. Unlike a move, landing on a taken name is the
+// common gesture rather than a mistake — pasting into the folder you copied
+// from has to mean something — so the server picks the first free variant
+// instead of refusing, and reports back where each item actually landed.
+async function apiCopyEntry(req, res) {
+  let body;
+  try {
+    body = JSON.parse(String(await readBody(req)) || '{}');
+  } catch {
+    return sendJson(res, 400, { error: 'invalid JSON body' });
+  }
+  const copies = Array.isArray(body.copies) ? body.copies : [];
+  if (!copies.length) return sendJson(res, 400, { error: 'copies required' });
+  const copied = [];
+  const errors = [];
+  for (const c of copies) {
+    const from = typeof c?.from === 'string' ? c.from : '';
+    const to = typeof c?.to === 'string' ? c.to : '';
+    if (!from || !to) { errors.push({ from, to, error: 'from and to are both required' }); continue; }
+    const src = resolveSafe(from);
+    let dst = resolveSafe(to);
+    if (!src || !dst) { errors.push({ from, to, error: 'path escapes root' }); continue; }
+    try {
+      // The free name is picked before the containment check, not after:
+      // pasting something back where it came from is the duplicate gesture,
+      // and "dest copy" is no longer inside "dest".
+      dst = await freeName(dst);
+      // What is left is a folder pasted into its own subtree, which would
+      // recurse until the disk filled.
+      if (dst.startsWith(src + path.sep)) { errors.push({ from, to, error: 'cannot copy a folder into itself' }); continue; }
+      await fs.mkdir(path.dirname(dst), { recursive: true });
+      await fs.cp(src, dst, { recursive: true, errorOnExist: true, force: false });
+      copied.push({ from, to: toClientPath(dst) });
+    } catch (e) {
+      errors.push({ from, to, error: String(e?.message ?? e) });
+    }
+  }
+  fileListCache.clear();
+  sendJson(res, 200, { copied, errors });
+}
+
 async function apiQuickOpen(res, params) {
   const baseAbs = resolveSafe(params.get('path') || '.');
   if (!baseAbs) return sendJson(res, 400, { error: 'path escapes root' });
@@ -1230,6 +1288,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/entry' && req.method === 'DELETE') return await apiDeleteEntry(res, url.searchParams);
     if (url.pathname === '/api/entry' && req.method === 'POST') return await apiCreateEntry(req, res);
     if (url.pathname === '/api/entry' && req.method === 'PATCH') return await apiMoveEntry(req, res);
+    if (url.pathname === '/api/entry/copy' && req.method === 'POST') return await apiCopyEntry(req, res);
     if (url.pathname === '/api/ports' && req.method === 'GET') return await apiPorts(res);
     if (url.pathname === '/api/version' && req.method === 'GET') return apiVersion(res);
     if (url.pathname === '/api/upgrade' && req.method === 'POST') return apiUpgrade(res);
@@ -1724,7 +1783,14 @@ function rawDiff(repoAbs, rel, staged, untracked, base, head) {
 function resolveRef(repoAbs, ref) {
   if (typeof ref !== 'string' || !ref || ref.startsWith('-')) return null;
   const r = git(['rev-parse', '--verify', '--quiet', '--end-of-options', `${ref}^{commit}`], repoAbs);
-  return r.code === 0 ? r.out.trim() : null;
+  if (r.code === 0) return r.out.trim();
+  // A commit with no parent has nothing to diff against, so the graph sends
+  // git's own empty tree as the base. That object peels to a tree and never to
+  // a commit, which turned every first-commit diff into an unknown ref. Every
+  // consumer of this function feeds the result to `git diff` or `git show`,
+  // both of which take a tree-ish, so accepting one costs nothing.
+  const t = git(['rev-parse', '--verify', '--quiet', '--end-of-options', `${ref}^{tree}`], repoAbs);
+  return t.code === 0 ? t.out.trim() : null;
 }
 
 // The commit DAG, flat. Parents come back as shas rather than a nested shape

@@ -899,8 +899,12 @@
   /* @codemirror/merge ships a light-first palette. Every rule below is two
      classes deep so it outranks the package's own base theme without
      !important, exactly like the starry-night block above. */
-  .difftab :global(.cm-mergeView),
-  .difftab :global(.cm-mergeViewEditors) { height: 100%; }
+  /* Height belongs to the merge container alone. Handing it to the editors
+     row as well capped both sides at the pane height while their content kept
+     its real size, and the package's own `.cm-mergeViewEditor { overflow:
+     hidden }` then clipped the overflow — so the container that owns the
+     scroll had nothing left to scroll and split mode lost its scrollbar. */
+  .difftab :global(.cm-mergeView) { height: 100%; }
   .difftab :global(.cm-mergeViewEditor) { min-width: 0; }
   /* The package hands the container the vertical scroll and leaves each
      editor overflow-hidden, which is why a line wider than its pane simply

@@ -28,6 +28,8 @@
     untitled?: boolean;
     // Set by a search-result click; consumed by CodeTab to scroll + select.
     reveal?: { line: number; seq: number; select?: { from: number; to: number } };
+    // A file as it stood at a commit: real content, no path to write back to.
+    ro?: boolean;
     // Present on kind === 'diff' tabs: which repo/file/side the tab shows.
     git?: { repo: string; path: string; staged: boolean; untracked: boolean; base?: string; baseLabel?: string; to?: string; toLabel?: string };
     // Present on kind === 'diff' tabs opened by a compare command: two
@@ -285,14 +287,20 @@
     localStorage.setItem(RECENT_FILES_KEY, JSON.stringify(recentFiles));
   }
 
-  // Last five workspaces, most recent first. Reads the stored list rather than
-  // the reactive one so writing the result cannot re-trigger this effect.
+  // Most recent first, stored absolute. Waits for the root to arrive because
+  // the relative form is ambiguous the moment it is written down: `code-gh .`
+  // resolves to the folder "`.`", which named nothing and read as a bug. The
+  // stored list is read rather than the reactive one so writing the result
+  // cannot re-trigger this effect, and mapping it through toAbsPath migrates
+  // whatever the old relative-path builds left behind.
   let notedWorkspace = false;
   $effect(() => {
     const home = folder;
-    if (!home || notedWorkspace) return;
+    if (!rootInfo || notedWorkspace) return;
     notedWorkspace = true;
-    const next = [home, ...readList<string>(RECENT_WS_KEY).filter((w) => w !== home)].slice(0, RECENT_WS_MAX);
+    const abs = toAbsPath(home);
+    const prior = readList<string>(RECENT_WS_KEY).map(toAbsPath);
+    const next = [abs, ...prior.filter((w) => w !== abs)].slice(0, RECENT_WS_MAX);
     recentWorkspaces = next;
     localStorage.setItem(RECENT_WS_KEY, JSON.stringify(next));
   });
@@ -617,6 +625,17 @@
     const s = rootInfo?.sep ?? '/';
     if (abs.startsWith(r + s)) return abs.slice(r.length + 1).split(s).join('/');
     return abs;
+  }
+
+  // The inverse of toWorkspacePath. Recents are held absolute so a row names a
+  // real folder rather than whichever relative shorthand happened to open it.
+  function toAbsPath(rel: string): string {
+    if (rel.startsWith('/')) return rel;
+    const r = rootInfo?.root;
+    if (!r) return rel;
+    const s = rootInfo?.sep ?? '/';
+    if (!rel || rel === '.') return r;
+    return r + s + rel.split('/').join(s);
   }
 
   function browsePick(abs: string) {
@@ -1108,6 +1127,53 @@
     noteRecentFile(tab.path);
   }
 
+  // A file exactly as it was at a commit. Distinct from a diff tab, which
+  // shows what changed, and from opening it in the tree, which gives the
+  // working copy. Keyed by repo+sha+path so two commits of one file coexist.
+  async function openFileAtRef(repo: string, rel: string, sha: string, label: string) {
+    const key = `gmd-show:${repo}:${sha}:${rel}`;
+    for (const g of groups) {
+      const existing = g.tabs.find((t) => t.path === key);
+      if (existing) {
+        activeGroupId = g.id;
+        g.activePath = key;
+        return;
+      }
+    }
+    const full = repo ? `${repo}/${rel}` : rel;
+    let content = '';
+    let error = '';
+    try {
+      const r = await fetch(`/api/git/show?path=${encodeURIComponent(full)}&ref=${encodeURIComponent(sha)}`);
+      const d = await r.json();
+      if (!r.ok) error = d.error ?? `HTTP ${r.status}`;
+      else if (d.binary) error = 'Binary file.';
+      else if (!d.tracked) error = `Not in ${label}: ${d.reason ?? 'no such object'}`;
+      else content = d.content ?? '';
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+    // Always 'code': the markdown cockpit is an editing surface, and this tab
+    // has nothing to edit.
+    const tab: Tab = {
+      path: key,
+      name: `${baseName(rel)} @ ${label}`,
+      kind: 'code',
+      pinned: false,
+      content,
+      savedContent: content,
+      mtimeMs: 0,
+      ro: true,
+      error: error || undefined,
+    };
+    const home = groups.includes(activeGroup) ? activeGroup : groups[0];
+    const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
+    if (previewIdx >= 0) home.tabs[previewIdx] = tab;
+    else home.tabs.push(tab);
+    home.activePath = key;
+    activeGroupId = home.id;
+  }
+
   // A diff tab is keyed by repo+side+path so the staged and working-tree
   // views of the same file are two distinct tabs — exactly like VS Code's
   // "Index vs Working Tree" split.
@@ -1331,6 +1397,9 @@
     // one used to PUT an empty body over the very file it was showing. Those
     // views own their own writeback where they have one.
     if (tab.kind !== 'code' && tab.kind !== 'md') return;
+    // A snapshot of a commit is not a checkout: there is no working-tree file
+    // this buffer belongs to, and Save As is the wrong offer for one.
+    if (tab.ro) return;
     if (tab.untitled) { saveAs = { tab }; return; }
     const put = (baseMtimeMs: number) =>
       fetch('/api/file', {
@@ -1813,19 +1882,37 @@
                 <div class="recent-empty">Nothing opened yet.</div>
               {:else}
                 {#each recentWorkspaces as w (w)}
-                  <button
-                    type="button"
-                    class="recent-row"
-                    class:current={w === folder}
-                    title={w}
-                    onclick={(e) => openWorkspaceIn(w, e.metaKey || e.ctrlKey ? 'tab' : 'same')}
-                    onauxclick={(e) => { if (e.button === 1) { e.preventDefault(); openWorkspaceIn(w, 'tab'); } }}
-                    oncontextmenu={(e) => { e.preventDefault(); rwMenu = { x: e.clientX, y: e.clientY, path: w }; }}
-                  >
-                    <img class="icon" alt="" aria-hidden="true" src={folderIconUrl(wsName(w), false)} />
-                    <span class="recent-name">{wsName(w)}</span>
-                    {#if wsParent(w)}<span class="recent-dir">{wsParent(w)}</span>{/if}
-                  </button>
+                  <div class="recent-item">
+                    <button
+                      type="button"
+                      class="recent-row"
+                      class:current={w === toAbsPath(folder)}
+                      title={w}
+                      onclick={(e) => openWorkspaceIn(toWorkspacePath(w), e.metaKey || e.ctrlKey ? 'tab' : 'same')}
+                      onauxclick={(e) => { if (e.button === 1) { e.preventDefault(); openWorkspaceIn(toWorkspacePath(w), 'tab'); } }}
+                      oncontextmenu={(e) => { e.preventDefault(); rwMenu = { x: e.clientX, y: e.clientY, path: w }; }}
+                    >
+                      <img class="icon" alt="" aria-hidden="true" src={folderIconUrl(wsName(w), false)} />
+                      <span class="recent-name">{wsName(w)}</span>
+                      {#if wsParent(w)}<span class="recent-dir">{wsParent(w)}</span>{/if}
+                    </button>
+                    <span class="recent-acts">
+                      <button
+                        type="button"
+                        class="recent-act"
+                        title="Open in this window"
+                        aria-label="Open in this window"
+                        onclick={() => openWorkspaceIn(toWorkspacePath(w), 'same')}
+                      >↵</button>
+                      <button
+                        type="button"
+                        class="recent-act"
+                        title="Open in new window"
+                        aria-label="Open in new window"
+                        onclick={() => openWorkspaceIn(toWorkspacePath(w), 'window')}
+                      >⧉</button>
+                    </span>
+                  </div>
                 {/each}
               {/if}
             </div>
@@ -1991,13 +2078,13 @@
                   {:else if at.kind === 'diff' && at.git}
                     <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} to={at.git.to ?? ''} toLabel={at.git.toLabel ?? ''} />
                   {:else if at.kind === 'graph' && at.graph}
-                    <GitGraphTab repo={at.graph.repo} onOpenDiff={openDiff} onOpenFile={openRepoFile} />
+                    <GitGraphTab repo={at.graph.repo} onOpenDiff={openDiff} onOpenFile={openRepoFile} onOpenAtRef={openFileAtRef} />
                   {:else if at.kind === 'merge' && at.merge}
                     <MergeTab repo={at.merge.repo} path={at.merge.path} />
                   {:else if at.kind === 'md'}
                     <MarkdownTab bind:value={at.content} name={at.name} reveal={at.reveal ?? null} />
                   {:else}
-                    <CodeTab bind:value={at.content} filename={at.name} gitPath={at.untitled ? '' : at.path} reveal={at.reveal ?? null} />
+                    <CodeTab bind:value={at.content} filename={at.name} gitPath={at.untitled || at.ro ? '' : at.path} reveal={at.reveal ?? null} readOnly={!!at.ro} />
                   {/if}
                 {:else}
                   <div class="placeholder">Open a file from the tree.</div>
@@ -2625,4 +2712,26 @@
     padding: 20px;
     text-align: center;
   }
+  /* The row keeps its own hover tint; the wrapper only exists to hang the two
+     open buttons off the end of it without nesting a button in a button. */
+  .recent-item { display: flex; align-items: center; }
+  .recent-item .recent-row { flex: 1; min-width: 0; }
+  .recent-acts {
+    flex: none;
+    display: flex;
+    visibility: hidden;
+    padding-right: 4px;
+  }
+  .recent-item:hover .recent-acts,
+  .recent-item:focus-within .recent-acts { visibility: visible; }
+  .recent-act {
+    border: 0;
+    background: none;
+    color: #6e7681;
+    cursor: pointer;
+    padding: 0 3px;
+    font: inherit;
+    line-height: 1;
+  }
+  .recent-act:hover { color: #c5c8c6; }
 </style>

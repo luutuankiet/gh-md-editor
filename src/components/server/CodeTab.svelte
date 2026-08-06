@@ -412,9 +412,12 @@
     );
   }
 
-  let { value = $bindable(''), filename, gitPath = '', reveal = null, marks = [] }: {
+  let { value = $bindable(''), filename, gitPath = '', reveal = null, marks = [], readOnly = false }: {
     value?: string;
     filename: string;
+    // A snapshot of a file as it was at a commit has nowhere to save back to,
+    // so the buffer refuses edits instead of collecting ones that vanish.
+    readOnly?: boolean;
     // Workspace-relative path, empty for an unsaved buffer. Used only to ask
     // git what this file looked like before the current edits — the editor
     // itself stays path-agnostic.
@@ -889,6 +892,9 @@
     const state = EditorState.create({
       doc: initialDoc,
       extensions: [
+        // Read at creation like the document itself: a tab never changes from
+        // editable to frozen, it opens as one or the other.
+        EditorState.readOnly.of(untrack(() => readOnly)),
         // Before the line numbers on purpose — extension order is gutter
         // order, and blame belongs at the far left where GitLens puts it,
         // outside the numbers rather than between them and the text.

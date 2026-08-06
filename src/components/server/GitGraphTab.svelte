@@ -4,6 +4,9 @@
   // already live in the ref picker, and a graph that also moves HEAD is a graph
   // you cannot click around in freely.
 
+  import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
+  import { toClipboard } from '../../lib/clipboard';
+
   type Commit = { sha: string; parents: string[]; author: string; date: string; refs: string[]; subject: string };
   type FileChange = { status: string; path: string; from?: string };
   type Detail = { sha: string; author: string; email: string; date: string; parents: string[]; subject: string; body: string; files: FileChange[] };
@@ -12,10 +15,12 @@
     repo = '',
     onOpenDiff,
     onOpenFile,
+    onOpenAtRef,
   }: {
     repo?: string;
     onOpenDiff: (repo: string, file: { path: string; staged: boolean; untracked?: boolean; base?: string; baseLabel?: string; to?: string; toLabel?: string }) => void;
     onOpenFile: (repo: string, path: string) => void;
+    onOpenAtRef: (repo: string, path: string, sha: string, label: string) => void;
   } = $props();
 
   const ROW_H = 24;
@@ -201,8 +206,125 @@
     });
   }
 
+  const baseOf = (p: string) => p.split('/').pop() ?? p;
+
+  interface FileNode { name: string; dir: string; files: FileChange[]; kids: FileNode[] }
+
+  // The commit's changed files as a folder tree rather than a column of full
+  // paths: in a repo of any depth the interesting part of a path is its tail,
+  // and a flat list buries it behind the same prefix on every row.
+  function buildTree(files: FileChange[]): FileNode {
+    const root: FileNode = { name: '', dir: '', files: [], kids: [] };
+    for (const f of files) {
+      const segs = f.path.split('/');
+      let node = root;
+      for (let i = 0; i < segs.length - 1; i++) {
+        const dir = segs.slice(0, i + 1).join('/');
+        let kid = node.kids.find((k) => k.dir === dir);
+        if (!kid) {
+          kid = { name: segs[i], dir, files: [], kids: [] };
+          node.kids.push(kid);
+        }
+        node = kid;
+      }
+      node.files.push(f);
+    }
+    squash(root);
+    sortNode(root);
+    return root;
+  }
+
+  // A folder whose only child is another folder is drawn as "src / lib": one
+  // row instead of a staircase of single entries, the way the explorer does
+  // it. The root is left alone — its children are the top level.
+  function squash(n: FileNode) {
+    while (n.dir && !n.files.length && n.kids.length === 1) {
+      const only = n.kids[0];
+      n.name = `${n.name} / ${only.name}`;
+      n.dir = only.dir;
+      n.files = only.files;
+      n.kids = only.kids;
+    }
+    for (const k of n.kids) squash(k);
+  }
+
+  // Folders above files, each side alphabetical: the order every file tree
+  // uses, and the one that makes two commits comparable at a glance.
+  function sortNode(n: FileNode) {
+    n.kids.sort((a, b) => a.name.localeCompare(b.name));
+    n.files.sort((a, b) => baseOf(a.path).localeCompare(baseOf(b.path)));
+    for (const k of n.kids) sortNode(k);
+  }
+
+  // Keyed by folder path and deliberately not reset between commits: walking a
+  // series of commits through the same subtree keeps the shape you set up.
+  let folded = $state<Record<string, boolean>>({});
+  const tree = $derived(detail ? buildTree(detail.files) : null);
+
+  let toast = $state('');
+  let toastTimer: ReturnType<typeof setTimeout> | undefined;
+  function showToast(msg: string) {
+    toast = msg;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast = ''; }, 2000);
+  }
+
+  async function copyPath(p: string) {
+    await toClipboard(p);
+    showToast('Copied path.');
+  }
+
+  // The file as it stood at this commit, not as it stands now — the read-only
+  // twin of the ↗ button beside it.
+  function openAtCommit(f: FileChange) {
+    if (!detail) return;
+    onOpenAtRef(repo, f.path, detail.sha, short(detail.sha));
+  }
+
   const STATUS: Record<string, string> = { A: 'added', M: 'modified', D: 'deleted', R: 'renamed', C: 'copied', T: 'typechange' };
 </script>
+
+<!-- Recursive: a folder renders its own children through the same snippet. -->
+{#snippet fileTree(node: FileNode, depth: number)}
+  {#each node.kids as k (k.dir)}
+    <li>
+      <button
+        type="button"
+        class="frow"
+        style="padding-left: {depth * 12}px"
+        title={k.dir}
+        onclick={() => (folded[k.dir] = !folded[k.dir])}
+      >
+        <span class="chev" class:open={!folded[k.dir]}>▸</span>
+        <img class="ficon" alt="" aria-hidden="true" src={folderIconUrl(baseOf(k.dir), !folded[k.dir])} />
+        <span class="fname dir">{k.name}</span>
+      </button>
+    </li>
+    {#if !folded[k.dir]}{@render fileTree(k, depth + 1)}{/if}
+  {/each}
+  {#each node.files as f (f.path)}
+    <li>
+      <button
+        type="button"
+        class="frow"
+        style="padding-left: {depth * 12}px"
+        title="{f.path} — click to show this commit's diff"
+        onclick={() => openFileDiff(f)}
+      >
+        <span class="st {f.status}" title={STATUS[f.status] ?? f.status}>{f.status}</span>
+        <img class="ficon" alt="" aria-hidden="true" src={fileIconUrl(baseOf(f.path))} />
+        <span class="fname">{baseOf(f.path)}</span>
+      </button>
+      <span class="factions">
+        <button type="button" class="fact" title="Copy path" aria-label="Copy path" onclick={() => copyPath(f.path)}>⧉</button>
+        <button type="button" class="fact" title="Open this file as it was at this commit" aria-label="Open at this commit" onclick={() => openAtCommit(f)}>◷</button>
+        {#if f.status !== 'D'}
+          <button type="button" class="fact" title="Open the current file" aria-label="Open current file" onclick={() => onOpenFile(repo, f.path)}>↗</button>
+        {/if}
+      </span>
+    </li>
+  {/each}
+{/snippet}
 
 <div class="graph">
   <header class="ghead">
@@ -277,21 +399,15 @@
           {#if detail.body}<pre class="bodytext">{detail.body}</pre>{/if}
           <div class="fhead">{detail.files.length} file{detail.files.length === 1 ? '' : 's'} changed</div>
           <ul class="files">
-            {#each detail.files as f (f.path)}
-              <li>
-                <button type="button" class="frow" title="Show this commit's diff" onclick={() => openFileDiff(f)}>
-                  <span class="st {f.status}" title={STATUS[f.status] ?? f.status}>{f.status}</span>
-                  <span class="fpath">{f.path}</span>
-                </button>
-                <button type="button" class="open" title="Open this file" onclick={() => onOpenFile(repo, f.path)}>↗</button>
-              </li>
-            {/each}
+            {#if tree}{@render fileTree(tree, 0)}{/if}
           </ul>
         {/if}
       </aside>
     {/if}
   </div>
 </div>
+
+{#if toast}<div class="gtoast">{toast}</div>{/if}
 
 <style>
   .graph {
@@ -370,7 +486,7 @@
   .badge.tag { background: #3a3020; border-color: #e58520; color: #e58520; }
   .detail {
     flex: none;
-    width: 320px;
+    width: 340px;
     border-left: 1px solid #404040;
     background: #232323;
     overflow: auto;
@@ -408,19 +524,48 @@
     padding: 2px 0;
     cursor: pointer;
   }
-  .fpath { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; }
+  .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fname.dir { color: #b5b5b5; }
+  .ficon { width: 14px; height: 14px; flex: none; }
+  .chev {
+    flex: none;
+    width: 10px;
+    color: #949494;
+    display: inline-block;
+    transition: transform 0.1s;
+  }
+  .chev.open { transform: rotate(90deg); }
+  /* The action group is the row's hover affordance, so it holds its width at
+     all times: appearing out of nowhere would reflow the name mid-click. */
+  .factions { flex: none; display: flex; visibility: hidden; }
+  .files li:hover .factions,
+  .files li:focus-within .factions { visibility: visible; }
+  .fact {
+    border: 0;
+    background: none;
+    color: #6e7681;
+    cursor: pointer;
+    padding: 0 3px;
+    font: inherit;
+    line-height: 1;
+  }
+  .fact:hover { color: #c5c8c6; }
   .st { flex: none; width: 12px; text-align: center; color: #949494; }
   .st.A { color: #8bc34a; }
   .st.M { color: #e58520; }
   .st.D { color: #e06c75; }
   .st.R { color: #4aa3df; }
-  .open {
-    flex: none;
-    border: 0;
-    background: none;
-    color: #6e7681;
-    cursor: pointer;
-    padding: 0 4px;
+  .gtoast {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    background: #272727;
+    border: 1px solid #404040;
+    border-radius: 6px;
+    padding: 6px 14px;
+    color: #c5c8c6;
+    z-index: 120;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
   }
-  .open:hover { color: #c5c8c6; }
 </style>

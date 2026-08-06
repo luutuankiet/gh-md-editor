@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack, tick } from 'svelte';
   import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
+  import { toClipboard } from '../../lib/clipboard';
   import { estimateTokens, formatTokens } from '../../lib/token-estimate';
 
   type EntryType = 'dir' | 'file' | 'link';
@@ -516,23 +517,6 @@
     toastTimer = setTimeout(() => { toast = ''; }, 3000);
   }
 
-  // navigator.clipboard exists only in secure contexts (https / localhost).
-  // Permissive LAN binds are plain http, so fall back to the hidden-textarea
-  // execCommand path there.
-  async function toClipboard(text: string): Promise<void> {
-    if (navigator.clipboard?.writeText) {
-      try { return await navigator.clipboard.writeText(text); } catch { /* fall through */ }
-    }
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    ta.remove();
-  }
-
   async function copyAsContext(targets: string[]) {
     menu = null;
     try {
@@ -828,6 +812,137 @@
     if (failed.length) showToast(`Uploaded ${queue.length - failed.length}, failed ${failed.length}: ${failed[0]}`);
   }
 
+  // --- clipboard --------------------------------------------------------
+
+  // The explorer's own clipboard, not the system one: these paths mean nothing
+  // outside this tree, and the system clipboard is already spoken for by "Copy
+  // full path". A cut is a move that has not happened yet — the rows dim to
+  // say so, Escape calls it off, and nothing on disk has moved until a paste.
+  let clip = $state<{ mode: 'cut' | 'copy'; paths: string[] } | null>(null);
+  const cutSet = $derived(new Set(clip?.mode === 'cut' ? clip.paths : []));
+
+  function setClip(paths: string[], mode: 'cut' | 'copy') {
+    menu = null;
+    if (!paths.length) return;
+    clip = { mode, paths: [...paths] };
+    showToast(`${mode === 'cut' ? 'Cut' : 'Copied'} ${paths.length} item${paths.length === 1 ? '' : 's'}. Paste to place, Esc to cancel.`);
+  }
+
+  function findNode(p: string, nodes: TreeNode[] = roots): TreeNode | null {
+    for (const n of nodes) {
+      if (n.path === p) return n;
+      if (n.children) {
+        const hit = findNode(p, n.children);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  }
+
+  // A folder takes the paste; a file hands it to the folder holding it.
+  function pasteTarget(): string {
+    const one = anchorPath || [...selected][0] || '';
+    if (!one) return folder;
+    return findNode(one)?.type === 'dir' ? one : parentOf(one) || folder;
+  }
+
+  function paste(dest: string) {
+    menu = null;
+    const c = clip;
+    if (!c) return;
+    if (c.mode === 'cut') {
+      // A cut is spent on its first paste, the same as everywhere else.
+      clip = null;
+      const moves = c.paths
+        .filter((p) => dest !== p && !dest.startsWith(`${p}/`) && parentOf(p) !== dest)
+        .map((p) => ({ from: p, to: joinIn(dest, baseOf(p)) }));
+      if (!moves.length) { showToast('Already there.'); return; }
+      void moveEntries(moves);
+      return;
+    }
+    // A copy stays loaded: pasting one folder into three places is one copy
+    // and three pastes.
+    void copyEntries(c.paths.map((p) => ({ from: p, to: joinIn(dest, baseOf(p)) })));
+  }
+
+  async function copyEntries(copies: { from: string; to: string }[]) {
+    if (!copies.length) return;
+    try {
+      const res = await fetch('/api/entry/copy', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ copies }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+      // The server renames around collisions, so where each item landed is
+      // something only it can report.
+      const done: { from: string; to: string }[] = data.copied ?? [];
+      await refresh();
+      if (done.length) {
+        window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
+        selected = new Set(done.map((c) => c.to));
+        selectionExplicit = done.length > 1;
+      }
+      showToast(
+        data.errors?.length
+          ? `Pasted ${done.length}, failed ${data.errors.length}: ${data.errors[0].error}`
+          : `Pasted ${done.length} item${done.length === 1 ? '' : 's'}.`
+      );
+    } catch (err) {
+      showToast(`Paste failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  function focusRow(p: string) {
+    treeEl?.querySelector<HTMLElement>(`[data-path="${CSS.escape(p)}"]`)?.focus();
+  }
+
+  function moveTo(p: string) {
+    anchorPath = p;
+    selected = new Set([p]);
+    selectionExplicit = false;
+    focusRow(p);
+  }
+
+  // Keys are caught on the container so they work wherever focus sits inside
+  // the tree, including on a row that was reached with the arrows.
+  function handleTreeKey(e: KeyboardEvent) {
+    if (editing) return; // the naming input owns its own keys
+    const mod = e.metaKey || e.ctrlKey;
+    const paths = selected.size ? [...selected] : anchorPath ? [anchorPath] : [];
+    const key = e.key.toLowerCase();
+    if (mod && key === 'c') { e.preventDefault(); setClip(paths, 'copy'); return; }
+    if (mod && key === 'x') { e.preventDefault(); setClip(paths, 'cut'); return; }
+    if (mod && key === 'v') { e.preventDefault(); paste(pasteTarget()); return; }
+    if (e.key === 'Escape' && clip) { e.preventDefault(); clip = null; return; }
+    if (e.key === 'Delete' && paths.length) { e.preventDefault(); void deleteEntries(paths); return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const flat = flatten(roots);
+      const at = flat.indexOf(anchorPath || activeRow);
+      const next = flat[Math.max(0, Math.min(flat.length - 1, at + (e.key === 'ArrowDown' ? 1 : -1)))];
+      if (next) moveTo(next);
+      return;
+    }
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+      const node = anchorPath ? findNode(anchorPath) : null;
+      if (!node) return;
+      e.preventDefault();
+      if (e.key === 'ArrowRight') {
+        // Right on a closed folder opens it; on anything else it steps in.
+        if (node.type === 'dir' && !node.expanded) { void toggleDir(node); return; }
+        const flat = flatten(roots);
+        const next = flat[flat.indexOf(node.path) + 1];
+        if (next) moveTo(next);
+        return;
+      }
+      if (node.type === 'dir' && node.expanded) { node.expanded = false; return; }
+      const up = parentOf(node.path);
+      if (up && up !== folder) moveTo(up);
+    }
+  }
+
   function terminalHere(node: { path: string; type: EntryType }) {
     menu = null;
     // Files spawn the shell in their parent folder.
@@ -877,6 +992,7 @@
       class:active={node.path === activeRow}
       class:droptarget={dropDir === node.path}
       class:ignored={node.ignored}
+      class:cut={cutSet.has(node.path)}
       data-path={node.path}
       style="padding-left: {8 + depth * 14}px"
       draggable="true"
@@ -917,6 +1033,11 @@
 <div class="explorer">
   <div class="ehead">
     <span class="etitle">Explorer</span>
+    {#if clip}
+      <button type="button" class="clip-pill" title="Escape also cancels" onclick={() => (clip = null)}>
+        {clip.mode === 'cut' ? 'cut' : 'copied'} {clip.paths.length} ✕
+      </button>
+    {/if}
     <button type="button" class="ebtn" title="New file" aria-label="New file" onclick={() => createAtRoot('file')}>
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h4.5V13H4.5V3h4.25v3.25H12V7.5h1.5V5zM11.25 9.5v2.25H9v1.5h2.25V15.5h1.5v-2.25H15v-1.5h-2.25V9.5z" /></svg>
     </button>
@@ -952,6 +1073,7 @@
   <div
     class="tree"
     bind:this={treeEl}
+    onkeydown={handleTreeKey}
     ondblclick={handleRootDblClick}
     ondragover={handleRootDragOver}
     ondrop={handleRootDrop}
@@ -984,8 +1106,24 @@
       <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && startRename(menu.path)}>
         Rename…
       </button>
-      <div class="ctx-sep"></div>
     {/if}
+    <div class="ctx-sep"></div>
+    <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && setClip(menu.paths, 'cut')}>
+      Cut{#if menu.paths.length > 1}&nbsp;({menu.paths.length}){/if}
+    </button>
+    <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && setClip(menu.paths, 'copy')}>
+      Copy{#if menu.paths.length > 1}&nbsp;({menu.paths.length}){/if}
+    </button>
+    <button
+      type="button"
+      role="menuitem"
+      class="ctx-item"
+      disabled={!clip}
+      onclick={() => menu && paste(menu.type === 'dir' ? menu.path : parentOf(menu.path) || folder)}
+    >
+      Paste{#if clip}&nbsp;({clip.paths.length}){/if}
+    </button>
+    <div class="ctx-sep"></div>
     <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && copyAsContext(menu.paths)}>
       Copy as context{#if menu.paths.length > 1}&nbsp;({menu.paths.length}){/if}
     </button>
@@ -1179,6 +1317,11 @@
      row stays fully interactive — build output is still worth opening. */
   .row.ignored .name { color: #6e7681; }
   .row.ignored .icon { opacity: 0.5; }
+  /* A pending cut. Deliberately a different kind of dim from the gitignore one
+     above: that tints the name and leaves the row solid, this fades the whole
+     row and leans it over, so the two stay legible even on the same row. */
+  .row.cut { opacity: 0.45; }
+  .row.cut .name { font-style: italic; }
   .loading { color: #949494; }
   .error {
     padding: 8px 12px;
@@ -1209,6 +1352,23 @@
     cursor: pointer;
   }
   .ctx-item:hover { background: #444444; }
+  .ctx-item:disabled { color: #6e7681; cursor: default; }
+  .ctx-item:disabled:hover { background: transparent; }
+  /* Reads as a status, not a button, until hovered — the cut is already the
+     loud signal down in the tree. */
+  .clip-pill {
+    border: 1px solid #505050;
+    border-radius: 10px;
+    background: #2d2d2d;
+    color: #949494;
+    font: inherit;
+    font-size: 10px;
+    letter-spacing: 0;
+    text-transform: none;
+    padding: 0 6px;
+    cursor: pointer;
+  }
+  .clip-pill:hover { background: #3a3a3a; color: #c5c8c6; }
   .ovw-back {
     position: fixed;
     inset: 0;

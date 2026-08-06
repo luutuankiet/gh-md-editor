@@ -34,6 +34,7 @@
   import { monokaiCodeBundle } from '../../lib/monokai-dimmed';
   import { scopeForFilename, highlightToLines, type Tok } from '../../lib/diff-highlight';
   import { wrapPref } from '../../lib/wrap-pref.svelte';
+  import { makeSplitHandle } from '../../lib/split-handle';
 
   interface DiffLine { t: '+' | '-' | ' ' | '\\'; n: number | null; o: number | null; text: string }
   interface Hunk { oldStart: number; oldLines: number; newStart: number; newLines: number; section: string; lines: DiffLine[] }
@@ -464,6 +465,7 @@
         ...(writable ? { revertControls: 'a-to-b' as const } : {}),
       });
       syncX(mv.a.scrollDOM, mv.b.scrollDOM);
+      installSplit();
     } else {
       uv = new EditorView({
         doc: r,
@@ -507,6 +509,29 @@
     };
   }
 
+  // The merge package sizes its two editors flex-grow:1 / flex-basis:0 and
+  // offers no way to move the boundary — which leaves a mostly-empty left side
+  // eating half the width on a file that is nearly all additions. Both sides
+  // are ordinary flex children, so a handle dropped into that row is the whole
+  // fix: no fork, nothing reimplemented.
+  const SPLIT_KEY = 'ghmd.diffSplit';
+  let split: { destroy(): void } | null = null;
+  function installSplit() {
+    split?.destroy();
+    split = null;
+    const row = mv?.dom.querySelector('.cm-mergeViewEditors') as HTMLElement | null;
+    if (!row) return;
+    const wraps = ([...row.children] as HTMLElement[])
+      .filter((c) => c.classList.contains('cm-mergeViewEditor'));
+    if (wraps.length !== 2) return;
+    const h = makeSplitHandle(wraps[0], wraps[1], { axis: 'x', key: SPLIT_KEY, initial: 0.5 });
+    // Anchored to the node rather than to an index: the package inserts its
+    // revert gutter as the second child, so counting positions would put the
+    // handle in the wrong gap.
+    row.insertBefore(h.el, wraps[1]);
+    split = h;
+  }
+
   // Same lockstep for the patch renderer's two columns, which are plain divs
   // rather than editors and so need their own listeners.
   function syncCols(node: HTMLElement) {
@@ -523,13 +548,23 @@
       from.addEventListener('scroll', h, { passive: true });
       offs.push(() => from.removeEventListener('scroll', h));
     };
-    if (cols.length === 2) { on(cols[0], cols[1]); on(cols[1], cols[0]); }
+    if (cols.length === 2) {
+      on(cols[0], cols[1]);
+      on(cols[1], cols[0]);
+      // Same handle, same stored ratio: switching between the merge view and
+      // the patch renderer should not silently rearrange the columns.
+      const h = makeSplitHandle(cols[0], cols[1], { axis: 'x', key: SPLIT_KEY, initial: 0.5 });
+      cols[1].parentElement?.insertBefore(h.el, cols[1]);
+      offs.push(() => h.destroy());
+    }
     return { destroy() { for (const off of offs) off(); } };
   }
 
   function destroyEditor() {
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
     unsync?.();
+    split?.destroy();
+    split = null;
     mv?.destroy();
     uv?.destroy();
     mv = null;
@@ -696,7 +731,7 @@
   }
 </script>
 
-<div class="difftab">
+<div class="difftab pl-dark">
   <div class="diff-head">
     <span class="diff-path" title={subject}>{subject}</span>
     <span class="diff-side">{compare ? `vs ${compare.rightLabel}` : to ? `${toLabel || to.slice(0, 7)} vs ${baseLabel || base.slice(0, 7)}` : base ? `vs ${baseLabel || base.slice(0, 7)}` : staged ? 'staged' : untracked ? 'untracked' : 'working tree'}</span>
@@ -862,39 +897,8 @@
 </div>
 
 <style>
-  /* starry-night ships style/both, whose palette flips with
-     prefers-color-scheme. The diff chrome is hard-coded dark, so on a
-     light-mode OS the tokens came out GitHub-light (near-black text on
-     #1e1e1e). Pin the GitHub-dark palette here, scoped to .difftab, so the
-     preview pane's code blocks stay system-following. Two classes beat the
-     package's single-class rules on specificity, no !important needed. */
-  .difftab :global(.pl-c) { color: #949494; font-style: italic; }
-  .difftab :global(.pl-k) { color: #ff7b72; }
-  .difftab :global(.pl-s),
-  .difftab :global(.pl-pds),
-  .difftab :global(.pl-s .pl-pse .pl-s1),
-  .difftab :global(.pl-sr),
-  .difftab :global(.pl-sr .pl-sra),
-  .difftab :global(.pl-mq) { color: #a5d6ff; }
-  .difftab :global(.pl-sr .pl-cce),
-  .difftab :global(.pl-cce),
-  .difftab :global(.pl-ent) { color: #7ee787; }
-  .difftab :global(.pl-c1),
-  .difftab :global(.pl-s .pl-v),
-  .difftab :global(.pl-corl) { color: #79c0ff; }
-  .difftab :global(.pl-e),
-  .difftab :global(.pl-en) { color: #d2a8ff; }
-  .difftab :global(.pl-v),
-  .difftab :global(.pl-smw) { color: #ffa657; }
-  .difftab :global(.pl-smi),
-  .difftab :global(.pl-s .pl-s1),
-  .difftab :global(.pl-vpf) { color: #c5c8c6; }
-  .difftab :global(.pl-bu),
-  .difftab :global(.pl-ii) { color: #f85149; }
-  .difftab :global(.pl-mh) { color: #3655b5; font-weight: 600; }
-  .difftab :global(.pl-ml) { color: #f2cc60; }
-  .difftab :global(.pl-mb) { color: #c5c8c6; font-weight: 600; }
-  .difftab :global(.pl-mi) { color: #c5c8c6; font-style: italic; }
+  /* The GitHub-dark token palette this pane needs lives in app.css under
+     `pl-dark`, shared with every other hard-coded-dark code surface. */
 
   /* @codemirror/merge ships a light-first palette. Every rule below is two
      classes deep so it outranks the package's own base theme without
@@ -975,6 +979,25 @@
     flex: 1 1 0;
     min-height: 0;
     overflow: hidden;
+  }
+  /* Built in script — the merge package and the patch renderer each assemble
+     their own DOM — so the rule has to escape component scoping. */
+  .difftab :global(.gmd-split-handle) {
+    flex: 0 0 6px;
+    align-self: stretch;
+    box-sizing: border-box;
+    cursor: col-resize;
+    background: #2b2b2b;
+    border-left: 1px solid #404040;
+    border-right: 1px solid #404040;
+    /* Without this the browser claims the gesture for panning and the drag
+       never reaches the pointer handlers on a touch screen. */
+    touch-action: none;
+  }
+  .difftab :global(.gmd-split-handle:hover),
+  .difftab :global(.gmd-split-handle.active) {
+    background: #0e639c;
+    border-color: #0e639c;
   }
   .diff-head {
     flex: 0 0 auto;

@@ -19,9 +19,44 @@ import { registerServer, patchServer, unregisterServer, run as runDaemon, VERSIO
 // early because ESM evaluates every import in the file before any statement
 // in it, so daemon.mjs is already loaded here.
 {
+  const SUBS = ['up', 'down', 'ls', 'list-servers', 'upgrade'];
   const sub = process.argv[2];
-  if (sub === 'up' || sub === 'down' || sub === 'ls' || sub === 'list-servers' || sub === 'upgrade') {
+  if (SUBS.includes(sub)) {
     process.exit(await runDaemon(sub, process.argv.slice(3)));
+  }
+
+  // Levenshtein, only ever used to turn a mistyped subcommand into a
+  // suggestion — past a couple of edits it is not a typo, it is a directory.
+  const distance = (a, b) => {
+    const row = [...Array(b.length + 1).keys()];
+    for (let i = 1; i <= a.length; i++) {
+      let diag = row[0];
+      row[0] = i;
+      for (let j = 1; j <= b.length; j++) {
+        const above = row[j];
+        row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+        diag = above;
+      }
+    }
+    return row[b.length];
+  };
+
+  // Everything that is not a subcommand is taken as the directory to serve,
+  // which turns a mistyped command into a server rooted at a folder nobody
+  // meant — on an auto-picked port, printing a url as though it had worked.
+  // `list-server` for `list-servers` cost a real debugging session. A word
+  // that close to a command name, naming nothing on disk, is a typo every
+  // time; a directory that genuinely carries the name still wins, because the
+  // existence check comes first.
+  if (typeof sub === 'string' && !sub.startsWith('-')) {
+    let exists = false;
+    try { exists = statSync(path.resolve(process.cwd(), sub)).isDirectory(); } catch { /* not a directory */ }
+    const near = exists ? null : SUBS.find((s) => distance(sub, s) <= 2);
+    if (near) {
+      console.error(`gh-md-editor: unknown command '${sub}' — did you mean '${near}'?`);
+      console.error('  a bare argument is the directory to serve; `--help` lists the commands.');
+      process.exit(2);
+    }
   }
 }
 // A pty and ripgrep are the two native pieces of this server, and both used to
@@ -154,6 +189,17 @@ for (let i = 0; i < argv.length; i++) {
 // bare `--tunnel` can never ship an unauthenticated public shell.
 if (tunnel && !auth) auth = crypto.randomBytes(16).toString('base64url');
 const ROOT = path.resolve(process.cwd(), rootArg);
+// A root that does not exist used to start a perfectly healthy server over an
+// empty tree, so the mistake only surfaced later as "why is my workspace
+// empty". Whatever produced the path — a typo, a stale shell alias, a deleted
+// checkout — there is nothing to serve and nothing this process can do about
+// it.
+try {
+  if (!statSync(ROOT).isDirectory()) throw new Error('not a directory');
+} catch {
+  console.error(`gh-md-editor: cannot serve ${ROOT} — no such directory.`);
+  process.exit(2);
+}
 // Shipped alongside this file and prepended to every integrated shell's PATH,
 // which is what makes `code-gh` resolve inside the terminal and nowhere else.
 const BIN_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), 'bin');
@@ -1026,14 +1072,50 @@ function upgradeBlocker() {
   return null;
 }
 
-function apiVersion(res) {
+// What npm currently publishes, which is the only thing that makes "upgrade"
+// a meaningful word. Cached, because the badge asks on every page load and a
+// registry round-trip per load is rude — but not for long, so a release cut
+// mid-session still shows up. A failed lookup returns null rather than
+// throwing: an offline host should still get a version badge, and the
+// pre-existing permissive answer is the honest one when the registry cannot
+// be reached.
+const LATEST_TTL_MS = 15 * 60_000;
+let latestSeen = { version: null, at: 0 };
+
+async function latestPublished() {
+  if (latestSeen.version && Date.now() - latestSeen.at < LATEST_TTL_MS) return latestSeen.version;
+  try {
+    // Plain accept: npm's abbreviated-metadata type is only understood on the
+    // packument, and asking for it here answers 200 with an empty body.
+    const r = await fetch(`https://registry.npmjs.org/${PKG}/latest`, {
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j?.version) return null;
+    latestSeen = { version: j.version, at: Date.now() };
+    return j.version;
+  } catch {
+    return null;
+  }
+}
+
+async function apiVersion(res) {
   const blocker = upgradeBlocker();
+  const latest = blocker ? null : await latestPublished();
+  // Offering an upgrade to the version already running is the click that
+  // wastes a restart and takes every live terminal session with it — and then
+  // reports success, because the restart genuinely happened. Being on the
+  // latest release is not a blocker, though: `upgrade --force` from a
+  // terminal still reinstalls deliberately.
+  const current = latest !== null && latest === VERSION;
   sendJson(res, 200, {
     version: VERSION,
     pkg: PKG,
     port,
-    upgradable: !blocker,
-    reason: blocker,
+    latest,
+    upgradable: !blocker && !current,
+    reason: blocker ?? (current ? `already on the latest release (${VERSION})` : null),
     log: UPGRADE_LOG,
   });
 }
@@ -1251,6 +1333,9 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/upload' && req.method === 'POST') return await apiUpload(req, res);
     if (url.pathname === '/api/search' && req.method === 'GET') return apiSearch(req, res, url.searchParams);
     if (url.pathname === '/api/defs' && req.method === 'GET') return apiDefs(req, res, url.searchParams);
+    if (url.pathname === '/api/refs' && req.method === 'GET') return apiRefs(req, res, url.searchParams);
+    if (url.pathname === '/api/refcounts' && req.method === 'GET') return apiRefCounts(req, res, url.searchParams);
+    if (url.pathname === '/api/resolveimport' && req.method === 'GET') return await apiResolveImport(res, url.searchParams);
     if (url.pathname === '/api/context' && req.method === 'GET') return await apiContext(res, url.searchParams);
     if (url.pathname === '/api/download' && req.method === 'GET') return await apiDownload(res, url.searchParams);
     if (url.pathname === '/api/git/repos' && req.method === 'GET') return await apiGitRepos(res, url.searchParams);
@@ -1290,7 +1375,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/entry' && req.method === 'PATCH') return await apiMoveEntry(req, res);
     if (url.pathname === '/api/entry/copy' && req.method === 'POST') return await apiCopyEntry(req, res);
     if (url.pathname === '/api/ports' && req.method === 'GET') return await apiPorts(res);
-    if (url.pathname === '/api/version' && req.method === 'GET') return apiVersion(res);
+    if (url.pathname === '/api/version' && req.method === 'GET') return await apiVersion(res);
     if (url.pathname === '/api/upgrade' && req.method === 'POST') return apiUpgrade(res);
     if (url.pathname.startsWith('/api/')) return sendJson(res, 404, { error: 'unknown endpoint' });
     const px = parseProxyPath(url.pathname);
@@ -1421,6 +1506,264 @@ function apiDefs(req, res, params) {
   rg.on('close', () => finish({ hits, truncated }));
   // A click can be abandoned by closing the tab mid-scan.
   req.on('close', () => { if (!sent) rg.kill('SIGKILL'); });
+}
+
+// The mirror of /api/defs: every *mention* of an identifier rather than its
+// declaration. Fixed-string word matching, because a reference has no shape to
+// pattern-match — `foo` in `foo()` and in `<foo />` are the same fact. Column
+// ranges ride along so the peek panel can tint the matched word without
+// re-finding it client-side.
+const REFS_CAP = 500;
+
+function apiRefs(req, res, params) {
+  const name = params.get('name') ?? '';
+  if (!/^[A-Za-z_$][\w$]{0,127}$/.test(name)) return sendJson(res, 400, { error: 'not an identifier' });
+  const dir = resolveSafe(params.get('path') ?? '.');
+  if (dir === null) return sendJson(res, 400, { error: 'path escapes root' });
+
+  const rg = spawn(rgBin || 'rg', [
+    '--json',
+    '--no-messages',
+    '--case-sensitive',
+    '--word-regexp',
+    '--fixed-strings',
+    '--max-filesize', '2M',
+    '--max-columns', '400',
+    '-e', name,
+    '--', dir || '.',
+  ], { cwd: ROOT });
+
+  const hits = [];
+  let truncated = false;
+  let tail = '';
+  let sent = false;
+  const finish = (payload) => {
+    if (sent) return;
+    sent = true;
+    sendJson(res, 200, payload);
+  };
+
+  rg.on('error', (e) => finish({
+    hits: [],
+    error: e.code === 'ENOENT' ? 'ripgrep (rg) not found on PATH' : String(e.message ?? e),
+  }));
+
+  rg.stdout.on('data', (chunk) => {
+    tail += chunk;
+    const lines = tail.split('\n');
+    tail = lines.pop() ?? '';
+    for (const l of lines) {
+      if (!l) continue;
+      let o;
+      try { o = JSON.parse(l); } catch { continue; }
+      if (o.type !== 'match') continue;
+      const text = rgText(o.data.lines).replace(/\r?\n$/, '');
+      hits.push({
+        path: toClientPath(rgText(o.data.path)),
+        line: o.data.line_number ?? 1,
+        text: text.slice(0, 400),
+        cols: charCols(text, o.data.submatches),
+      });
+      if (hits.length >= REFS_CAP) {
+        truncated = true;
+        rg.kill('SIGKILL');
+        return;
+      }
+    }
+  });
+
+  rg.on('close', () => finish({ hits, truncated }));
+  req.on('close', () => { if (!sent) rg.kill('SIGKILL'); });
+}
+
+// Counts for the reference lens above every declaration in one file. A process
+// per symbol would mean dozens of ripgreps per keystroke-settled outline, so
+// every name goes into a single alternation and the submatch text says which
+// one was hit. Identifiers are validated above, so none can carry a regex
+// metacharacter into the pattern.
+const REFCOUNT_NAME_CAP = 120;
+const REFCOUNT_MATCH_CAP = 20000;
+
+function apiRefCounts(req, res, params) {
+  const raw = (params.get('names') ?? '').split(',').map((s) => s.trim());
+  const names = [...new Set(raw)]
+    .filter((n) => /^[A-Za-z_$][\w$]{0,127}$/.test(n))
+    .slice(0, REFCOUNT_NAME_CAP);
+  if (!names.length) return sendJson(res, 200, { counts: {} });
+  const dir = resolveSafe(params.get('path') ?? '.');
+  if (dir === null) return sendJson(res, 400, { error: 'path escapes root' });
+
+  const counts = Object.create(null);
+  for (const n of names) counts[n] = 0;
+
+  const rg = spawn(rgBin || 'rg', [
+    '--json',
+    '--no-messages',
+    '--case-sensitive',
+    '--word-regexp',
+    '--max-filesize', '2M',
+    '--max-columns', '400',
+    '-e', names.join('|'),
+    '--', dir || '.',
+  ], { cwd: ROOT });
+
+  let seen = 0;
+  let truncated = false;
+  let tail = '';
+  let sent = false;
+  const finish = (payload) => {
+    if (sent) return;
+    sent = true;
+    sendJson(res, 200, payload);
+  };
+
+  rg.on('error', () => finish({ counts, unavailable: true }));
+
+  rg.stdout.on('data', (chunk) => {
+    tail += chunk;
+    const lines = tail.split('\n');
+    tail = lines.pop() ?? '';
+    for (const l of lines) {
+      if (!l) continue;
+      let o;
+      try { o = JSON.parse(l); } catch { continue; }
+      if (o.type !== 'match') continue;
+      for (const s of o.data.submatches ?? []) {
+        const w = rgText(s.match);
+        if (w in counts) counts[w] += 1;
+        seen += 1;
+      }
+      if (seen >= REFCOUNT_MATCH_CAP) {
+        truncated = true;
+        rg.kill('SIGKILL');
+        return;
+      }
+    }
+  });
+
+  rg.on('close', () => finish({ counts, truncated }));
+  req.on('close', () => { if (!sent) rg.kill('SIGKILL'); });
+}
+
+// --- import resolution -----------------------------------------------------
+// Go-to-definition guesses; an import statement knows. Given the specifier a
+// file imports a name from, this walks it to a real file so the jump lands in
+// the right module instead of the first workspace-wide regex hit — which in a
+// tree carrying worktrees or vendored copies is routinely the wrong one.
+const MODULE_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts', '.svelte', '.vue', '.json', '.py', '.go', '.rs'];
+const PROJECT_MARKERS = ['package.json', '.git', 'go.mod', 'pyproject.toml', 'Cargo.toml'];
+const ALIAS_ROOTS = ['src', '.', 'app', 'lib'];
+
+async function isFile(p) {
+  try { return (await fs.stat(p)).isFile() ? p : null; } catch { return null; }
+}
+
+// Extensionless specifiers are the norm everywhere but Deno, so the extension
+// has to be guessed back on — then the directory form, which is the other half
+// of the same convention.
+async function probeModule(base) {
+  const direct = await isFile(base);
+  if (direct) return direct;
+  for (const e of MODULE_EXTS) {
+    const hit = await isFile(base + e);
+    if (hit) return hit;
+  }
+  for (const e of MODULE_EXTS) {
+    const hit = await isFile(path.join(base, 'index' + e));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function nearestAncestor(fileAbs, markers) {
+  let dir = path.dirname(fileAbs);
+  for (let i = 0; i < 24; i++) {
+    for (const m of markers) {
+      // stat, not isFile: `.git` is a directory in a normal clone and a file
+      // in a worktree, and either one marks the root just as well.
+      try { await fs.stat(path.join(dir, m)); return dir; } catch { /* keep climbing */ }
+    }
+    const up = path.dirname(dir);
+    if (up === dir) return null;
+    dir = up;
+  }
+  return null;
+}
+
+// tsconfig/jsconfig are JSON with comments and trailing commas in practice.
+// Stripping both is cheaper and far more forgiving than pulling in a parser
+// for a file that is only ever read to answer "what does @/ mean here".
+function looseJson(txt) {
+  const stripped = txt.replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, (m) => (m[0] === '"' ? m : ''));
+  return JSON.parse(stripped.replace(/,(\s*[}\]])/g, '$1'));
+}
+
+async function pathsConfigFor(fileAbs) {
+  let dir = path.dirname(fileAbs);
+  for (let i = 0; i < 24; i++) {
+    for (const nm of ['tsconfig.json', 'jsconfig.json']) {
+      try {
+        const cfg = looseJson(await fs.readFile(path.join(dir, nm), 'utf8'));
+        const co = cfg.compilerOptions ?? {};
+        if (co.paths || co.baseUrl) return { dir, baseUrl: co.baseUrl ?? '.', paths: co.paths ?? {} };
+      } catch { /* absent or unparseable — keep climbing */ }
+    }
+    const up = path.dirname(dir);
+    if (up === dir) return null;
+    dir = up;
+  }
+  return null;
+}
+
+function applyPathsMap(spec, cfg) {
+  const base = path.resolve(cfg.dir, cfg.baseUrl || '.');
+  const out = [];
+  for (const [pat, targets] of Object.entries(cfg.paths)) {
+    const list = Array.isArray(targets) ? targets : [];
+    const star = pat.indexOf('*');
+    if (star < 0) {
+      if (pat === spec) for (const t of list) out.push(path.resolve(base, t));
+      continue;
+    }
+    const head = pat.slice(0, star);
+    const tail = pat.slice(star + 1);
+    if (spec.length < head.length + tail.length) continue;
+    if (!spec.startsWith(head) || !spec.endsWith(tail)) continue;
+    const mid = spec.slice(head.length, spec.length - tail.length);
+    for (const t of list) out.push(path.resolve(base, t.replace('*', mid)));
+  }
+  return out;
+}
+
+async function apiResolveImport(res, params) {
+  const spec = params.get('spec') ?? '';
+  if (!spec || spec.length > 512) return sendJson(res, 400, { error: 'bad specifier' });
+  const fromAbs = resolveSafe(params.get('from') ?? '');
+  if (fromAbs === null) return sendJson(res, 400, { error: 'path escapes root' });
+
+  const cands = [];
+  if (/^\.\.?\//.test(spec)) {
+    cands.push(path.resolve(path.dirname(fromAbs), spec));
+  } else {
+    const cfg = await pathsConfigFor(fromAbs);
+    if (cfg) cands.push(...applyPathsMap(spec, cfg));
+    // An alias is as often a bundler convention as a tsconfig entry. `@/x`
+    // means the project's source root nine times out of ten, so try that
+    // rather than falling straight through to the workspace-wide scan.
+    const m = /^[@~#]\/(.+)$/.exec(spec);
+    if (m) {
+      const root = await nearestAncestor(fromAbs, PROJECT_MARKERS);
+      if (root) for (const sub of ALIAS_ROOTS) cands.push(path.resolve(root, sub, m[1]));
+    }
+  }
+
+  for (const c of cands) {
+    const hit = await probeModule(c);
+    if (hit) return sendJson(res, 200, { path: toClientPath(hit) });
+  }
+  // A bare package name, or an alias nothing on disk backs. The caller falls
+  // back to the declaration scan.
+  return sendJson(res, 200, { path: null });
 }
 
 function apiSearch(req, res, params) {

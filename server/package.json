@@ -1,19 +1,41 @@
 {
   "name": "@luutuankiet/gh-md-editor",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "description": "Lightweight browser editor served from any folder: markdown cockpit (editor + live preview + outline), code tabs with syntax highlight, git source control, integrated terminal, ripgrep search.",
   "type": "module",
-  "bin": { "gh-md-editor": "index.mjs" },
-  "files": ["index.mjs", "daemon.mjs", "bin", "dist/web"],
+  "bin": {
+    "gh-md-editor": "index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "daemon.mjs",
+    "bin",
+    "dist/web"
+  ],
   "scripts": {
     "prepublishOnly": "test -f dist/web/index.html"
   },
-  "repository": { "type": "git", "url": "git+https://github.com/luutuankiet/gh-md-editor.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/luutuankiet/gh-md-editor.git"
+  },
   "homepage": "https://github.com/luutuankiet/gh-md-editor#readme",
   "license": "MIT",
-  "engines": { "node": ">=20" },
-  "publishConfig": { "access": "public" },
-  "keywords": ["markdown", "editor", "preview", "codemirror", "terminal", "git", "web-editor"],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "markdown",
+    "editor",
+    "preview",
+    "codemirror",
+    "terminal",
+    "git",
+    "web-editor"
+  ],
   "dependencies": {
     "ws": "^8.21.1"
   },

@@ -27,7 +27,10 @@
     // `untitled:` key until Save As assigns a real one.
     untitled?: boolean;
     // Set by a search-result click; consumed by CodeTab to scroll + select.
-    reveal?: { line: number; seq: number; select?: { from: number; to: number } };
+    // `word` is the identifier a navigation resolved to. The destination
+    // editor finds and selects it, so a jump ends looking at the symbol rather
+    // than at a line number that happens to contain it.
+    reveal?: { line: number; seq: number; select?: { from: number; to: number }; word?: string };
     // A file as it stood at a commit: real content, no path to write back to.
     ro?: boolean;
     // Present on kind === 'diff' tabs: which repo/file/side the tab shows.
@@ -727,10 +730,10 @@
   $effect(() => {
     const onOpenRequest = (e: Event) => {
       const d = (e as CustomEvent).detail as
-        { kind?: string; path?: string; reuse?: boolean; line?: number } | null;
+        { kind?: string; path?: string; reuse?: boolean; line?: number; word?: string } | null;
       if (!d?.path) return;
       if (d.kind === 'folder') openWorkspaceIn(d.path, d.reuse ? 'same' : 'tab');
-      else void openFile(d.path, { pinned: true, line: d.line });
+      else void openFile(d.path, { pinned: true, line: d.line, word: d.word });
     };
     window.addEventListener('gmd:open-request', onOpenRequest);
     return () => window.removeEventListener('gmd:open-request', onOpenRequest);
@@ -1069,14 +1072,14 @@
   // spawning a duplicate tab.
   const pendingOpens = new Map<string, { pinned: boolean }>();
 
-  async function openFile(path: string, opts: { pinned: boolean; line?: number }) {
+  async function openFile(path: string, opts: { pinned: boolean; line?: number; word?: string }) {
     // If open in ANY group, focus it there — duplicating a file across groups
     // would fork its content buffer and make saves ambiguous.
     for (const g of groups) {
       const existing = g.tabs.find((t) => t.path === path);
       if (existing) {
         if (opts.pinned) existing.pinned = true;
-        if (opts.line) existing.reveal = { line: opts.line, seq: ++revealSeq };
+        if (opts.line || opts.word) existing.reveal = { line: opts.line ?? 1, seq: ++revealSeq, word: opts.word };
         activeGroupId = g.id;
         g.activePath = path;
         noteRecentFile(path);
@@ -1113,7 +1116,7 @@
     // VS Code preview-tab semantics: an unpinned preview tab is replaced by the
     // next preview open. A dirty preview is treated as pinned so edits are not
     // silently discarded.
-    if (opts.line) tab.reveal = { line: opts.line, seq: ++revealSeq };
+    if (opts.line || opts.word) tab.reveal = { line: opts.line ?? 1, seq: ++revealSeq, word: opts.word };
 
     const home = groups.includes(target) ? target : groups[0];
     const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));

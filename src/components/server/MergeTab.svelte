@@ -5,6 +5,7 @@
   import MergePane from './MergePane.svelte';
   import type { PaneAction } from './MergePane.svelte';
   import { wrapPref } from '../../lib/wrap-pref.svelte';
+  import { splitter } from '../../lib/split-handle';
 
   let { repo, path }: { repo: string; path: string } = $props();
 
@@ -403,14 +404,23 @@
   {:else}
     <div class="panes">
       {@render pane('Current', active?.oursLabel ?? 'in this branch', ours, spans.ours, currentActions, 'ours')}
+      <div class="gmd-split-handle x" use:splitter={{ axis: 'x', key: 'ghmd.merge.oursBase' }}></div>
       <!-- The ancestor is always shown — seeing what the line started as is
            most of why this view exists — but it can only be accepted when the
            markers carry an ancestor section to accept, which is to say when
            the file was written in the diff3 conflict style. Offering the
            button otherwise would splice in nothing and read as a delete. -->
       {@render pane('Base', 'common ancestor', base, spans.base, baseActions, 'base')}
+      <div class="gmd-split-handle x" use:splitter={{ axis: 'x', key: 'ghmd.merge.baseTheirs' }}></div>
       {@render pane('Incoming', active?.theirsLabel ?? 'being merged in', theirs, spans.theirs, incomingActions, 'theirs')}
     </div>
+    <!-- The conflict row is a fixed share of the height and the result takes
+         the rest, so this boundary moves a flex-basis rather than trading grow
+         between two flexible siblings. -->
+    <div
+      class="gmd-split-handle y"
+      use:splitter={{ axis: 'y', mode: 'basis', key: 'ghmd.merge.resultSplit', initial: 0.38 }}
+    ></div>
     <div class="result">
       <div class="pane-head">
         <span class="pane-title">Result</span>
@@ -475,6 +485,19 @@
     gap: 1px;
     background: #404040;
   }
+  .gmd-split-handle {
+    flex: 0 0 5px;
+    align-self: stretch;
+    box-sizing: border-box;
+    background: #2b2b2b;
+    /* Without this the browser claims the gesture for panning and the drag
+       never reaches the pointer handlers on a touch screen. */
+    touch-action: none;
+  }
+  .gmd-split-handle.x { cursor: col-resize; }
+  .gmd-split-handle.y { cursor: row-resize; }
+  .gmd-split-handle:hover,
+  .gmd-split-handle.active { background: #0e639c; }
   .pane {
     flex: 1 1 0;
     min-width: 0;

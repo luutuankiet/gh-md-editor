@@ -35,6 +35,8 @@
   import { expandSelection, shrinkSelection, resetSelectionHistory } from '../../lib/expand-selection';
   import { formatDocumentText } from '../../lib/format-doc';
   import { wrapPref } from '../../lib/wrap-pref.svelte';
+  import { highlightToLines, scopeForFilename } from '../../lib/diff-highlight';
+  import type { Tok } from '../../lib/diff-highlight';
 
 
   // --- inline change gutter ---------------------------------------------------
@@ -64,6 +66,26 @@
   // Chunk starts (positions in the CURRENT document) whose original text is
   // expanded. A set rather than a single position: having to close one change
   // to read another is exactly the friction that stops people using this.
+  // A brief tint on the symbol a navigation resolved to. A state field rather
+  // than a static decoration so the range maps through edits — a jump landing
+  // moments before a save-format would otherwise leave a stale offset behind.
+  const setNavFlash = StateEffect.define<{ from: number; to: number } | null>();
+  let flashTimer: ReturnType<typeof setTimeout> | undefined;
+  const navFlashField = StateField.define<DecorationSet>({
+    create: () => Decoration.none,
+    update(set, tr) {
+      let next = set.map(tr.changes);
+      for (const e of tr.effects) {
+        if (!e.is(setNavFlash)) continue;
+        next = e.value
+          ? Decoration.set([Decoration.mark({ class: 'cm-navFlash' }).range(e.value.from, e.value.to)])
+          : Decoration.none;
+      }
+      return next;
+    },
+    provide: (f) => EditorView.decorations.from(f),
+  });
+
   const toggleChangePeek = StateEffect.define<number>();
 
   const changePeeks = StateField.define<Set<number>>({
@@ -426,7 +448,11 @@
     // fire again — a bare line number would compare equal and do nothing.
     // `select` carries a range to highlight instead of just placing the cursor,
     // which is how an outline double-click selects a whole declaration.
-    reveal?: { line: number; seq: number; select?: { from: number; to: number } } | null;
+    // `word` is the identifier a navigation resolved to. Given one, the jump
+    // lands on the symbol itself rather than on the start of whatever line the
+    // resolver happened to report — and an import-resolved jump has no line at
+    // all, only a name.
+    reveal?: { line: number; seq: number; select?: { from: number; to: number }; word?: string } | null;
     // Regions the host wants tinted — conflict blocks, in the merge view.
     // Purely decorative: nothing here changes the document.
     marks?: { from: number; to: number; cls: string }[];
@@ -446,12 +472,310 @@
     outlineTimer = setTimeout(() => {
       const nodes = outlineFromState(vw.state);
       outlineNodes = nodes;
-      hasOutline = nodes.length > 0;
       window.dispatchEvent(new CustomEvent('gmd:outline', {
         detail: { name: filename, nodes },
       }));
       syncCrumbs(vw);
+      void refreshLens(vw, nodes);
     }, 200);
+  }
+
+  // --- reference lens --------------------------------------------------------
+  // The `N references` row above every declaration. Counts come from a single
+  // ripgrep over the workspace per outline settle rather than one per symbol —
+  // the endpoint takes every name in one alternation, which is the only reason
+  // this is affordable without a language server.
+  interface Lens { line: number; name: string; n: number }
+
+  class LensWidget extends WidgetType {
+    name: string;
+    n: number;
+    indent: number;
+    constructor(name: string, n: number, indent: number) {
+      super();
+      this.name = name;
+      this.n = n;
+      this.indent = indent;
+    }
+    // Equality keeps an unchanged row's DOM alive across recomputes, so a click
+    // landing while the outline re-settles is not thrown away mid-gesture.
+    eq(o: LensWidget) { return o.name === this.name && o.n === this.n && o.indent === this.indent; }
+    toDOM() {
+      const wrap = document.createElement('div');
+      wrap.className = this.n ? 'cm-refLens' : 'cm-refLens empty';
+      // Aligned with the declaration it belongs to, not with the left margin —
+      // a nested method's lens hanging at column zero reads as belonging to the
+      // class above it.
+      wrap.style.paddingLeft = `${this.indent}ch`;
+      const link = document.createElement('span');
+      link.className = 'cm-refLensLink';
+      link.textContent = this.n === 1 ? '1 reference' : `${this.n} references`;
+      if (this.n) {
+        link.setAttribute('role', 'button');
+        link.dataset.name = this.name;
+      }
+      wrap.appendChild(link);
+      return wrap;
+    }
+    // The lens is interactive; letting CodeMirror ignore its events would eat
+    // the click.
+    ignoreEvent() { return false; }
+  }
+
+  const setLens = StateEffect.define<Lens[]>();
+  const refLensField = StateField.define<DecorationSet>({
+    create: () => Decoration.none,
+    update(set, tr) {
+      let next = set.map(tr.changes);
+      for (const e of tr.effects) {
+        if (!e.is(setLens)) continue;
+        const doc = tr.state.doc;
+        const b = new RangeSetBuilder<Decoration>();
+        for (const l of e.value) {
+          if (l.line < 1 || l.line > doc.lines) continue;
+          const ln = doc.line(l.line);
+          const indent = /^[ \t]*/.exec(ln.text)?.[0].length ?? 0;
+          b.add(ln.from, ln.from, Decoration.widget({
+            widget: new LensWidget(l.name, l.n, indent),
+            block: true,
+            side: -1,
+          }));
+        }
+        next = b.finish();
+      }
+      return next;
+    },
+    provide: (f) => EditorView.decorations.from(f),
+  });
+
+  const refLensClicks = EditorView.domEventHandlers({
+    mousedown(e) {
+      const link = (e.target as HTMLElement | null)?.closest('.cm-refLensLink') as HTMLElement | null;
+      const name = link?.dataset.name;
+      if (!name) return false;
+      // Without this the click also places the caret, which scrolls the buffer
+      // out from under the panel about to open over it.
+      e.preventDefault();
+      void openPeek(name);
+      return true;
+    },
+  });
+
+  // What the reference endpoints search. The workspace folder rather than the
+  // whole server root: a root holding a dozen sibling checkouts would report
+  // matches from projects the reader never opened.
+  function searchScope(): string {
+    const cut = gitPath.indexOf('/');
+    return cut > 0 ? gitPath.slice(0, cut) : (gitPath || '.');
+  }
+
+  const LENS_NAME_CAP = 120;
+  let lensCounts = new Map<string, number>();
+  let lensKey = '';
+
+  // Only declarations that create something callable or nameable from another
+  // file. A word count for a variable is a fiction whatever its scope: `const
+  // n` reported four hundred hits from every unrelated `n` in the workspace,
+  // and a top-level `let error` in a component reported four hundred more. A
+  // CSS rule has the same problem for the opposite reason — the selector is
+  // not an identifier anyone refers to by name.
+  const LENS_KINDS: ReadonlySet<string> = new Set(['function', 'class', 'interface', 'enum', 'module']);
+
+  function lensTargets(nodes: OutlineNode[], out: OutlineNode[] = []): OutlineNode[] {
+    for (const n of nodes) {
+      if (n.name && LENS_KINDS.has(n.kind ?? '') && /^[A-Za-z_$][\w$]{0,127}$/.test(n.name)) out.push(n);
+      lensTargets(n.children, out);
+    }
+    return out;
+  }
+
+  function paintLens(vw: EditorView, targets: OutlineNode[]) {
+    const seen = new Set<number>();
+    const rows: Lens[] = [];
+    for (const t of targets) {
+      const total = lensCounts.get(t.name as string);
+      if (total === undefined || seen.has(t.line)) continue;
+      seen.add(t.line);
+      // The declaration is itself one of the matches ripgrep counted, and a
+      // symbol that is only declared has zero references, not one.
+      rows.push({ line: t.line, name: t.name as string, n: Math.max(0, total - 1) });
+    }
+    rows.sort((a, b) => a.line - b.line);
+    vw.dispatch({ effects: setLens.of(rows) });
+  }
+
+  async function refreshLens(vw: EditorView, nodes: OutlineNode[]) {
+    // An unsaved buffer has no path to search from, and nothing on disk refers
+    // to it yet anyway.
+    if (!gitPath) return;
+    const targets = lensTargets(nodes).slice(0, LENS_NAME_CAP);
+    const names = [...new Set(targets.map((t) => t.name as string))];
+    const key = `${gitPath}\u0000${names.join(',')}`;
+    if (!names.length) {
+      lensKey = key;
+      lensCounts = new Map();
+      vw.dispatch({ effects: setLens.of([]) });
+      return;
+    }
+    // Typing inside a body moves the rows without changing the symbol set, so
+    // the counts are refetched only when that set actually changes. Repainting
+    // is cheap; a workspace-wide ripgrep per keystroke-settle is not.
+    if (key === lensKey) { paintLens(vw, targets); return; }
+    lensKey = key;
+    try {
+      const r = await fetch(
+        `/api/refcounts?names=${encodeURIComponent(names.join(','))}&path=${encodeURIComponent(searchScope())}`,
+      );
+      const j = (await r.json()) as { counts?: Record<string, number> };
+      if (untrack(() => view) !== vw || lensKey !== key) return;
+      lensCounts = new Map(Object.entries(j.counts ?? {}));
+      paintLens(vw, targets);
+    } catch { /* an unreachable counter just leaves the rows off */ }
+  }
+
+  // --- peek references -------------------------------------------------------
+  // Every mention of a symbol, at a glance, without leaving the file being
+  // read: a preview of the surrounding lines on the left, the locations grouped
+  // by file on the right. Escape closes it.
+  interface PeekHit { path: string; line: number; text: string; cols?: [number, number][] }
+  interface PeekLine { n: number; toks: Tok[]; hit: boolean }
+
+  const PEEK_CTX = 4;
+
+  let peek = $state<{
+    name: string;
+    loading: boolean;
+    hits: PeekHit[];
+    truncated: boolean;
+    sel: number;
+    preview: { path: string; lines: PeekLine[] } | null;
+  } | null>(null);
+
+  // Grouped by file with the parent folder beside the name, because two files
+  // of the same name in different directories is the normal case in a tree
+  // carrying worktrees or a vendored copy. Hits arrive sorted by path, so the
+  // running index here matches the flat array the keyboard walks.
+  const peekGroups = $derived.by(() => {
+    const p = peek;
+    if (!p) return [];
+    const by = new Map<string, PeekHit[]>();
+    for (const h of p.hits) {
+      const arr = by.get(h.path);
+      if (arr) arr.push(h);
+      else by.set(h.path, [h]);
+    }
+    let i = 0;
+    return [...by].map(([path, hits]) => {
+      const cut = path.lastIndexOf('/');
+      return {
+        path,
+        base: cut < 0 ? path : path.slice(cut + 1),
+        dir: cut < 0 ? '' : path.slice(0, cut),
+        hits: hits.map((h) => {
+          // Leading indentation is dropped so the matched word sits as far left
+          // as the list can put it; the column range rides in from the server
+          // rather than being re-found here.
+          const lead = h.text.length - h.text.trimStart().length;
+          const c = h.cols?.[0];
+          const from = c ? Math.max(lead, c[0]) : lead;
+          const to = c ? Math.max(from, c[1]) : from;
+          return {
+            i: i++,
+            line: h.line,
+            pre: h.text.slice(lead, from),
+            mid: h.text.slice(from, to),
+            post: h.text.slice(to),
+          };
+        }),
+      };
+    });
+  });
+
+  function closePeek() {
+    peek = null;
+    view?.focus();
+  }
+
+  function autofocus(node: HTMLElement) {
+    node.focus();
+  }
+
+  async function openPeek(name: string) {
+    if (!gitPath) return;
+    peek = { name, loading: true, hits: [], truncated: false, sel: 0, preview: null };
+    try {
+      const r = await fetch(
+        `/api/refs?name=${encodeURIComponent(name)}&path=${encodeURIComponent(searchScope())}`,
+      );
+      const j = (await r.json()) as { hits?: PeekHit[]; truncated?: boolean; error?: string };
+      if (peek?.name !== name) return;
+      if (j.error) { peek = null; showNotice(`References: ${j.error}`); return; }
+      const hits = (j.hits ?? []).sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
+      if (!hits.length) { peek = null; showNotice(`No references to “${name}”`); return; }
+      peek = { name, loading: false, hits, truncated: !!j.truncated, sel: 0, preview: null };
+      void loadPreview(0);
+    } catch {
+      peek = null;
+      showNotice('Reference lookup failed');
+    }
+  }
+
+  async function loadPreview(i: number) {
+    const p = peek;
+    const hit = p?.hits[i];
+    if (!p || !hit) return;
+    peek = { ...p, sel: i, preview: null };
+    try {
+      const r = await fetch(`/api/file?path=${encodeURIComponent(hit.path)}`);
+      const j = (await r.json()) as { content?: string };
+      if (peek?.name !== p.name || peek.sel !== i) return;
+      const all = (j.content ?? '').split('\n');
+      const from = Math.max(1, hit.line - PEEK_CTX);
+      const to = Math.min(all.length, hit.line + PEEK_CTX);
+      // Only the window is highlighted, not the whole file: a grammar run over
+      // a 10k-line module to colour nine lines is the wrong trade, and the
+      // window is self-contained enough to colour convincingly.
+      const scope = await scopeForFilename(hit.path);
+      const toks = scope ? await highlightToLines(all.slice(from - 1, to).join('\n'), scope) : [];
+      if (peek?.name !== p.name || peek.sel !== i) return;
+      const lines: PeekLine[] = [];
+      for (let n = from; n <= to; n++) {
+        lines.push({
+          n,
+          toks: toks[n - from] ?? [{ cls: null, text: all[n - 1] ?? '' }],
+          hit: n === hit.line,
+        });
+      }
+      peek = { ...peek, preview: { path: hit.path, lines } };
+    } catch { /* the preview is a nicety; the locations list is the answer */ }
+  }
+
+  function peekOpen(i: number) {
+    const hit = peek?.hits[i];
+    const word = peek?.name;
+    if (!hit) return;
+    closePeek();
+    window.dispatchEvent(new CustomEvent('gmd:open-request', {
+      detail: { kind: 'file', path: hit.path, line: hit.line, word },
+    }));
+  }
+
+  function peekKey(e: KeyboardEvent) {
+    const p = peek;
+    if (!p) return;
+    if (e.key === 'Escape') {
+      // Stopped here so the same keystroke does not also close the search panel
+      // or clear the selection in the editor underneath.
+      e.preventDefault();
+      e.stopPropagation();
+      closePeek();
+      return;
+    }
+    if (e.key === 'Enter') { e.preventDefault(); peekOpen(p.sel); return; }
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    const n = p.hits.length;
+    if (n) void loadPreview((p.sel + (e.key === 'ArrowDown' ? 1 : n - 1)) % n);
   }
 
   // --- symbol breadcrumb -----------------------------------------------------
@@ -461,7 +785,6 @@
   // it work on an unsaved buffer whose language was picked by hand from the
   // corner dropdown, where there is no extension to detect.
   let outlineNodes: OutlineNode[] = [];
-  let hasOutline = $state(false);
   let crumbs = $state<OutlineNode[]>([]);
   let crumbFrame = 0;
 
@@ -531,8 +854,87 @@
     return null;
   }
 
-  // Same-file definitions resolve from the outline already in hand: no round
-  // trip, and it is by far the common case. Only a miss reaches the server.
+  // Where a jump should actually come to rest. The requested line is a hint:
+  // a reference carries the exact line worth looking at, an import-resolved
+  // jump carries none, and in both cases what the reader wants in front of
+  // them is the identifier, not a row number that happens to contain it.
+  function wordColIn(text: string, word: string): number {
+    const re = new RegExp(`(?:^|[^\\w$])(${word})(?![\\w$])`);
+    const m = re.exec(text);
+    return m ? m.index + m[0].length - word.length : -1;
+  }
+
+  const DECL_KEYWORDS = 'function|class|interface|type|enum|struct|impl|trait|module|namespace|def|fn|func|const|let|var';
+
+  function findSymbol(
+    state: EditorState,
+    word: string,
+    hintLine: number,
+  ): { from: number; to: number } | null {
+    if (!/^[A-Za-z_$][\w$]*$/.test(word)) return null;
+    const doc = state.doc;
+    // A hinted line that really holds the word wins outright — that is the
+    // occurrence the caller meant.
+    const hint = doc.line(Math.min(Math.max(1, hintLine), doc.lines));
+    const atHint = wordColIn(hint.text, word);
+    if (atHint >= 0) return { from: hint.from + atHint, to: hint.from + atHint + word.length };
+    // Otherwise prefer a line that declares the name over one that merely
+    // mentions it: landing on `export default function HeroSplit()` is the
+    // point, landing on an unrelated call site is noise.
+    const decl = new RegExp(`(?:^|[^\\w$.])(?:${DECL_KEYWORDS})\\s+${word}\\b`);
+    let first: { from: number; to: number } | null = null;
+    const cap = Math.min(doc.lines, 5000);
+    for (let i = 1; i <= cap; i++) {
+      const ln = doc.line(i);
+      const col = wordColIn(ln.text, word);
+      if (col < 0) continue;
+      const range = { from: ln.from + col, to: ln.from + col + word.length };
+      if (decl.test(ln.text)) return range;
+      if (!first) first = range;
+    }
+    return first;
+  }
+
+  function landOn(vw: EditorView, range: { from: number; to: number }) {
+    vw.dispatch({
+      selection: EditorSelection.single(range.from, range.to),
+      effects: [
+        EditorView.scrollIntoView(range.from, { y: 'center' }),
+        setNavFlash.of(range),
+      ],
+    });
+    vw.focus();
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => {
+      try { vw.dispatch({ effects: setNavFlash.of(null) }); } catch { /* view gone */ }
+    }, 1400);
+  }
+
+  // The import statement that brings `word` into this file, if there is one.
+  // A workspace-wide declaration scan is a guess; an import is a fact, and in
+  // a tree carrying worktrees or vendored copies the guess routinely resolves
+  // to the wrong copy. Both clause forms allow newlines inside the binding
+  // list, because a named-import block is commonly wrapped across lines.
+  const IMPORT_CLAUSE = /(?:^|[\n;])\s*import\s+([^;'"]*?)\s*from\s*['"]([^'"\n]+)['"]/g;
+  const REQUIRE_CLAUSE = /(?:^|[\n;])\s*(?:const|let|var)\s+([^=;]+?)\s*=\s*require\(\s*['"]([^'"\n]+)['"]\s*\)/g;
+
+  function importSpecFor(head: string, word: string): string | null {
+    const bound = new RegExp(`(?:^|[^\\w$.])${word}(?![\\w$])`);
+    for (const re of [IMPORT_CLAUSE, REQUIRE_CLAUSE]) {
+      re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(head)) !== null) {
+        // `X as Y` binds Y locally, and the clause carries both — matching
+        // either is right, since both name this module.
+        if (bound.test(m[1])) return m[2];
+      }
+    }
+    return null;
+  }
+
+  // Resolution order, cheapest and most certain first: a declaration in this
+  // very file, then the module this file imports the name from, then a
+  // workspace-wide scan for anything shaped like a declaration.
   async function goToDefinition(vw: EditorView, pos: number) {
     const w = vw.state.wordAt(pos);
     if (!w) return;
@@ -540,10 +942,31 @@
     if (!/^[A-Za-z_$][\w$]*$/.test(word)) return;
     const here = localDef(outlineNodes, word, vw.state, pos);
     if (here) {
-      vw.dispatch({ selection: EditorSelection.cursor(here.from), scrollIntoView: true });
-      vw.focus();
+      const at = findSymbol(vw.state, word, vw.state.doc.lineAt(here.from).number);
+      landOn(vw, at ?? { from: here.from, to: here.from });
       return;
     }
+
+    // Imports live at the top of a file by construction; scanning the whole
+    // buffer for them would be paying for the tail of a 10k-line file on every
+    // click.
+    const doc = vw.state.doc;
+    const spec = gitPath ? importSpecFor(doc.sliceString(0, Math.min(doc.length, 20000)), word) : null;
+    if (spec) {
+      try {
+        const r = await fetch(
+          `/api/resolveimport?spec=${encodeURIComponent(spec)}&from=${encodeURIComponent(gitPath)}`,
+        );
+        const j = (await r.json()) as { path?: string | null };
+        if (j.path) {
+          window.dispatchEvent(new CustomEvent('gmd:open-request', {
+            detail: { kind: 'file', path: j.path, word },
+          }));
+          return;
+        }
+      } catch { /* an unreachable resolver is not a reason to give up */ }
+    }
+
     try {
       const r = await fetch(`/api/defs?name=${encodeURIComponent(word)}`);
       const j = (await r.json()) as { hits?: { path: string; line: number }[]; error?: string };
@@ -553,7 +976,7 @@
         return;
       }
       window.dispatchEvent(new CustomEvent('gmd:open-request', {
-        detail: { kind: 'file', path: hits[0].path, line: hits[0].line },
+        detail: { kind: 'file', path: hits[0].path, line: hits[0].line, word },
       }));
       // Opening the first and saying so beats a picker for the common case of
       // one real definition plus a re-export.
@@ -931,6 +1354,9 @@
         diffCompartment.of([]),
         changePeeks,
         changePeekDecorations,
+        navFlashField,
+        refLensField,
+        refLensClicks,
         wrapCompartment.of(untrack(() => wrapPref.on) ? EditorView.lineWrapping : []),
         markCompartment.of([]),
         languageCompartment.of([]),
@@ -951,6 +1377,26 @@
           },
           // Host-supplied marks. Faint for every conflict still in the buffer,
           // stronger for the one the merge toolbar is pointing at.
+          // Where a go-to-definition landed. Loud enough to find with the eye
+          // on arrival, gone before it can be mistaken for a selection.
+          '.cm-navFlash': {
+            backgroundColor: 'rgba(229, 192, 32, 0.3)',
+            outline: '1px solid rgba(229, 192, 32, 0.55)',
+            borderRadius: '2px',
+          },
+          // The reference lens. Deliberately quiet — it sits above every
+          // declaration in the file, so anything louder would out-shout the
+          // code it annotates.
+          '.cm-refLens': {
+            paddingTop: '2px',
+            fontSize: '11px',
+            lineHeight: '1.3',
+            color: '#7a7a7a',
+            userSelect: 'none',
+          },
+          '.cm-refLensLink': { cursor: 'pointer' },
+          '.cm-refLensLink:hover': { color: '#4daafc', textDecoration: 'underline' },
+          '.cm-refLens.empty .cm-refLensLink': { cursor: 'default', opacity: '0.65' },
           '.cm-conflictBlock': { backgroundColor: 'rgba(229, 133, 32, 0.09)' },
           '.cm-conflictBlockActive': {
             backgroundColor: 'rgba(229, 133, 32, 0.2)',
@@ -1040,6 +1486,16 @@
           { key: 'Alt-z', preventDefault: true, run: (vw) => { toggleWrap(vw); return true; } },
           // VS Code's Format Document chord, same on every platform.
           { key: 'Shift-Alt-f', preventDefault: true, run: formatDocument },
+          // VS Code's Find All References chord.
+          {
+            key: 'Shift-Alt-F12',
+            preventDefault: true,
+            run: (vw) => {
+              const w = vw.state.wordAt(vw.state.selection.main.head);
+              if (w) void openPeek(vw.state.sliceDoc(w.from, w.to));
+              return true;
+            },
+          },
         ]),
         EditorView.updateListener.of((u) => {
           if (u.docChanged) {
@@ -1378,7 +1834,12 @@
     if (!r || !v) return;
     const doc = v.state.doc;
     const pos = doc.line(Math.min(Math.max(1, r.line), doc.lines)).from;
-    if (r.select) {
+    // A resolved identifier outranks the line it was reported on: the caller
+    // asked to see a symbol, and the line is only how it found it.
+    const found = r.word ? findSymbol(v.state, r.word, r.line) : null;
+    if (found) {
+      landOn(v, found);
+    } else if (r.select) {
       // Clamp: the outline is pushed asynchronously, so its offsets can
       // describe a document that has since shrunk.
       const from = Math.min(Math.max(0, r.select.from), doc.length);
@@ -1424,10 +1885,13 @@
 </script>
 
 <div class="code-container">
-  <!-- Height is reserved for the whole file rather than per-position: showing
-       the strip only where a symbol encloses the caret makes the editor jump a
-       row on every scroll past a top-level gap. -->
-  {#if hasOutline}
+  <!-- Always present, whether or not the grammar yields an outline: the strip
+       carries the language picker too, and one that appeared and vanished with
+       the parse would shift the editor down a row mid-typing. Height is
+       reserved for the whole file rather than per-position for the same
+       reason — a strip that only shows where a symbol encloses the caret makes
+       the editor jump a row on every scroll past a top-level gap. -->
+  <div class="code-head">
     <div class="symbol-crumbs" aria-label="Symbol path">
       {#each crumbs as c, i (c.from + ':' + i)}
         {#if i > 0}<span class="crumb-sep" aria-hidden="true">›</span>{/if}
@@ -1436,7 +1900,25 @@
         </button>
       {/each}
     </div>
-  {/if}
+    <select
+      class="lang-picker"
+      class:hidden={searchOpen}
+      bind:value={selectedLanguage}
+      onchange={() => void applyLanguage(selectedLanguage).then(() => {
+        // A hand-picked grammar has to re-feed the outline itself. Nothing else
+        // fires on this path, and on an unsaved buffer the filename effect — the
+        // only other feeder — never will, so the strip would stay empty.
+        const vw = view;
+        if (vw) pushOutline(vw);
+      })}
+      title="Syntax language"
+      aria-label="Syntax language"
+    >
+      {#each languageNames as name (name)}
+        <option value={name}>{name}</option>
+      {/each}
+    </select>
+  </div>
   <div class="code-body">
     <div class="code-host" bind:this={host}></div>
     <div class="sticky-stack" style={stickyFont}>
@@ -1460,24 +1942,58 @@
         <span class="tick current" style="top: {currentTickY}px"></span>
       {/if}
     </div>
-    <select
-      class="lang-picker"
-      class:hidden={searchOpen}
-      bind:value={selectedLanguage}
-      onchange={() => void applyLanguage(selectedLanguage).then(() => {
-        // A hand-picked grammar has to re-feed the outline itself. Nothing else
-        // fires on this path, and on an unsaved buffer the filename effect — the
-        // only other feeder — never will, so the strip would stay empty.
-        const vw = view;
-        if (vw) pushOutline(vw);
-      })}
-      title="Syntax language"
-      aria-label="Syntax language"
-    >
-      {#each languageNames as name (name)}
-        <option value={name}>{name}</option>
-      {/each}
-    </select>
+    {#if peek}
+      <!-- Over the editor rather than beside it: the point of a peek is that
+           the file being read stays where it was, so closing the panel returns
+           to exactly the same view. -->
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <div class="peek pl-dark" role="dialog" aria-label="References" tabindex="-1" use:autofocus onkeydown={peekKey}>
+        <div class="peek-head">
+          <span class="peek-title">{peek.name}</span>
+          <span class="peek-count">
+            {peek.loading ? 'searching…' : `${peek.hits.length}${peek.truncated ? '+' : ''} references`}
+          </span>
+          <button type="button" class="peek-close" title="Close (Esc)" onclick={closePeek}>✕</button>
+        </div>
+        <div class="peek-body">
+          <div class="peek-preview">
+            {#if peek.preview}
+              <div class="peek-path">{peek.preview.path}</div>
+              {#each peek.preview.lines as l (l.n)}
+                <div class="peek-line" class:hit={l.hit}>
+                  <span class="peek-ln">{l.n}</span><span class="peek-code">{#each l.toks as t, i (i)}<span class={t.cls ?? ''}>{t.text}</span>{/each}</span>
+                </div>
+              {/each}
+            {:else}
+              <div class="peek-empty">{peek.loading ? 'Searching…' : 'Loading preview…'}</div>
+            {/if}
+          </div>
+          <div class="peek-locs">
+            {#each peekGroups as g (g.path)}
+              <div class="peek-group">
+                <div class="peek-file">
+                  <span class="peek-base">{g.base}</span>
+                  <span class="peek-dir" title={g.dir}>{g.dir}</span>
+                  <span class="peek-n">{g.hits.length}</span>
+                </div>
+                {#each g.hits as h (h.i)}
+                  <button
+                    type="button"
+                    class="peek-hit"
+                    class:sel={peek?.sel === h.i}
+                    title="Enter or double-click to open"
+                    onclick={() => void loadPreview(h.i)}
+                    ondblclick={() => peekOpen(h.i)}
+                  >
+                    <span class="peek-hln">{h.line}</span><span class="peek-htext">{h.pre}<mark>{h.mid}</mark>{h.post}</span>
+                  </button>
+                {/each}
+              </div>
+            {/each}
+          </div>
+        </div>
+      </div>
+    {/if}
   </div>
 </div>
 {#if notice}
@@ -1493,27 +2009,209 @@
     display: flex;
     flex-direction: column;
   }
-  /* The tick rail and the language picker are positioned against this box, not
-     against the container, so the breadcrumb strip above cannot skew them. */
+  /* The tick rail is positioned against this box, not against the container,
+     so the strip above cannot skew it. */
   .code-body {
     position: relative;
     flex: 1;
     min-height: 0;
   }
-  /* Not `.crumbs`: the tab header already owns that name for the file path, and
-     two breadcrumbs on one screen are confusing enough without sharing one. */
-  .symbol-crumbs {
+  /* Anchored to the bottom of the editor box, the way VS Code's peek grows up
+     from the line you invoked it on — close enough to that, and it costs no
+     per-line widget bookkeeping. */
+  .peek {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 45%;
+    min-height: 160px;
+    display: flex;
+    flex-direction: column;
+    background: #1e1e1e;
+    border-top: 1px solid #007acc;
+    box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.4);
+    z-index: 8;
+    outline: none;
+  }
+  .peek-head {
     flex: 0 0 auto;
     display: flex;
     align-items: center;
-    gap: 2px;
+    gap: 8px;
+    height: 24px;
+    padding: 0 4px 0 10px;
+    background: #252526;
+    border-bottom: 1px solid #333;
+    font-size: 12px;
+  }
+  .peek-title {
+    color: #d4d4d4;
+    font-weight: 600;
+  }
+  .peek-count {
+    flex: 1 1 auto;
+    color: #8a8a8a;
+    font-size: 11px;
+  }
+  .peek-close {
+    flex: 0 0 auto;
+    width: 20px;
+    height: 20px;
+    border: none;
+    border-radius: 3px;
+    background: none;
+    color: #949494;
+    cursor: pointer;
+    line-height: 1;
+  }
+  .peek-close:hover {
+    background: #3a3a3a;
+    color: #e6e6e6;
+  }
+  .peek-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+  }
+  .peek-preview {
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: auto;
+    padding: 4px 0 6px;
+    font-family: var(--gmd-code-font, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 12px;
+    line-height: 1.45;
+  }
+  .peek-path {
+    padding: 0 10px 4px;
+    color: #7a7a7a;
+    font-size: 11px;
+  }
+  .peek-line {
+    display: flex;
+    white-space: pre;
+  }
+  /* The line the match is on. Everything else in the window is context, and
+     without this the reader has to count rows to find it. */
+  .peek-line.hit {
+    background: rgba(0, 122, 204, 0.18);
+  }
+  .peek-ln {
+    flex: 0 0 auto;
+    width: 46px;
+    padding-right: 10px;
+    text-align: right;
+    color: #5a5a5a;
+    user-select: none;
+  }
+  .peek-code {
+    flex: 1 1 auto;
+    padding-right: 10px;
+  }
+  .peek-empty {
+    padding: 10px;
+    color: #7a7a7a;
+    font-size: 12px;
+  }
+  .peek-locs {
+    flex: 0 0 38%;
+    min-width: 220px;
+    overflow: auto;
+    border-left: 1px solid #333;
+    background: #1b1b1b;
+    padding: 2px 0 6px;
+  }
+  .peek-file {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 3px 8px 2px;
+    font-size: 11px;
+  }
+  .peek-base {
+    color: #d4d4d4;
+  }
+  /* The parent folder, faint and truncated from the left where it matters —
+     two files named the same are told apart by the tail of their directory,
+     not the head. */
+  .peek-dir {
+    flex: 1 1 auto;
+    min-width: 0;
+    color: #6e6e6e;
+    direction: rtl;
+    text-align: left;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .peek-n {
+    flex: 0 0 auto;
+    color: #8a8a8a;
+  }
+  .peek-hit {
+    display: flex;
+    width: 100%;
+    gap: 8px;
+    padding: 1px 8px 1px 16px;
+    border: none;
+    background: none;
+    color: #b0b0b0;
+    font-family: var(--gmd-code-font, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 11px;
+    text-align: left;
+    cursor: pointer;
+    white-space: pre;
+    overflow: hidden;
+  }
+  .peek-hit:hover {
+    background: #2a2d2e;
+  }
+  .peek-hit.sel {
+    background: #04395e;
+    color: #e6e6e6;
+  }
+  .peek-hln {
+    flex: 0 0 auto;
+    width: 34px;
+    text-align: right;
+    color: #5a5a5a;
+  }
+  .peek-htext {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .peek-htext mark {
+    background: rgba(229, 192, 32, 0.32);
+    color: inherit;
+    border-radius: 2px;
+  }
+  /* One row above the editor holding the symbol path and the language picker.
+     The picker used to float over the top-right of the text, which put it on
+     top of any line long enough to reach there. */
+  .code-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
     height: 22px;
     padding: 0 8px;
+    background: #232323;
+    border-bottom: 1px solid #404040;
+  }
+  /* Not `.crumbs`: the tab header already owns that name for the file path, and
+     two breadcrumbs on one screen are confusing enough without sharing one. */
+  .symbol-crumbs {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 2px;
     overflow-x: auto;
     overflow-y: hidden;
     white-space: nowrap;
-    background: #232323;
-    border-bottom: 1px solid #404040;
     scrollbar-width: none;
   }
   .symbol-crumbs::-webkit-scrollbar {
@@ -1638,19 +2336,21 @@
     right: 1px;
   }
   .lang-picker {
-    position: absolute;
-    top: 6px;
-    right: 30px;
-    z-index: 20;
+    flex: 0 0 auto;
     font-size: 11px;
-    padding: 2px 4px;
-    border-radius: 4px;
+    line-height: 1.4;
+    padding: 0 2px;
+    border-radius: 3px;
     border: 1px solid rgba(64, 64, 64, 0.7);
-    background: rgba(39, 39, 39, 0.9);
-    color: #c5c8c6;
-    max-width: 160px;
+    background: #272727;
+    color: #949494;
+    max-width: 150px;
   }
-  /* The find box claims the same corner — yield to it, come back on Escape. */
+  .lang-picker:hover {
+    color: #c5c8c6;
+  }
+  /* Still yields while the find box is open: a live dropdown beside a query
+     field reads as part of it. */
   .lang-picker.hidden {
     display: none;
   }

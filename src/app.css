@@ -148,3 +148,38 @@ html, body, #app {
     color: #f88;
   }
 }
+
+/* starry-night ships style/both, whose palette flips with the OS via
+   prefers-color-scheme. Surfaces whose chrome is hard-coded dark — the diff
+   rows, the peek preview — therefore came out GitHub-LIGHT on a light-mode
+   OS: near-black tokens on #1e1e1e, unreadable. Opting a subtree in with
+   `pl-dark` pins the GitHub-dark palette for that subtree only, so the
+   preview pane's code blocks keep following the system as they should. Two
+   classes outrank the package's single-class rules, so no !important. */
+.pl-dark .pl-c { color: #949494; font-style: italic; }
+.pl-dark .pl-k { color: #ff7b72; }
+.pl-dark .pl-s,
+.pl-dark .pl-pds,
+.pl-dark .pl-s .pl-pse .pl-s1,
+.pl-dark .pl-sr,
+.pl-dark .pl-sr .pl-sra,
+.pl-dark .pl-mq { color: #a5d6ff; }
+.pl-dark .pl-sr .pl-cce,
+.pl-dark .pl-cce,
+.pl-dark .pl-ent { color: #7ee787; }
+.pl-dark .pl-c1,
+.pl-dark .pl-s .pl-v,
+.pl-dark .pl-corl { color: #79c0ff; }
+.pl-dark .pl-e,
+.pl-dark .pl-en { color: #d2a8ff; }
+.pl-dark .pl-v,
+.pl-dark .pl-smw { color: #ffa657; }
+.pl-dark .pl-smi,
+.pl-dark .pl-s .pl-s1,
+.pl-dark .pl-vpf { color: #c5c8c6; }
+.pl-dark .pl-bu,
+.pl-dark .pl-ii { color: #f85149; }
+.pl-dark .pl-mh { color: #3655b5; font-weight: 600; }
+.pl-dark .pl-ml { color: #f2cc60; }
+.pl-dark .pl-mb { color: #c5c8c6; font-weight: 600; }
+.pl-dark .pl-mi { color: #c5c8c6; font-style: italic; }

@@ -21,7 +21,7 @@
     rootInfo?: { root: string; sep: string } | null;
     activePath?: string;
     onOpen: (path: string, opts: { pinned: boolean }) => void;
-    onOpenWorkspace: (path: string) => void;
+    onOpenWorkspace: (path: string, how: 'same' | 'tab' | 'window') => void;
     onNewTerminal: (cwd: string) => void;
   } = $props();
 
@@ -490,9 +490,12 @@
     return () => window.removeEventListener('click', close);
   });
 
-  function pickWorkspace(path: string) {
+  // Three destinations, matching the recent-workspaces menu: this tab, a new
+  // browser tab, a separate browser window. Defaults to the historic
+  // same-tab behaviour so callers that don't care stay unchanged.
+  function pickWorkspace(path: string, how: 'same' | 'tab' | 'window' = 'same') {
     menu = null;
-    onOpenWorkspace(path);
+    onOpenWorkspace(path, how);
   }
 
   // Double-click on blank tree space is VS Code's "new file here". Guarded on
@@ -1094,6 +1097,12 @@
     {#if menu.type === 'dir' && menu.paths.length === 1}
       <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && pickWorkspace(menu.path)}>
         Open workspace here
+      </button>
+      <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && pickWorkspace(menu.path, 'tab')}>
+        Open workspace in new tab
+      </button>
+      <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && pickWorkspace(menu.path, 'window')}>
+        Open workspace in new window
       </button>
     {/if}
     {#if menu.paths.length === 1}

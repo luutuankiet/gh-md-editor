@@ -1686,10 +1686,6 @@
     if (v === 'search') window.dispatchEvent(new CustomEvent('gmd:focus-search'));
   }
 
-  function openWorkspace(path: string) {
-    location.search = '?folder=' + encodeURIComponent(path);
-  }
-
   // Explorer context menu → spawn a shell cd'd into that folder. Reveal the
   // panel first so the new tab is visible when it lands.
   function newTerminalAt(cwd: string) {
@@ -1922,7 +1918,7 @@
           {/if}
         </div>
         <div class="stack-item grow">
-          <FileTree {folder} {rootInfo} activePath={activeGroup.activePath ?? ''} onOpen={openFile} onOpenWorkspace={openWorkspace} onNewTerminal={newTerminalAt} />
+          <FileTree {folder} {rootInfo} activePath={activeGroup.activePath ?? ''} onOpen={openFile} onOpenWorkspace={openWorkspaceIn} onNewTerminal={newTerminalAt} />
         </div>
         <!-- Outline: collapsed by default, expands into a draggable lower pane. -->
         {#if outlineOpen}

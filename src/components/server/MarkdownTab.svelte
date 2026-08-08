@@ -258,7 +258,11 @@
     // short to hold the saved offset at all. Retry as the document grows, with a
     // hard attempt budget so a genuinely shorter document stops the loop instead
     // of leaving it armed.
-    const wantPx = viewKey ? tabViewOf(viewKey)?.px ?? 0 : 0;
+    // Untracked, for the reason the source pane untracks its own anchor: the
+    // scroll handler above writes this very key, so a reactive read here tears
+    // this effect down and re-arms the listener and MutationObserver on every
+    // scroll - and re-asserts the saved offset while the reader is still moving.
+    const wantPx = untrack(() => (viewKey ? tabViewOf(viewKey)?.px ?? 0 : 0));
     let restoreTries = wantPx > 0 ? 20 : 0;
     const tryRestore = () => {
       if (restoreTries <= 0) return;

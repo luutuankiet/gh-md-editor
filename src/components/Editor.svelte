@@ -585,7 +585,19 @@
     if (viewKey) {
       const key = viewKey;
       const vw = localView;
-      const saved = tabViewOf(key)?.anchor;
+      // Untracked, and that is load-bearing rather than a style choice. This
+      // effect OWNS the editor: it constructs the view and destroys it on
+      // teardown. Reading the tab's remembered state reactively therefore wires
+      // the scroll listener directly below - which WRITES that same state - back
+      // into a full rebuild of the editor it lives in. Measured before the
+      // untrack: one scroll assignment produced ten rebuilds, each one restoring
+      // an anchor that does not round-trip exactly, so the position crept
+      // backwards a few hundred pixels while the teardown kept cancelling the
+      // pending save that would have recorded where the reader actually was.
+      // `wrapFor` above is untracked for the same reason; the wrap and scroll
+      // values live in one reactive record, so a write to either invalidates
+      // reads of both.
+      const saved = untrack(() => tabViewOf(key))?.anchor;
       if (saved) applyScrollAnchor(vw, saved);
       let saveTimer: ReturnType<typeof setTimeout> | undefined;
       const remember = () => {

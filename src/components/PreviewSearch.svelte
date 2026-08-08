@@ -235,7 +235,7 @@
       spellcheck="false"
       autocomplete="off"
     />
-    <span class="match-count">{matchCount > 0 ? `${currentIndex + 1} / ${matchCount}` : '0'}</span>
+    <span class="match-count">{!query ? '' : matchCount > 0 ? `${currentIndex + 1} of ${matchCount}` : 'No results'}</span>
     <button type="button" onclick={prev} title="Previous (Shift+Enter)" aria-label="Previous match">‹</button>
     <button type="button" onclick={next} title="Next (Enter)" aria-label="Next match">›</button>
     <button type="button" onclick={close} title="Close (Esc)" aria-label="Close">×</button>
@@ -290,7 +290,7 @@
     color: #57606a;
     padding: 0 4px;
     white-space: nowrap;
-    min-width: 38px;
+    min-width: 58px;
     text-align: center;
   }
   .preview-search-overlay button {

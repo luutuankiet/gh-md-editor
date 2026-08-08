@@ -28,7 +28,8 @@
 
   import { untrack } from 'svelte';
   import { EditorView, lineNumbers, drawSelection, highlightActiveLine, keymap } from '@codemirror/view';
-  import { search, searchKeymap, openSearchPanel } from '@codemirror/search';
+  import { search, searchKeymap, openSearchPanel, getSearchQuery, searchPanelOpen } from '@codemirror/search';
+  import { matchCountBadge } from '../../lib/search-count';
   import { restoreScrollTop } from '../../lib/cm-scroll-anchor';
   import { EditorState } from '@codemirror/state';
   import type { Extension } from '@codemirror/state';
@@ -424,6 +425,64 @@
   // A background reload must never throw away work in progress, and must never
   // cost the user their place in the file: both sides are patched into the
   // LIVE editors rather than rebuilt.
+  // --- Match ticks on the shared scrollbar ---
+  // The code editor draws its rail against its own scroller. A split diff has
+  // no such thing: the merge container owns the vertical scroll for both
+  // columns, so there is exactly one scrollbar to hang ticks off while two
+  // panes can be hunting different strings at the same time. Ticks from either
+  // column therefore land on the same rail, and the current one is whichever
+  // match the cursor is sitting on, in whichever pane that happens to be.
+  let matchTicks = $state<number[]>([]);
+  let currentTickY = $state<number | null>(null);
+
+  function tickY(vw: EditorView, sc: HTMLElement, pos: number): number | null {
+    const sh = sc.scrollHeight;
+    const ch = sc.clientHeight;
+    if (!sh || !ch) return null;
+    try {
+      // `lineBlockAt` measures from the top of this editor's own content, which
+      // is not the top of the scrollable area -- the find panel sits above it,
+      // and in split mode the two columns need not start level either. Adding
+      // the content box's offset within the scroller, plus whatever is already
+      // scrolled past, converts a per-editor measurement into a position in the
+      // range the rail is scaled to. Independent of scroll position by
+      // construction, so scrolling alone never needs a recompute.
+      const top = vw.lineBlockAt(pos).top;
+      const offset = vw.contentDOM.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop;
+      return ((top + offset) / sh) * ch;
+    } catch { return null; }
+  }
+
+  function recomputeTicks() {
+    const sc = scroller();
+    const panes = mv ? [mv.a, mv.b] : uv ? [uv] : [];
+    if (!sc || !panes.length) { matchTicks = []; currentTickY = null; return; }
+    const ticks: number[] = [];
+    let current: number | null = null;
+    for (const vw of panes) {
+      // Gated on the panel, not on the query alone. CodeMirror drops its inline
+      // match decorations the moment the panel unmounts but keeps the query, so
+      // ticks keyed off the query outlive the box that produced them and Escape
+      // would leave a rail full of marks for a search nobody can see.
+      if (!searchPanelOpen(vw.state)) continue;
+      const q = getSearchQuery(vw.state);
+      if (!q || !q.search || !q.valid) continue;
+      const sel = vw.state.selection.main;
+      const cur = q.getCursor(vw.state.doc);
+      let safety = 5000;
+      let next = cur.next();
+      while (!next.done && safety-- > 0) {
+        const r = next.value;
+        const y = tickY(vw, sc, r.from);
+        if (y != null) ticks.push(y);
+        if (r.from === sel.from && r.to === sel.to) current = y;
+        next = cur.next();
+      }
+    }
+    matchTicks = ticks;
+    currentTickY = current;
+  }
+
   function scroller(): HTMLElement | null {
     if (!host) return null;
     // Split mode scrolls the merge container, not either editor: the package
@@ -479,6 +538,13 @@
       // one side only. Mod-g is left to the browser exactly as the code editor
       // leaves it — the panel's own field still steps through matches.
       search({ top: true }),
+      matchCountBadge,
+      EditorView.updateListener.of((u) => {
+        if (
+          u.docChanged || u.selectionSet || u.viewportChanged || u.geometryChanged ||
+          u.transactions.some((tr) => tr.effects.length > 0)
+        ) recomputeTicks();
+      }),
       keymap.of([
         { key: 'Mod-s', preventDefault: true, run: () => { void save(); return true; } },
         ...searchKeymap.filter((b) => b.key !== 'Mod-g' && b.key !== 'Shift-Mod-g'),
@@ -885,7 +951,17 @@
     {#if leftText === null || rightText === null}
       <div class="empty">Loading file…</div>
     {:else}
-      <div class="cmwrap" bind:this={host}></div>
+      <div class="cmarea">
+        <div class="cmwrap" bind:this={host}></div>
+        <div class="diff-tick-rail" aria-hidden="true">
+          {#each matchTicks as y, i (i + ':dmatch')}
+            <span class="tick" style="top: {y}px"></span>
+          {/each}
+          {#if currentTickY !== null}
+            <span class="tick current" style="top: {currentTickY}px"></span>
+          {/if}
+        </div>
+      </div>
     {/if}
   {:else if loading}
     <div class="empty">Loading diff…</div>
@@ -1015,7 +1091,17 @@
      hidden }` then clipped the overflow — so the container that owns the
      scroll had nothing left to scroll and split mode lost its scrollbar. */
   .difftab :global(.cm-mergeView) { height: 100%; }
-  .difftab :global(.cm-mergeViewEditor) { min-width: 0; }
+  /* `min-width: 0` so a flex column can actually shrink. `clip` rather than the
+     package's own `hidden` for a subtler reason: the two clip identically, but
+     `hidden` also makes the box a scroll container -- and a scroll container is
+     exactly what `position: sticky` measures itself against. CodeMirror's base
+     theme makes the find panel sticky, so while this wrapper counted as one the
+     panel pinned itself to the top of a box as tall as the whole file, scrolled
+     away with the text, and left the reader typing into a find box that was no
+     longer on screen. `clip` is not a scroll container, so the panel now
+     measures against the merge container -- the element that really scrolls --
+     and stays put at the top of its pane. */
+  .difftab :global(.cm-mergeViewEditor) { min-width: 0; overflow: clip; }
   /* The package hands the container the vertical scroll and leaves each
      editor overflow-hidden, which is why a line wider than its pane simply
      vanished off the right edge instead of revealing a scrollbar. Restore
@@ -1081,10 +1167,43 @@
     background: #1e1e1e;
     color: #c5c8c6;
   }
-  .cmwrap {
+  .cmarea {
+    position: relative;
     flex: 1 1 0;
     min-height: 0;
+    display: flex;
+  }
+  .cmwrap {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 0;
     overflow: hidden;
+  }
+  /* Both columns' ticks land on this one rail, because a split diff has only
+     one vertical scrollbar to mark up. Amber is a match, orange is the one the
+     cursor is on -- the same reading as the code editor's rail. */
+  .diff-tick-rail {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 0;
+    width: 24px;
+    pointer-events: none;
+    z-index: 5;
+  }
+  .diff-tick-rail .tick {
+    position: absolute;
+    right: 2px;
+    width: 20px;
+    height: 3px;
+    border-radius: 1px;
+    background: rgba(255, 195, 0, 0.85);
+  }
+  .diff-tick-rail .tick.current {
+    background: #ff6b00;
+    height: 4px;
+    width: 22px;
+    right: 1px;
   }
   /* Built in script — the merge package and the patch renderer each assemble
      their own DOM — so the rule has to escape component scoping. */

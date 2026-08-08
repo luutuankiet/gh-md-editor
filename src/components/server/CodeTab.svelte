@@ -21,6 +21,7 @@
   import { indentFoldService } from '../../lib/fold-indent';
   import { TAB_DND_MIME, PATH_DND_MIME } from '../../lib/dnd';
   import { search, searchKeymap, getSearchQuery, searchPanelOpen } from '@codemirror/search';
+  import { matchCountBadge } from '../../lib/search-count';
   import { selectAllOccurrences } from '../../lib/select-occurrences';
   import { indentationMarkers } from '@replit/codemirror-indentation-markers';
   import { indentRainbow } from '../../lib/indent-rainbow';
@@ -1424,6 +1425,7 @@
         // Inert until the filename effect below arms it for a .env file.
         dotenvCloak,
         search({ top: true }),
+        matchCountBadge,
         wordHighlight,
         // Empty until the file turns out to be tracked, and it carries the
         // change gutter with it — declared here so that gutter lands to the

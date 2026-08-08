@@ -5,6 +5,7 @@
   import { history, historyKeymap, defaultKeymap, indentWithTab, selectParentSyntax } from '@codemirror/commands';
   import { indentOnInput, bracketMatching, syntaxTree, LanguageDescription } from '@codemirror/language';
   import { searchKeymap, search, getSearchQuery, searchPanelOpen } from '@codemirror/search';
+  import { matchCountBadge } from '../lib/search-count';
   import { selectAllOccurrences } from '../lib/select-occurrences';
   import { recordExpansion, shrinkSelection, resetSelectionHistory } from '../lib/expand-selection';
   import { wordHighlight, wordMatchRanges } from '../lib/word-highlight';
@@ -387,6 +388,7 @@
         EditorState.allowMultipleSelections.of(true),
         highlightActiveLine(),
         search({ top: true }),
+        matchCountBadge,
         wordHighlight,
         // Theme + highlight (Compartment, swappable on per-pane toggle). The
         // returned Extension bundles the light/dark HighlightStyle plus the

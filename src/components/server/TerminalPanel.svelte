@@ -24,6 +24,14 @@
     return i === -1 ? t : t.slice(i + 1);
   };
 
+  // Which shells belong to this window. The server's session registry is
+  // process-wide and shared by every tab pointed at it, so a window has to
+  // recognise its own: the anchor folder itself, or anything beneath it —
+  // "open terminal here" on a subfolder is still this workspace. A window
+  // anchored at the served root owns only shells born there, so it stays one
+  // workspace among others instead of swallowing all of them.
+  const owns = (cwd: string) => (folder ? cwd === folder || cwd.startsWith(folder + '/') : cwd === '');
+
   // Grouped by the directory each shell was spawned in. With several windows
   // open on different workspaces, a flat list is exactly how a command lands
   // in the wrong repo — so any group that is not this window's anchor starts
@@ -36,7 +44,7 @@
       if (g) g.push(t);
       else by.set(k, [t]);
     }
-    return [...by].map(([cwd, items]) => ({ cwd, items, mine: cwd === folder }));
+    return [...by].map(([cwd, items]) => ({ cwd, items, mine: owns(cwd) }));
   });
   let folded = $state<Record<string, boolean>>({});
   const isFolded = (cwd: string, mine: boolean) => folded[cwd] ?? !mine;
@@ -85,20 +93,28 @@
     return body;
   }
 
-  // Adopt whatever the server already has (survives a browser reload), and
-  // only spawn when there is genuinely nothing to attach to.
-  async function boot() {
+  // Adopt whatever the server already has (survives a browser reload), but
+  // activate only a shell belonging to this workspace. A window with none of
+  // its own opens one rather than borrowing a neighbour's — attaching to the
+  // first session in registry order is how a command lands in another repo.
+  async function boot(autoSpawn = true) {
     try {
       const { terminals } = await api('/api/terminals');
       terms = terminals ?? [];
-      if (terms.length === 0) await spawn();
-      else activeId = terms[0].id;
+      const mine = terms.filter((t) => owns(t.cwd ?? ''));
+      if (mine.length > 0) activeId = mine[0].id;
+      else if (autoSpawn) await spawn();
     } catch (e) {
       error = String((e as Error)?.message ?? e);
     } finally {
       booted = true;
     }
   }
+
+  // One boot per panel, whichever path reaches it first. "Open new terminal
+  // here" adopts without auto-spawning, because it is about to spawn its own.
+  let bootOnce: Promise<void> | null = null;
+  const ensureBooted = (autoSpawn = true) => (bootOnce ??= boot(autoSpawn));
 
   async function spawn(cwd?: string) {
     try {
@@ -128,18 +144,29 @@
     const idx = terms.findIndex((t) => t.id === id);
     if (idx === -1) return;
     terms = terms.filter((t) => t.id !== id);
-    if (activeId === id) activeId = terms[Math.min(idx, terms.length - 1)]?.id ?? null;
+    if (activeId !== id) return;
+    // Fall back inside this workspace before reaching into another one.
+    const mine = terms.filter((t) => owns(t.cwd ?? ''));
+    const pool = mine.length > 0 ? mine : terms;
+    activeId = pool[Math.min(idx, pool.length - 1)]?.id ?? null;
   }
 
+  // Deferred until the panel is actually shown. The component stays mounted
+  // for the life of the page so sessions survive a toggle, which meant every
+  // workspace tab used to open a shell at load whether or not anyone asked.
   $effect(() => {
-    if (!booted) boot();
+    if (visible) ensureBooted();
   });
 
   // Ctrl/Cmd+Shift+` — new terminal, VS Code's binding. Dispatched by the app
   // shell so it can reveal the panel first.
   $effect(() => {
     // "Open new terminal here" rides the same event with a cwd detail.
-    const onNew = (e: Event) => spawn((e as CustomEvent).detail?.cwd);
+    const onNew = async (e: Event) => {
+      const cwd = (e as CustomEvent).detail?.cwd;
+      await ensureBooted(false);
+      spawn(cwd);
+    };
     window.addEventListener('gmd:new-terminal', onNew);
     return () => window.removeEventListener('gmd:new-terminal', onNew);
   });

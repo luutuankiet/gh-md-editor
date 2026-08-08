@@ -17,7 +17,7 @@
   const shortcuts: Shortcut[] = [
     { pane: 'Editor', keys: 'Right-click', description: 'NOVEL FEATURE — flash matching block in preview (auto-expands collapsed <details>, lands on the matching table row not the whole table). Pairs with right-click in the preview going the other way: never lose your place when switching panes.' },
     { pane: 'Editor', keys: 'Cmd/Ctrl + F', description: 'Find / replace (CodeMirror panel, top-right). Scrollbar shows match ticks for the active query.' },
-    { pane: 'Editor', keys: 'Alt / Opt + Z', description: 'Toggle word wrap (persisted). Mac Opt+Z handled at the DOM event level so Firefox does not paste Ω.', highlight: true },
+    { pane: 'Anywhere', keys: 'Alt / Opt + Z', description: 'Toggle word wrap for the active tab, remembered per tab. Works in diffs, the merge view and the graph too. Matched on the physical key so Mac Opt+Z cannot paste Ω instead.', highlight: true },
     { pane: 'Editor', keys: 'Cmd/Ctrl + D', description: 'Multi-cursor — spawn a caret at the next matching occurrence of the word or selection. Press repeatedly to keep adding cursors.', highlight: true },
     { pane: 'Editor', keys: 'Alt / Opt + Left-click', description: 'Multi-cursor — drop an additional caret at the click point. Combine with Cmd+D for free-form multi-cursor editing.', highlight: true },
     { pane: 'Editor', keys: 'Cmd/Ctrl + = / -', description: 'Zoom editor pane font size (preview unaffected — heading hierarchy stays readable while you bump editor text). Persisted across reloads. Range 9–32 px.', highlight: true },

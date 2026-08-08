@@ -50,8 +50,14 @@
 
   import OutlinePanel from './server/OutlinePanel.svelte';
   import type { OutlineNode } from '../lib/code-outline';
+  import { initTabViewState, toggleWrapFor, renameTabView } from '../lib/tab-view-state.svelte';
 
   const folder = new URLSearchParams(location.search).get('folder') ?? '';
+
+  // Per-tab word wrap, diff view mode and scroll position. Scoped to the
+  // workspace, and initialised before any tab mounts so the first editor built
+  // reads its own remembered state rather than the app-wide default.
+  initTabViewState(folder);
 
   // Which view the left sidebar shows. Both stay mounted (CSS-hidden) so the
   // explorer keeps its expanded folders and search keeps its results.
@@ -363,6 +369,7 @@
         for (const t of g.tabs) {
           const next = remap(t.path);
           if (next === t.path) continue;
+          renameTabView(t.path, next);
           t.path = next;
           t.name = next.split('/').pop() ?? t.name;
         }
@@ -1469,6 +1476,9 @@
     const data = await res.json();
     const oldPath = tab.path;
     tab.path = relPath;
+    // The synthetic `untitled:` key just became a real path; carry the tab's
+    // wrap and scroll across so it does not visibly reset on being named.
+    renameTabView(oldPath, relPath);
     tab.name = baseName(relPath);
     tab.kind = kindOf(tab.name);
     tab.untitled = false;
@@ -1695,6 +1705,8 @@
   }
 
   $effect(() => {
+    // Set when the wrap chord is handled, read by the input guard below.
+    let wrapChordAt = 0;
     const onKey = (e: KeyboardEvent) => {
       // This listener is on window in the CAPTURE phase, so it sees every
       // chord before xterm does — and the bottom panel is a real shell. Ctrl+L
@@ -1718,6 +1730,22 @@
         // Alt/Opt+N — new untitled buffer (the browser owns plain Ctrl/Cmd+N).
         e.preventDefault();
         newUntitledTab();
+      } else if (e.altKey && !e.metaKey && !e.ctrlKey && e.code === 'KeyZ') {
+        // Word wrap for the active tab, from anywhere in the workbench: the diff
+        // panes, the merge view, the graph, a commit-message box. None of those
+        // are CodeMirror editors with a keymap of their own, which is why the
+        // chord used to do nothing there but paste a character.
+        //
+        // Matching event.code rather than event.key is the whole point. On macOS
+        // Option+Z IS a character — `Ω` — so CodeMirror looks up a binding named
+        // `Alt-Ω`, finds none, and lets the insertion through; it explicitly
+        // disables its own physical-key fallback for Alt-only chords on that
+        // platform. stopPropagation then keeps the editors' identical DOM-level
+        // handlers from toggling the same tab straight back.
+        e.preventDefault();
+        e.stopPropagation();
+        wrapChordAt = Date.now();
+        if (activeGroup.activePath) toggleWrapFor(activeGroup.activePath);
       } else if ((e.metaKey || e.ctrlKey) && e.code === 'KeyB') {
         e.preventDefault();
         layout.showLeft = !layout.showLeft;
@@ -1762,6 +1790,15 @@
         }
       }
     };
+    // Belt and braces for the macOS Option+Z character described above:
+    // cancelling the keydown should already stop the insertion, but if a browser
+    // ever delivers it anyway the character arrives here and gets dropped
+    // instead of landing in whatever was editable. Time-boxed to the chord so
+    // typing Ω on purpose still works.
+    const onBeforeInput = (e: Event) => {
+      const data = (e as InputEvent).data;
+      if (data && /^[ΩΩ]$/.test(data) && Date.now() - wrapChordAt < 250) e.preventDefault();
+    };
     // Always-on leave guard — unconditional by design. Also the last chance
     // to flush the session snapshot (the autosave is debounced).
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -1770,10 +1807,12 @@
       e.returnValue = '';
     };
     window.addEventListener('keydown', onKey, true);
+    window.addEventListener('beforeinput', onBeforeInput, true);
     window.addEventListener('beforeunload', onBeforeUnload);
     void loadVersion();
     return () => {
       window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('beforeinput', onBeforeInput, true);
       window.removeEventListener('beforeunload', onBeforeUnload);
     };
   });
@@ -2073,17 +2112,17 @@
                   {:else if at.binary}
                     <div class="placeholder">{at.name} is a binary file.</div>
                   {:else if at.kind === 'diff' && at.cmp}
-                    <DiffTab compare={at.cmp} onScratch={(text) => applyScratch(at, text)} />
+                    <DiffTab compare={at.cmp} onScratch={(text) => applyScratch(at, text)} viewKey={at.path} />
                   {:else if at.kind === 'diff' && at.git}
-                    <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} to={at.git.to ?? ''} toLabel={at.git.toLabel ?? ''} />
+                    <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} to={at.git.to ?? ''} toLabel={at.git.toLabel ?? ''} viewKey={at.path} />
                   {:else if at.kind === 'graph' && at.graph}
                     <GitGraphTab repo={at.graph.repo} onOpenDiff={openDiff} onOpenFile={openRepoFile} onOpenAtRef={openFileAtRef} />
                   {:else if at.kind === 'merge' && at.merge}
-                    <MergeTab repo={at.merge.repo} path={at.merge.path} />
+                    <MergeTab repo={at.merge.repo} path={at.merge.path} viewKey={at.path} />
                   {:else if at.kind === 'md'}
-                    <MarkdownTab bind:value={at.content} name={at.name} reveal={at.reveal ?? null} />
+                    <MarkdownTab bind:value={at.content} name={at.name} reveal={at.reveal ?? null} viewKey={at.path} />
                   {:else}
-                    <CodeTab bind:value={at.content} filename={at.name} gitPath={at.untitled || at.ro ? '' : at.path} reveal={at.reveal ?? null} readOnly={!!at.ro} />
+                    <CodeTab bind:value={at.content} filename={at.name} gitPath={at.untitled || at.ro ? '' : at.path} reveal={at.reveal ?? null} readOnly={!!at.ro} viewKey={at.path} />
                   {/if}
                 {:else}
                   <div class="placeholder">Open a file from the tree.</div>

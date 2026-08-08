@@ -13,11 +13,16 @@
   } from '../../lib/theme';
   import { EditorView } from '@codemirror/view';
 
+  import { tabViewOf, patchTabView } from '../../lib/tab-view-state.svelte';
+
   // Three-pane markdown cockpit hosted inside a tab of the server shell.
   // `value` is the tab's document content, owned by App-server.svelte.
-  let { value = $bindable(''), name = '', reveal = null }: {
+  let { value = $bindable(''), name = '', reveal = null, viewKey = '' }: {
     value?: string;
     name?: string;
+    // Which tab this cockpit is hosted in, for the state the tab remembers on
+    // its behalf: word wrap, and the scroll position of both panes.
+    viewKey?: string;
     // Sidebar-outline jump, same channel the code editor uses. `seq` makes a
     // repeat click on the same heading fire again.
     reveal?: { line: number; seq: number } | null;
@@ -234,16 +239,39 @@
       activeHeadingLine = active || flatLines[0];
     };
 
+    // The preview is its own scroller, so the tab remembers it separately from
+    // the source pane. Pixels rather than a document anchor: the rendered
+    // article has no line numbers to hold on to.
+    let saveTimer: ReturnType<typeof setTimeout> | undefined;
     const onScroll = () => {
       previewScrollTop = ph.scrollTop;
+      if (viewKey) {
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => patchTabView(viewKey, { px: ph.scrollTop }), 150);
+      }
       requestAnimationFrame(compute);
     };
     ph.addEventListener('scroll', onScroll, { passive: true });
 
+    // Restoring it has to wait for height. The article renders in stages — code
+    // highlighting, then mermaid diagrams — so the first paint is often too
+    // short to hold the saved offset at all. Retry as the document grows, with a
+    // hard attempt budget so a genuinely shorter document stops the loop instead
+    // of leaving it armed.
+    const wantPx = viewKey ? tabViewOf(viewKey)?.px ?? 0 : 0;
+    let restoreTries = wantPx > 0 ? 20 : 0;
+    const tryRestore = () => {
+      if (restoreTries <= 0) return;
+      restoreTries--;
+      if (ph.scrollHeight - ph.clientHeight < wantPx) return;
+      ph.scrollTop = wantPx;
+      restoreTries = 0;
+    };
+
     let scheduleTimer: ReturnType<typeof setTimeout>;
     const schedule = () => {
       clearTimeout(scheduleTimer);
-      scheduleTimer = setTimeout(compute, 100);
+      scheduleTimer = setTimeout(() => { tryRestore(); compute(); }, 100);
     };
     schedule();
 
@@ -261,6 +289,7 @@
 
     return () => {
       clearTimeout(scheduleTimer);
+      clearTimeout(saveTimer);
       mo.disconnect();
       ph.removeEventListener('scroll', onScroll);
     };
@@ -311,6 +340,7 @@
         </div>
       {/if}
       <Editor
+        {viewKey}
         bind:value={doc}
         bind:view={editorView}
         bind:topLine={editorTopLine}

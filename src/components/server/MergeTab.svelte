@@ -4,10 +4,10 @@
   import CodeTab from './CodeTab.svelte';
   import MergePane from './MergePane.svelte';
   import type { PaneAction } from './MergePane.svelte';
-  import { wrapPref } from '../../lib/wrap-pref.svelte';
+  import { wrapFor, toggleWrapFor } from '../../lib/tab-view-state.svelte';
   import { splitter } from '../../lib/split-handle';
 
-  let { repo, path }: { repo: string; path: string } = $props();
+  let { repo, path, viewKey = '' }: { repo: string; path: string; viewKey?: string } = $props();
 
   // Git reports paths relative to its own checkout; the file and show
   // endpoints are anchored at the workspace root.
@@ -44,9 +44,10 @@
   let revealSeq = 0;
   let reveal = $state<{ line: number; seq: number } | null>(null);
 
-  // One switch for all four panes here — and for every other text surface in
-  // the app, which is the whole point of it living outside this component.
-  const wrap = $derived(wrapPref.on);
+  // One switch for all four panes of this tab — the three references and the
+  // editable result — which is the whole point of it living outside them. Other
+  // tabs keep their own.
+  const wrap = $derived(wrapFor(viewKey));
 
   const dirty = $derived(result !== saved);
   const leaf = $derived(path.slice(path.lastIndexOf('/') + 1));
@@ -393,7 +394,7 @@
       <span class="counter clean">No conflicts remain</span>
     {/if}
     <span class="spacer"></span>
-    <button type="button" class="btn" class:on={wrap} onclick={() => wrapPref.toggle()} title="Word wrap — one setting for every pane, editor, diff and search result">Wrap</button>
+    <button type="button" class="btn" class:on={wrap} onclick={() => toggleWrapFor(viewKey)} title="Word wrap in this tab, all four panes (Alt/Opt+Z)">Wrap</button>
     <button type="button" class="btn" disabled={busy || !dirty} onclick={() => void save()}>{dirty ? 'Save' : 'Saved'}</button>
     <button type="button" class="btn primary" disabled={busy} onclick={() => void complete()} title="Save and stage, which is what clears the conflict in git">Complete Merge</button>
   </div>
@@ -427,7 +428,7 @@
         <span class="pane-label">working copy — edit freely</span>
       </div>
       <div class="result-editor">
-        <CodeTab bind:value={result} filename={leaf} gitPath="" {reveal} {marks} />
+        <CodeTab bind:value={result} filename={leaf} gitPath="" {reveal} {marks} {viewKey} />
       </div>
     </div>
   {/if}

@@ -1,7 +1,10 @@
 <script lang="ts">
-  let { repo = '', path = '', staged = false, untracked = false, compare = null, onScratch = undefined, base = '', baseLabel = '', to = '', toLabel = '' }: {
+  let { repo = '', path = '', staged = false, untracked = false, compare = null, onScratch = undefined, base = '', baseLabel = '', to = '', toLabel = '', viewKey = '' }: {
     repo?: string;
     path?: string;
+    // Which tab this diff is hosted in, for the state the tab remembers on its
+    // behalf: word wrap, which of the three view modes, and scroll position.
+    viewKey?: string;
     staged?: boolean;
     untracked?: boolean;
     // Pinned sha of a tree-compare base: the diff's old side is that commit's
@@ -25,6 +28,8 @@
 
   import { untrack } from 'svelte';
   import { EditorView, lineNumbers, drawSelection, highlightActiveLine, keymap } from '@codemirror/view';
+  import { search, searchKeymap, openSearchPanel } from '@codemirror/search';
+  import { restoreScrollTop } from '../../lib/cm-scroll-anchor';
   import { EditorState } from '@codemirror/state';
   import type { Extension } from '@codemirror/state';
   import { MergeView, unifiedMergeView } from '@codemirror/merge';
@@ -33,7 +38,7 @@
   import { grammarFor } from '../../lib/lang-detect';
   import { monokaiCodeBundle } from '../../lib/monokai-dimmed';
   import { scopeForFilename, highlightToLines, type Tok } from '../../lib/diff-highlight';
-  import { wrapPref } from '../../lib/wrap-pref.svelte';
+  import { wrapFor, toggleWrapFor, diffViewFor, tabViewOf, patchTabView } from '../../lib/tab-view-state.svelte';
   import { makeSplitHandle } from '../../lib/split-handle';
 
   interface DiffLine { t: '+' | '-' | ' ' | '\\'; n: number | null; o: number | null; text: string }
@@ -88,32 +93,109 @@
     hl = map;
   }
 
-  // Side-by-side is the default; the choice persists workspace-wide. `hunks`
-  // is the original patch renderer, kept as its own mode: it is the only view
-  // that can stage or revert INDIVIDUAL LINES, because the server rebuilds the
-  // patch from a hunk index plus line indices and an editor has neither.
+  // Side-by-side is the default. `hunks` is the original patch renderer, kept as
+  // its own mode: it is the only view that can stage or revert INDIVIDUAL LINES,
+  // because the server rebuilds the patch from a hunk index plus line indices
+  // and an editor has neither.
+  //
+  // The mode belongs to the tab. The workspace-wide key is only the default for
+  // a diff nobody has switched yet — dropping into Hunks to stage single lines
+  // used to silently turn every other diff in the workspace into a patch view.
   type ViewMode = 'split' | 'inline' | 'hunks';
   const DIFFVIEW_KEY = 'ghmd.diffView';
   const storedView = typeof localStorage !== 'undefined' ? localStorage.getItem(DIFFVIEW_KEY) : null;
-  let view = $state<ViewMode>(storedView === 'inline' || storedView === 'hunks' ? storedView : 'split');
+  const defaultView: ViewMode = storedView === 'inline' || storedView === 'hunks' ? storedView : 'split';
+  let view = $state<ViewMode>(untrack(() => diffViewFor(viewKey, defaultView)));
   function setView(v: ViewMode) {
     view = v;
+    if (viewKey) { patchTabView(viewKey, { diffView: v }); return; }
     try { localStorage.setItem(DIFFVIEW_KEY, v); } catch { /* private mode */ }
   }
 
-  // Wrap is app-wide, so the patch columns below and the CodeMirror panes agree
-  // with the editor tabs without a second switch to find.
-  const wrap = $derived(wrapPref.on);
+  // Wrap belongs to the tab too, defaulting to the app-wide preference, so the
+  // patch columns below and the CodeMirror panes always agree with each other.
+  const wrap = $derived(wrapFor(viewKey));
   // A full rebuild rather than a compartment reconfigure: the merge view
   // measures chunk heights when its field is installed, so changing what a line
   // occupies underneath it leaves the two sides aligned to stale rows.
-  let builtWrap = wrapPref.on;
+  let builtWrap = untrack(() => wrapFor(viewKey));
   $effect(() => {
-    const on = wrapPref.on;
+    const on = wrapFor(viewKey);
     if (on === builtWrap) return;
     builtWrap = on;
     pendingScroll = scroller()?.scrollTop ?? null;
     docsVersion++;
+  });
+
+  // Remember where this diff was scrolled to.
+  //
+  // Nothing here holds a reference to the scrolling element. Which element that
+  // is depends on the active mode, and it is replaced wholesale on every
+  // rebuild — but more importantly it does not exist yet when this runs. The
+  // effect that builds the editors is declared further down the file and so runs
+  // AFTER this one, and the diff itself arrives from the server later still.
+  // Attaching to the scroller directly therefore found nothing on the first
+  // pass, and nothing this effect had read would ever change to bring it back:
+  // the listener was never installed at all, for the whole life of the tab.
+  //
+  // The container is the one element that outlives every rebuild, so the
+  // listener goes there instead, in the capture phase. Scroll events do not
+  // bubble, but capture still reaches an ancestor on the way down, so one
+  // listener covers whichever descendant ends up owning the overflow — including
+  // the patch columns of hunks mode, which have no editor behind them.
+  $effect(() => {
+    const h = host;
+    const key = viewKey;
+    if (!h || !key) return;
+    let saveTimer: ReturnType<typeof setTimeout> | undefined;
+    let pending: HTMLElement | null = null;
+    const remember = (e: Event) => {
+      // `scroller()` is the authority where it resolves: in split mode the
+      // overflow is on the merge container while the two inner scrollers move
+      // horizontally, and reading scrollTop off one of those would persist a
+      // zero over a perfectly good position. Only fall back to the event's own
+      // target for the modes it does not know about.
+      const sc = scroller() ?? (e.target as HTMLElement | null);
+      if (!sc || !(sc instanceof HTMLElement) || sc.scrollHeight <= sc.clientHeight) return;
+      pending = sc;
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        if (pending) patchTabView(key, { px: pending.scrollTop });
+      }, 150);
+    };
+    h.addEventListener('scroll', remember, { capture: true, passive: true });
+    return () => {
+      clearTimeout(saveTimer);
+      h.removeEventListener('scroll', remember, { capture: true });
+    };
+  });
+
+  // Find inside the diff, when the caret is not in one of the panes. The panes
+  // carry their own search extension and handle the chord themselves whenever
+  // one of them has focus; everywhere else in the tab the keystroke used to
+  // reach the browser and open ITS find bar over the page, which searches the
+  // rendered DOM rather than the document and cannot see the folded-away
+  // regions at all. Routed to the editable side by default, since that is the
+  // one being worked on.
+  $effect(() => {
+    const h = host;
+    if (!h) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey || e.code !== 'KeyF') return;
+      const focused = document.activeElement;
+      const outside = focused === document.body || focused === document.documentElement;
+      if (!outside && !h.contains(focused)) return;
+      const target = mv ? (mv.a.dom.contains(focused) ? mv.a : mv.b) : uv;
+      if (!target) return;
+      e.preventDefault();
+      // Same node as any sibling group's handler, so stopping propagation is
+      // not enough to keep a second diff from opening its panel too.
+      e.stopImmediatePropagation();
+      target.focus();
+      openSearchPanel(target);
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
   });
 
   interface SplitCell { line: DiffLine; idx: number }
@@ -248,7 +330,9 @@
   let uv: EditorView | null = null;
   // Carried across a rebuild so a background refresh does not throw the reader
   // back to the top of the file.
-  let pendingScroll: number | null = null;
+  // Seeded from what the tab remembered, so the first build after a tab switch
+  // or a reload lands where the reader left off rather than at the top.
+  let pendingScroll: number | null = untrack(() => (viewKey ? tabViewOf(viewKey)?.px ?? null : null));
   let langExt: Extension = [];
   let langFor = '';
   let docsToken = 0;
@@ -389,8 +473,15 @@
       drawSelection(),
       bracketMatching(),
       indentOnInput(),
+      // Find, per pane. In split mode that means each column gets its own panel
+      // and its own query, which is the point of putting it here rather than
+      // over the tab as a whole: the string being hunted is usually present on
+      // one side only. Mod-g is left to the browser exactly as the code editor
+      // leaves it — the panel's own field still steps through matches.
+      search({ top: true }),
       keymap.of([
         { key: 'Mod-s', preventDefault: true, run: () => { void save(); return true; } },
+        ...searchKeymap.filter((b) => b.key !== 'Mod-g' && b.key !== 'Shift-Mod-g'),
         ...defaultKeymap,
         ...historyKeymap,
         indentWithTab,
@@ -477,11 +568,6 @@
           unifiedExt(l),
         ],
       });
-    }
-    if (pendingScroll !== null) {
-      const top = pendingScroll;
-      pendingScroll = null;
-      requestAnimationFrame(() => { const s = scroller(); if (s) s.scrollTop = top; });
     }
   }
 
@@ -581,6 +667,26 @@
     if (!h || !gen) return;
     untrack(() => buildEditor(h, mode));
     return destroyEditor;
+  });
+
+  // Put the reader back where they were, once per build — which includes the
+  // first build after a tab switch or a reload, and the rebuild that a wrap
+  // change forces. Declared after the builder so the container it needs already
+  // exists, and retried rather than assigned once: the split view folds every
+  // unchanged region on install and measures over several frames, so for the
+  // first of them it is far shorter than the saved offset.
+  $effect(() => {
+    // Waits for a generation, not just for the effect to run. The diff arrives
+    // from the server well after mount, and until it does there are no editors
+    // and nothing to scroll; spending the retry budget on that dead time is how
+    // this lands on zero. A generation means the builder above has just run, and
+    // since that runs first, the container is already populated here.
+    const gen = docsVersion;
+    void shownView;
+    if (!gen || pendingScroll === null) return;
+    const top = pendingScroll;
+    pendingScroll = null;
+    return restoreScrollTop(() => scroller(), top);
   });
 
   function scheduleSave() {
@@ -747,7 +853,7 @@
       <span class="pill">read-only</span>
     {/if}
     <span class="viewtoggle">
-      <button type="button" class:on={wrap} title="Word wrap — one setting for every editor, diff and search result" onclick={() => wrapPref.toggle()}>Wrap</button>
+      <button type="button" class:on={wrap} title="Word wrap in this tab (Alt/Opt+Z)" onclick={() => toggleWrapFor(viewKey)}>Wrap</button>
     </span>
     <span class="viewtoggle">
       <button type="button" class:on={shownView === 'split'} disabled={cmBlocked} onclick={() => setView('split')}>Split</button>

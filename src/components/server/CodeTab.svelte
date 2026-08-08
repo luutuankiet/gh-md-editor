@@ -34,7 +34,8 @@
   import { LANGS, describeFor } from '../../lib/lang-detect';
   import { expandSelection, shrinkSelection, resetSelectionHistory } from '../../lib/expand-selection';
   import { formatDocumentText } from '../../lib/format-doc';
-  import { wrapPref } from '../../lib/wrap-pref.svelte';
+  import { wrapFor, toggleWrapFor, tabViewOf, patchTabView } from '../../lib/tab-view-state.svelte';
+  import { readScrollAnchor, applyScrollAnchor } from '../../lib/cm-scroll-anchor';
   import { highlightToLines, scopeForFilename } from '../../lib/diff-highlight';
   import type { Tok } from '../../lib/diff-highlight';
 
@@ -434,9 +435,14 @@
     );
   }
 
-  let { value = $bindable(''), filename, gitPath = '', reveal = null, marks = [], readOnly = false }: {
+  let { value = $bindable(''), filename, gitPath = '', reveal = null, marks = [], readOnly = false, viewKey = '' }: {
     value?: string;
     filename: string;
+    // Which tab this editor belongs to, for the state the tab remembers on its
+    // behalf: word wrap, and the scroll position. Empty outside the IDE shell
+    // (and for the merge view's Result pane, which passes its host tab's key),
+    // in which case wrap falls back to the app-wide preference.
+    viewKey?: string;
     // A snapshot of a file as it was at a commit has nowhere to save back to,
     // so the buffer refuses edits instead of collecting ones that vanish.
     readOnly?: boolean;
@@ -865,12 +871,44 @@
 
   // Scrolling inside an already-rendered viewport produces no view update, so
   // the pinned rows would only refresh when CodeMirror happened to re-render.
+  // The same listener is where the tab's remembered position gets written back,
+  // debounced because one wheel gesture fires this dozens of times.
   $effect(() => {
     const v = view;
     if (!v) return;
-    const onScroll = () => syncSticky(v);
+    const key = untrack(() => viewKey);
+    let saveTimer: ReturnType<typeof setTimeout> | undefined;
+    const onScroll = () => {
+      syncSticky(v);
+      if (!key) return;
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        const anchor = readScrollAnchor(v);
+        if (anchor) patchTabView(key, { anchor });
+      }, 150);
+    };
     v.scrollDOM.addEventListener('scroll', onScroll, { passive: true });
-    return () => v.scrollDOM.removeEventListener('scroll', onScroll);
+    return () => {
+      clearTimeout(saveTimer);
+      v.scrollDOM.removeEventListener('scroll', onScroll);
+    };
+  });
+
+  // Put the reader back where they were. Once per mounted editor — and since a
+  // tab switch destroys this component, that means once per visit to the tab,
+  // not once per session. Waits for the buffer to actually have content: a tab
+  // restored from the session cache is created empty and filled by the fetch
+  // that follows. A reveal request from a search hit or an outline click arrives
+  // later and deliberately wins.
+  let scrollRestored = false;
+  $effect(() => {
+    const v = view;
+    const hasDoc = value.length > 0;
+    const key = untrack(() => viewKey);
+    if (!v || !key || scrollRestored || !hasDoc) return;
+    scrollRestored = true;
+    const anchor = untrack(() => tabViewOf(key))?.anchor;
+    if (anchor) applyScrollAnchor(v, anchor);
   });
 
   // --- go to definition ------------------------------------------------------
@@ -1186,15 +1224,16 @@
   const wrapCompartment = new Compartment();
   const markCompartment = new Compartment();
 
-  // Word wrap follows one app-wide preference. Alt/Opt+Z here also settles the
-  // markdown editor, the diff panes, the merge view and the search results, and
-  // the choice survives a reload. `applied` is what this editor last
-  // reconfigured to, so the effect below ignores the echo of our own toggle.
-  let appliedWrap = wrapPref.on;
+  // Word wrap belongs to the tab, falling back to the app-wide preference for a
+  // tab nobody has toggled yet. Alt/Opt+Z here settles every pane of THIS tab
+  // and leaves the others alone, and the choice survives a reload. `applied` is
+  // what this editor last reconfigured to, so the effect below ignores the echo
+  // of our own toggle.
+  let appliedWrap = untrack(() => wrapFor(viewKey));
 
   function toggleWrap(vw: EditorView) {
-    wrapPref.toggle();
-    appliedWrap = wrapPref.on;
+    toggleWrapFor(viewKey);
+    appliedWrap = wrapFor(viewKey);
     vw.dispatch({ effects: wrapCompartment.reconfigure(appliedWrap ? EditorView.lineWrapping : []) });
   }
 
@@ -1396,7 +1435,7 @@
         navFlashField,
         refLensField,
         refLensClicks,
-        wrapCompartment.of(untrack(() => wrapPref.on) ? EditorView.lineWrapping : []),
+        wrapCompartment.of(untrack(() => wrapFor(viewKey)) ? EditorView.lineWrapping : []),
         markCompartment.of([]),
         languageCompartment.of([]),
         themeCompartment.of(untrack(() => isDark) ? darkBundle : lightBundle),
@@ -1748,7 +1787,14 @@
       // tab reused for a different file, which is why this is unconditional
       // rather than only armed on a match.
       view?.dispatch({ effects: setCloak.of(isDotenvFile(name)) });
-      selectedLanguage = detected ? detected.name : PLAIN;
+      // A grammar picked by hand outranks the one the filename implies, and is
+      // remembered per tab. Validated against the current list so a name left in
+      // the cache by an older version cannot send applyLanguage hunting for a
+      // grammar that no longer exists.
+      const picked = viewKey ? tabViewOf(viewKey)?.lang : undefined;
+      selectedLanguage = picked && languageNames.includes(picked)
+        ? picked
+        : detected ? detected.name : PLAIN;
       void applyLanguage(selectedLanguage).then(() => {
         const vw = view;
         if (vw) pushOutline(vw);
@@ -1843,7 +1889,7 @@
   });
 
   $effect(() => {
-    const w = wrapPref.on;
+    const w = wrapFor(viewKey);
     const v = view;
     if (!v || w === appliedWrap) return;
     appliedWrap = w;
@@ -1943,13 +1989,18 @@
       class="lang-picker"
       class:hidden={searchOpen}
       bind:value={selectedLanguage}
-      onchange={() => void applyLanguage(selectedLanguage).then(() => {
-        // A hand-picked grammar has to re-feed the outline itself. Nothing else
-        // fires on this path, and on an unsaved buffer the filename effect — the
-        // only other feeder — never will, so the strip would stay empty.
-        const vw = view;
-        if (vw) pushOutline(vw);
-      })}
+      onchange={() => {
+        // Remembered for this tab so it survives switching away and back.
+        if (viewKey) patchTabView(viewKey, { lang: selectedLanguage });
+        void applyLanguage(selectedLanguage).then(() => {
+          // A hand-picked grammar has to re-feed the outline itself. Nothing
+          // else fires on this path, and on an unsaved buffer the filename
+          // effect — the only other feeder — never will, so the strip would
+          // stay empty.
+          const vw = view;
+          if (vw) pushOutline(vw);
+        });
+      }}
       title="Syntax language"
       aria-label="Syntax language"
     >

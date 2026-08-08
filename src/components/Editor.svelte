@@ -18,7 +18,8 @@
   import { html as htmlLang } from '@codemirror/lang-html';
   import { css as cssLang } from '@codemirror/lang-css';
   import { editorThemeExtensions } from '../lib/editor-theme';
-  import { wrapPref } from '../lib/wrap-pref.svelte';
+  import { wrapFor, toggleWrapFor, tabViewOf, patchTabView } from '../lib/tab-view-state.svelte';
+  import { readScrollAnchor, applyScrollAnchor } from '../lib/cm-scroll-anchor';
   import type { EffectiveTheme, ThemeChoice } from '../lib/theme';
   import ThemeToggle from './ThemeToggle.svelte';
 
@@ -51,6 +52,7 @@
     onThemeToggle,
     onZoomIn,
     onZoomOut,
+    viewKey = '',
   }: {
     value?: string;
     view?: EditorView | null;
@@ -61,6 +63,10 @@
     onThemeToggle?: () => void;
     onZoomIn?: () => void;
     onZoomOut?: () => void;
+    // Which tab this editor belongs to, when it is hosted inside the IDE shell's
+    // tab strip. Empty in the standalone and extension builds, which have a
+    // single document and therefore one app-wide wrap preference.
+    viewKey?: string;
   } = $props();
 
   let host: HTMLDivElement;
@@ -84,22 +90,23 @@
 
   const wrapCompartment = new Compartment();
 
-  // Word wrap is one app-wide preference, so Alt+Z here also settles the code
-  // editor, the diff panes, the merge view and the search results. `applied` is
-  // what this editor last reconfigured to, so the effect below can tell an echo
-  // of our own toggle from a change made on one of those other surfaces.
-  let appliedWrap = wrapPref.on;
+  // Word wrap belongs to the hosting tab when there is one, and is app-wide
+  // otherwise. Alt+Z here settles the panes of this tab — source and preview —
+  // and leaves other tabs alone. `applied` is what this editor last
+  // reconfigured to, so the effect below can tell an echo of our own toggle from
+  // a change made on one of the tab's other surfaces.
+  let appliedWrap = untrack(() => wrapFor(viewKey));
 
   function toggleWrap(vw: EditorView) {
-    wrapPref.toggle();
-    appliedWrap = wrapPref.on;
+    toggleWrapFor(viewKey);
+    appliedWrap = wrapFor(viewKey);
     vw.dispatch({
       effects: wrapCompartment.reconfigure(appliedWrap ? EditorView.lineWrapping : []),
     });
   }
 
   $effect(() => {
-    const on = wrapPref.on;
+    const on = wrapFor(viewKey);
     if (!localView || on === appliedWrap) return;
     appliedWrap = on;
     localView.dispatch({ effects: wrapCompartment.reconfigure(on ? EditorView.lineWrapping : []) });
@@ -386,7 +393,7 @@
         // defaultHighlightStyle fallback (covers fenced-code nested grammars
         // that emit tags our markdown style doesn't claim) plus editor chrome.
         themeCompartment.of(editorThemeExtensions(effectiveTheme)),
-        wrapCompartment.of(untrack(() => wrapPref.on) ? EditorView.lineWrapping : []),
+        wrapCompartment.of(untrack(() => wrapFor(viewKey)) ? EditorView.lineWrapping : []),
         fontSizeCompartment.of(makeFontSizeTheme(currentFontSize)),
         markdownLang({ base: markdownLanguage, addKeymap: true, codeLanguages: MARKDOWN_CODE_LANGS }),
         markdownAutoPair,
@@ -567,8 +574,33 @@
       ],
     });
 
+    let cleanupRemember: (() => void) | undefined;
     localView = new EditorView({ state, parent: host });
     view = localView;
+
+    // Scroll position belongs to the hosting tab, when there is one. Only the
+    // IDE shell destroys and rebuilds this component on a tab switch; the
+    // standalone and extension builds keep one document alive for the life of
+    // the page and have nothing to restore.
+    if (viewKey) {
+      const key = viewKey;
+      const vw = localView;
+      const saved = tabViewOf(key)?.anchor;
+      if (saved) applyScrollAnchor(vw, saved);
+      let saveTimer: ReturnType<typeof setTimeout> | undefined;
+      const remember = () => {
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => {
+          const anchor = readScrollAnchor(vw);
+          if (anchor) patchTabView(key, { anchor });
+        }, 150);
+      };
+      vw.scrollDOM.addEventListener('scroll', remember, { passive: true });
+      cleanupRemember = () => {
+        clearTimeout(saveTimer);
+        vw.scrollDOM.removeEventListener('scroll', remember);
+      };
+    }
 
     const scroller = localView.scrollDOM;
     const updateTop = () => {
@@ -593,6 +625,7 @@
     if (localView) recomputeTicks(localView);
 
     return () => {
+      cleanupRemember?.();
       ro.disconnect();
       scroller.removeEventListener('scroll', onScroll);
       localView?.destroy();

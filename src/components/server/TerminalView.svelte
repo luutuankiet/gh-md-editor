@@ -128,6 +128,48 @@
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: 'd', d }));
     });
 
+    // xterm carried a translation from 2016 that turned Alt+Arrow into word
+    // motion; version 6 removed it deliberately and told embedders to supply
+    // the binding themselves. What reaches the shell now is the raw
+    // modified-arrow sequence \e[1;3D, which zsh's emacs keymap never binds —
+    // so the line editor beeps and the trailing "D" self-inserts, and
+    // Option+Left types a letter instead of moving a word. Ctrl+U is the same
+    // mismatch from the other side: readline discards to the start of the
+    // line, but zsh's ^U is kill-whole-line and takes the text ahead of the
+    // cursor with it. Both are answered by sending what every line editor
+    // already understands, rather than asking each user to edit a shell rc
+    // file that would not travel with this package. \e- is a negative
+    // argument and kill-line under one kills backwards, so \e-^K means
+    // "delete to start of line" in bash and zsh alike. Ctrl+K needs nothing:
+    // forward kill-line is already the default in both.
+    const lineEditChords: Record<string, string> = {
+      'alt:ArrowLeft': '\x1bb',
+      'alt:ArrowRight': '\x1bf',
+      'ctrl:KeyU': '\x1b-\x0b',
+    };
+    t.attachCustomKeyEventHandler((ev) => {
+      // The handler also sees keyup and keypress. Acting on all three would
+      // send the bytes three times for one press.
+      if (ev.type !== 'keydown') return true;
+      // A full-screen program owns its own keymap: Ctrl+U is half a page up in
+      // vim and less, and an escape-prefixed word motion would drop vim out of
+      // insert mode. Only the shell prompt gets the rewrite — anything drawing
+      // on the alternate buffer keeps the standard sequences.
+      if (t.buffer.active.type !== 'normal') return true;
+      if (ev.shiftKey || ev.metaKey) return true;
+      const prefix = ev.altKey && !ev.ctrlKey ? 'alt:' : ev.ctrlKey && !ev.altKey ? 'ctrl:' : '';
+      // Matched on `code` rather than `key`, because macOS composes Option and
+      // a letter into a symbol: `key` for Option+U is a dead-key diaeresis.
+      const seq = prefix ? lineEditChords[prefix + ev.code] : undefined;
+      if (!seq) return true;
+      // Returning false makes xterm bail out before its own preventDefault, so
+      // cancelling the browser default is this handler's job.
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: 'd', d: seq }));
+      return false;
+    });
+
     // Any geometry change (panel drag, hotkey nudge, reveal) → refit + tell
     // the pty its new size so full-screen TUIs redraw correctly.
     const ro = new ResizeObserver(() => {

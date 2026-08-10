@@ -23,6 +23,7 @@
   import { search, searchKeymap, getSearchQuery, searchPanelOpen } from '@codemirror/search';
   import { matchCountBadge } from '../../lib/search-count';
   import { selectAllOccurrences } from '../../lib/select-occurrences';
+  import { multiCursorMouse } from '../../lib/cm-multi-cursor';
   import { indentationMarkers } from '@replit/codemirror-indentation-markers';
   import { indentRainbow } from '../../lib/indent-rainbow';
   import { dotenvCloak, setCloak, cloakState } from '../../lib/dotenv-cloak';
@@ -913,8 +914,9 @@
   });
 
   // --- go to definition ------------------------------------------------------
-  // Ctrl/Cmd+click, the VS Code chord. Alt+click stays multi-cursor, which is
-  // the split the markdown editor already documents.
+  // Ctrl/Cmd+click, the VS Code chord — claimed here, so the add-a-cursor half
+  // of multiCursorMouse never fires in this editor. Alt/Opt+click is the
+  // multi-cursor gesture instead, and the handler below bails on it.
   function localDef(
     nodes: OutlineNode[],
     word: string,
@@ -1411,7 +1413,7 @@
         highlightActiveLine(),
         history(),
         drawSelection(),
-        EditorState.allowMultipleSelections.of(true),
+        multiCursorMouse,
         indentOnInput(),
         bracketMatching(),
         indentationMarkers({

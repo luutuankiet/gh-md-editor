@@ -30,6 +30,7 @@
   import { EditorView, lineNumbers, drawSelection, highlightActiveLine, keymap } from '@codemirror/view';
   import { search, searchKeymap, openSearchPanel, getSearchQuery, searchPanelOpen } from '@codemirror/search';
   import { matchCountBadge } from '../../lib/search-count';
+  import { multiCursorMouse } from '../../lib/cm-multi-cursor';
   import { restoreScrollTop } from '../../lib/cm-scroll-anchor';
   import { EditorState } from '@codemirror/state';
   import type { Extension } from '@codemirror/state';
@@ -530,6 +531,7 @@
       lineNumbers(),
       history(),
       drawSelection(),
+      multiCursorMouse,
       bracketMatching(),
       indentOnInput(),
       // Find, per pane. In split mode that means each column gets its own panel

@@ -7,6 +7,7 @@
   import { searchKeymap, search, getSearchQuery, searchPanelOpen } from '@codemirror/search';
   import { matchCountBadge } from '../lib/search-count';
   import { selectAllOccurrences } from '../lib/select-occurrences';
+  import { multiCursorMouse } from '../lib/cm-multi-cursor';
   import { recordExpansion, shrinkSelection, resetSelectionHistory } from '../lib/expand-selection';
   import { wordHighlight, wordMatchRanges } from '../lib/word-highlight';
   import { markdown as markdownLang, markdownLanguage } from '@codemirror/lang-markdown';
@@ -381,11 +382,10 @@
         drawSelection(),
         indentOnInput(),
         bracketMatching(),
-        // v0.5.1: enable multi-cursor support. Cmd/Ctrl+D (selectNextOccurrence
-        // from searchKeymap) now actually spawns additional cursors at next
-        // match, and Alt/Opt+Left-click drops a cursor at the pointer position
-        // (drawSelection handles the click natively when this flag is true).
-        EditorState.allowMultipleSelections.of(true),
+        // Cmd/Ctrl+D walks occurrences one at a time, Alt/Opt+click drops or
+        // removes a cursor under the pointer. Shared with the code editor and
+        // the diff panes so the chord cannot drift per surface.
+        multiCursorMouse,
         highlightActiveLine(),
         search({ top: true }),
         matchCountBadge,
@@ -410,36 +410,6 @@
             if (pos == null) return true;
             const line = vw.state.doc.lineAt(pos).number;
             onRevealRequest?.(line);
-            return true;
-          },
-          mousedown: (event, vw) => {
-            // v0.5.2: Alt/Opt+Left-click → add cursor at pointer position.
-            // CodeMirror 6's built-in Alt+click multi-cursor (gated on
-            // EditorState.allowMultipleSelections, enabled in v0.5.1) does NOT
-            // fire on Firefox/macOS — Firefox intercepts Option+click for its
-            // own purposes (word-select drag, accessibility shortcut). Bypass
-            // by handling mousedown at the DOM level and dispatching the
-            // cursor-add transaction ourselves. Works uniformly across
-            // Chromium / Firefox / WebKit on Mac + Linux + Windows.
-            //
-            // Modifier policy: ONLY plain Alt+Left-click. Reject if Shift/Ctrl/Meta
-            // also held — those are reserved for native CM6 chords (Shift+click =
-            // extend selection, Meta+click on macOS = native, etc).
-            if (event.button !== 0) return false;
-            if (!event.altKey || event.shiftKey || event.ctrlKey || event.metaKey) return false;
-            const pos = vw.posAtCoords({ x: event.clientX, y: event.clientY });
-            if (pos == null) return false;
-            event.preventDefault();
-            const existing = vw.state.selection;
-            const newCursor = EditorSelection.cursor(pos);
-            // Append the new range and make it primary (VS Code parity:
-            // typing happens at the most-recently-added cursor).
-            vw.dispatch({
-              selection: EditorSelection.create(
-                [...existing.ranges, newCursor],
-                existing.ranges.length,
-              ),
-            });
             return true;
           },
           keydown: (event, vw) => {

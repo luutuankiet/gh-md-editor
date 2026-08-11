@@ -129,8 +129,14 @@ release_web() {
 
   bold "Web app  $(read_version package.json) -> $ver"
   set_version package.json "$ver"
+  # The npm package CI publishes is server/package.json, not this one -- the
+  # publish workflow runs `npm publish` with working-directory: server. Leaving
+  # it behind produces a tag that builds cleanly and then fails at the registry
+  # with "cannot publish over the previously published version", because the
+  # tarball still carries the last release's number.
+  set_version server/package.json "$ver"
   sed -i -E "s/gh-md-editor v[0-9]+\.[0-9]+\.[0-9]+/gh-md-editor v$ver/" public/userscript-installer.html
-  ok "package.json + userscript installer footer bumped"
+  ok "package.json + server/package.json + userscript installer footer bumped"
 
   build_web
   git add -A

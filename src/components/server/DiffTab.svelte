@@ -35,6 +35,7 @@
   import { EditorState } from '@codemirror/state';
   import type { Extension } from '@codemirror/state';
   import { MergeView, unifiedMergeView } from '@codemirror/merge';
+  import { isCollapsedAt, revealSearchMatch } from '../../lib/cm-merge-reveal';
   import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands';
   import { bracketMatching, indentOnInput } from '@codemirror/language';
   import { grammarFor } from '../../lib/lang-detect';
@@ -433,8 +434,16 @@
   // panes can be hunting different strings at the same time. Ticks from either
   // column therefore land on the same rail, and the current one is whichever
   // match the cursor is sitting on, in whichever pane that happens to be.
-  let matchTicks = $state<number[]>([]);
+  // A tick carries which column produced it and whether the line it marks is
+  // currently folded away. Both get drawn: the column picks a lane, because
+  // two panes hunting different strings otherwise pile seventy identical marks
+  // onto one strip with no way to tell whose is whose; the fold picks a hollow
+  // marker, because every match inside one collapsed region shares that
+  // region's single y and five hits would read as one.
+  let matchTicks = $state<{ y: number; side: number; hidden: boolean }[]>([]);
   let currentTickY = $state<number | null>(null);
+  let currentTickSide = $state(0);
+  let paneCount = $state(1);
 
   function tickY(vw: EditorView, sc: HTMLElement, pos: number): number | null {
     const sh = sc.scrollHeight;
@@ -457,10 +466,13 @@
   function recomputeTicks() {
     const sc = scroller();
     const panes = mv ? [mv.a, mv.b] : uv ? [uv] : [];
+    paneCount = panes.length || 1;
     if (!sc || !panes.length) { matchTicks = []; currentTickY = null; return; }
-    const ticks: number[] = [];
+    const ticks: { y: number; side: number; hidden: boolean }[] = [];
     let current: number | null = null;
-    for (const vw of panes) {
+    let currentSide = 0;
+    for (let side = 0; side < panes.length; side++) {
+      const vw = panes[side];
       // Gated on the panel, not on the query alone. CodeMirror drops its inline
       // match decorations the moment the panel unmounts but keeps the query, so
       // ticks keyed off the query outlive the box that produced them and Escape
@@ -475,13 +487,14 @@
       while (!next.done && safety-- > 0) {
         const r = next.value;
         const y = tickY(vw, sc, r.from);
-        if (y != null) ticks.push(y);
-        if (r.from === sel.from && r.to === sel.to) current = y;
+        if (y != null) ticks.push({ y, side, hidden: isCollapsedAt(vw, r.from) != null });
+        if (r.from === sel.from && r.to === sel.to) { current = y; currentSide = side; }
         next = cur.next();
       }
     }
     matchTicks = ticks;
     currentTickY = current;
+    currentTickSide = currentSide;
   }
 
   function scroller(): HTMLElement | null {
@@ -546,6 +559,17 @@
           u.docChanged || u.selectionSet || u.viewportChanged || u.geometryChanged ||
           u.transactions.some((tr) => tr.effects.length > 0)
         ) recomputeTicks();
+        // Stepping through find can land on a line that is folded away, and a
+        // block-replaced line draws nothing: the counter says "5 of 24" while
+        // the screen shows a grey strip and no highlight anywhere. Unfold on
+        // arrival, both columns at once. Deferred, because a view cannot
+        // dispatch into itself from inside its own update.
+        if (u.selectionSet && !u.state.selection.main.empty && searchPanelOpen(u.state)) {
+          const pos = u.state.selection.main.from;
+          if (isCollapsedAt(u.view, pos) != null) {
+            requestAnimationFrame(() => revealSearchMatch(u.view, pos));
+          }
+        }
       }),
       keymap.of([
         { key: 'Mod-s', preventDefault: true, run: () => { void save(); return true; } },
@@ -955,12 +979,12 @@
     {:else}
       <div class="cmarea">
         <div class="cmwrap" bind:this={host}></div>
-        <div class="diff-tick-rail" aria-hidden="true">
-          {#each matchTicks as y, i (i + ':dmatch')}
-            <span class="tick" style="top: {y}px"></span>
+        <div class="diff-tick-rail" class:split={paneCount > 1} aria-hidden="true">
+          {#each matchTicks as t, i (i + ':dmatch')}
+            <span class="tick" class:right={t.side === 1} class:hidden-match={t.hidden} style="top: {t.y}px"></span>
           {/each}
           {#if currentTickY !== null}
-            <span class="tick current" style="top: {currentTickY}px"></span>
+            <span class="tick current" class:right={currentTickSide === 1} style="top: {currentTickY}px"></span>
           {/if}
         </div>
       </div>
@@ -1142,6 +1166,26 @@
     cursor: pointer;
   }
   .difftab :global(.cm-collapsedLines:hover) { background: #303030; color: #c5c8c6; }
+
+  /* CodeMirror's base theme puts the find panel in flow above the scroller.
+     Harmless in a single editor, wrong in a diff: opening find in one column
+     pushes that column's rows down by the panel's height and the two sides
+     stop lining up -- until the other column's panel happens to open too, at
+     which point they silently line up again. Floating it over the text keeps
+     both scrollers the same height whatever is open. */
+  .difftab :global(.cm-panels.cm-panels-top) {
+    position: absolute;
+    top: 0;
+    right: 0;
+    left: auto;
+    width: max-content;
+    max-width: 100%;
+    z-index: 12;
+    border-bottom: 1px solid #404040;
+    border-left: 1px solid #404040;
+    border-radius: 0 0 0 4px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  }
   .difftab :global(.cm-chunkButtons) { gap: 4px; }
   /* Built imperatively by @codemirror/merge, so scoped styles never reach
      them — these have to be :global. */
@@ -1201,12 +1245,27 @@
     border-radius: 1px;
     background: rgba(255, 195, 0, 0.85);
   }
+  /* Split mode runs two independent searches against one rail. Halving it
+     gives each column a lane, so twenty-four hits on the left and forty-six on
+     the right stay readable as two sets instead of seventy anonymous marks. */
+  .diff-tick-rail.split .tick { width: 9px; right: 13px; }
+  .diff-tick-rail.split .tick.right { right: 2px; }
+  /* Hollow means the line is folded away behind an unchanged-lines strip, so
+     every match in that stretch shares this one y. Stepping onto it unfolds
+     the strip and the marks separate. */
+  .diff-tick-rail .tick.hidden-match {
+    background: transparent;
+    height: 5px;
+    box-shadow: inset 0 0 0 1px rgba(255, 195, 0, 0.95);
+  }
   .diff-tick-rail .tick.current {
     background: #ff6b00;
     height: 4px;
     width: 22px;
     right: 1px;
   }
+  .diff-tick-rail.split .tick.current { width: 11px; right: 12px; }
+  .diff-tick-rail.split .tick.current.right { right: 1px; }
   /* Built in script — the merge package and the patch renderer each assemble
      their own DOM — so the rule has to escape component scoping. */
   .difftab :global(.gmd-split-handle) {

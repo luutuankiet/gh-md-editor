@@ -2027,7 +2027,7 @@
         <SearchPanel {folder} onOpen={(p, line) => openFile(p, { pinned: false, line })} />
       </div>
       <div class="side-view" class:hidden={sideView !== 'compare'}>
-        <TreeComparePanel visible={layout.showLeft && sideView === 'compare'} onOpenDiff={openDiff} />
+        <TreeComparePanel visible={layout.showLeft && sideView === 'compare'} onOpenDiff={openDiff} onOpenFile={openRepoFile} onOpenAtRef={openFileAtRef} />
       </div>
 
     </aside>

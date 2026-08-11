@@ -1,9 +1,11 @@
 <script lang="ts">
   import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
 
-  let { visible = false, onOpenDiff }: {
+  let { visible = false, onOpenDiff, onOpenFile, onOpenAtRef }: {
     visible?: boolean;
     onOpenDiff: (repo: string, file: { path: string; staged: boolean; untracked?: boolean; base?: string; baseLabel?: string; to?: string; toLabel?: string }) => void;
+    onOpenFile?: (repo: string, rel: string) => void;
+    onOpenAtRef?: (repo: string, rel: string, sha: string, label: string) => void;
   } = $props();
 
   interface RepoInfo { repo: string; branch?: string; error?: string }
@@ -135,6 +137,15 @@
     void refresh();
   }
 
+  // The file as it stood on one side of the compare, rather than what changed
+  // between them. Two refs are in play here, unlike a commit's file list where
+  // a row belongs to exactly one commit -- so a row can offer two of these,
+  // and the sha, not the label, is what gets read.
+  function openAt(f: FileRow, sha: string, label: string) {
+    if (!sha) return;
+    onOpenAtRef?.(repo, f.path, sha, label);
+  }
+
   function open(f: FileRow) {
     onOpenDiff(repo, {
       path: f.path,
@@ -259,6 +270,35 @@
       <img class="ficon" alt="" aria-hidden="true" src={fileIconUrl(leafName(f.path))} />
       <span class="fname">{leafName(f.path)}</span>
       <span class="badge" style="color: {color(f.status)}">{f.status}</span>
+      <span class="factions">
+        {#if onOpenAtRef && f.status !== 'A' && f.status !== 'U'}
+          <button
+            type="button"
+            class="fact"
+            title="Open this file as it was at {base}"
+            aria-label="Open at {base}"
+            onclick={(e) => { e.stopPropagation(); openAt(f, resolved, direct ? base : `${base} ⤴`); }}
+          >&#9719;</button>
+        {/if}
+        {#if onOpenAtRef && incoming && resolvedHead && f.status !== 'D'}
+          <button
+            type="button"
+            class="fact incoming"
+            title="Open this file as it was at {incoming}"
+            aria-label="Open at {incoming}"
+            onclick={(e) => { e.stopPropagation(); openAt(f, resolvedHead, incoming); }}
+          >&#9719;</button>
+        {/if}
+        {#if onOpenFile && f.status !== 'D'}
+          <button
+            type="button"
+            class="fact"
+            title="Open the current file"
+            aria-label="Open current file"
+            onclick={(e) => { e.stopPropagation(); onOpenFile?.(repo, f.path); }}
+          >&#8599;</button>
+        {/if}
+      </span>
     </div>
   {/each}
 {/snippet}
@@ -414,6 +454,33 @@
     box-sizing: border-box;
   }
   .filerow:hover { background: rgba(110, 118, 129, 0.12); }
+  /* The action group holds its width at all times rather than appearing on
+     hover: a row that reflows under the cursor moves the thing being clicked.
+     Only its contents fade in. */
+  .factions {
+    flex: none;
+    display: flex;
+    align-items: center;
+    padding-right: 4px;
+    visibility: hidden;
+  }
+  .filerow:hover .factions,
+  .filerow:focus-within .factions { visibility: visible; }
+  .fact {
+    border: 0;
+    background: none;
+    color: #6e7681;
+    cursor: pointer;
+    padding: 0 3px;
+    font: inherit;
+    font-size: 12px;
+    line-height: 1;
+  }
+  .fact:hover { color: #c5c8c6; }
+  /* Two clocks on one row otherwise say the same thing twice. Blue is the
+     incoming side throughout this panel, so it reads without a legend. */
+  .fact.incoming { color: #4d7ea8; }
+  .fact.incoming:hover { color: #79c0ff; }
   .guide {
     position: absolute;
     top: 0;

@@ -97,3 +97,58 @@ export function revealSearchMatch(view: EditorView, pos: number): boolean {
 
   return true;
 }
+
+/**
+ * Unfold every collapsed strip hiding one of `positions`, on both columns, and
+ * return how many strips were opened.
+ *
+ * Find exists to let a reader see all the hits at once. A hit behind a fold
+ * strip is a hit the reader cannot see, so stepping onto it one at a time --
+ * what `revealSearchMatch` does -- is the wrong shape for the whole-file scan;
+ * this opens all of them and leaves the reader to use their eyes.
+ *
+ * One transaction per column, not one per strip: the effect is applied as a
+ * filter over the collapsed-range field and the field's update loop walks every
+ * effect in the transaction, so a batch costs one measure instead of N. The
+ * offsets are document positions and unfolding changes no text, so none of them
+ * go stale as the batch is applied.
+ *
+ * No scrolling. The reader is looking at a position they chose, and the strips
+ * being opened are mostly somewhere else; CodeMirror holds the viewport against
+ * its own scroll anchor while the document above grows taller.
+ */
+export function revealAllMatches(view: EditorView, positions: readonly number[]): number {
+  if (!positions.length) return 0;
+
+  // Many matches usually share one strip, and the effect is keyed on the
+  // strip's start offset -- dispatching a duplicate is wasted work at best.
+  const strips = new Set<number>();
+  for (const pos of positions) {
+    const from = isCollapsedAt(view, pos);
+    if (from != null) strips.add(from);
+  }
+  if (!strips.size) return 0;
+
+  // Read the chunk map before dispatching: it describes the two documents,
+  // which the unfold does not touch, but the state it hangs off is replaced.
+  const info = getChunks(view.state);
+  const sibs = mergeViewSiblings(view);
+  const list = [...strips];
+
+  view.dispatch({ effects: list.map((from) => uncollapseUnchanged.of(from)) });
+
+  // The sibling is not optional -- see revealSearchMatch. Two columns that
+  // disagree about which lines are folded stop lining up, which is the one
+  // thing a diff has to get right.
+  if (sibs && info) {
+    const other = sibs.a === view ? sibs.b : sibs.a;
+    if (other && other !== view) {
+      const isA = info.side === 'a';
+      other.dispatch({
+        effects: list.map((from) => uncollapseUnchanged.of(mapPos(from, info.chunks, isA))),
+      });
+    }
+  }
+
+  return list.length;
+}

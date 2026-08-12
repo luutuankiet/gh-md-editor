@@ -33,6 +33,10 @@
     reveal?: { line: number; seq: number; select?: { from: number; to: number }; word?: string };
     // A file as it stood at a commit: real content, no path to write back to.
     ro?: boolean;
+    // The bare file name, for when `name` carries a decoration the editor must
+    // not see. Grammar is detected off the end of the string, so a tab titled
+    // `app.js @ v1.2` reads as extension `js @ v1.2` and gets no language.
+    fileName?: string;
     // Present on kind === 'diff' tabs: which repo/file/side the tab shows.
     git?: { repo: string; path: string; staged: boolean; untracked: boolean; base?: string; baseLabel?: string; to?: string; toLabel?: string };
     // Present on kind === 'diff' tabs opened by a compare command: two
@@ -220,8 +224,9 @@
     { label: 'Select All Occurrences', hint: 'Mod+Shift+D', run: () => window.dispatchEvent(new CustomEvent('gmd:select-all-occurrences')) },
     { label: 'Compare Active File With…', run: () => { if (compareSource()) browse = { mode: 'compare', action: 'same' }; } },
     { label: 'Compare Active File With Clipboard', run: () => void compareWithClipboard() },
-    { label: "Open Diff's File at This Commit", hint: 'active diff, old side', run: () => openActiveDiffAt('base') },
-    { label: "Open Diff's File at HEAD", hint: 'active diff', run: () => openActiveDiffAt('head') },
+    { label: "Open Diff's File at This Commit", hint: 'active diff, side shown', run: () => openActiveDiffAt('this') },
+    { label: "Open Diff's File at Base Commit", hint: 'active diff, old side', run: () => openActiveDiffAt('base') },
+    { label: "Open Diff's File", hint: 'active diff, working copy', run: openActiveDiffFile },
     { label: 'Checkout Branch…', hint: 'anchored repository', run: () => void openRefPicker(gitAnchor) },
     { label: 'Toggle Hidden Values', hint: '.env files', run: () => window.dispatchEvent(new CustomEvent('gmd:toggle-cloak')) },
     { label: 'Toggle Git Blame', hint: 'code editors', run: toggleBlame },
@@ -1160,7 +1165,7 @@
       const d = await r.json();
       if (!r.ok) error = d.error ?? `HTTP ${r.status}`;
       else if (d.binary) error = 'Binary file.';
-      else if (!d.tracked) error = `Not in ${label}: ${d.reason ?? 'no such object'}`;
+      else if (!d.tracked) error = `Not in ${label} — the file did not exist at that commit.`;
       else content = d.content ?? '';
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -1170,6 +1175,7 @@
     const tab: Tab = {
       path: key,
       name: `${baseName(rel)} @ ${label}`,
+      fileName: baseName(rel),
       kind: 'code',
       pinned: false,
       content,
@@ -1323,16 +1329,36 @@
     activeGroupId = home.id;
   }
 
-  // The palette twin of the ref buttons in a diff's header: the same two refs,
-  // reached from the keyboard instead of the mouse. 'this commit' is the diff's
-  // OLD side — the state the change departed from — which is what a reader
-  // comparing against a commit actually wants to see whole.
-  function openActiveDiffAt(which: 'base' | 'head') {
+  // The parent of a repository's first commit. A diff of that commit has it as
+  // the old side, and nothing has ever existed there.
+  const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+  // The palette twin of the ref buttons in a diff's header: the same refs,
+  // reached from the keyboard instead of the mouse.
+  //
+  // 'this commit' is the NEW side. A commit's own diff is drawn against its
+  // parent, so the old side is the state before the change — where a file the
+  // commit added does not exist at all, and git rightly says so. The commit
+  // being read is the one the reader means.
+  function openActiveDiffAt(which: 'this' | 'base') {
     const t = activeTab;
     if (!t || t.kind !== 'diff' || !t.git || !t.git.repo || !t.git.path || t.git.untracked) return;
     const g = t.git;
-    const pinned = which === 'base' ? g.base ?? '' : '';
-    void openFileAtRef(g.repo, g.path, pinned || 'HEAD', pinned ? g.baseLabel || pinned.slice(0, 7) : 'HEAD');
+    const ref = which === 'this' ? g.to || g.base || 'HEAD' : g.base ?? '';
+    if (!ref || ref === EMPTY_TREE) return;
+    const label =
+      ref === g.to ? g.toLabel || ref.slice(0, 7)
+      : ref === g.base ? g.baseLabel || ref.slice(0, 7)
+      : 'HEAD';
+    void openFileAtRef(g.repo, g.path, ref, label);
+  }
+
+  // Not a ref at all: the file on disk, editable, with its history and its
+  // grammar — the same thing the explorer opens.
+  function openActiveDiffFile() {
+    const t = activeTab;
+    if (!t || t.kind !== 'diff' || !t.git || !t.git.path) return;
+    openRepoFile(t.git.repo, t.git.path);
   }
 
   // The left side of a compare is whatever real file is on screen. A diff tab
@@ -2134,7 +2160,7 @@
                   {:else if at.kind === 'diff' && at.cmp}
                     <DiffTab compare={at.cmp} onScratch={(text) => applyScratch(at, text)} viewKey={at.path} />
                   {:else if at.kind === 'diff' && at.git}
-                    <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} to={at.git.to ?? ''} toLabel={at.git.toLabel ?? ''} viewKey={at.path} onOpenAtRef={openFileAtRef} />
+                    <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} to={at.git.to ?? ''} toLabel={at.git.toLabel ?? ''} viewKey={at.path} onOpenAtRef={openFileAtRef} onOpenFile={openRepoFile} />
                   {:else if at.kind === 'graph' && at.graph}
                     <GitGraphTab repo={at.graph.repo} onOpenDiff={openDiff} onOpenFile={openRepoFile} onOpenAtRef={openFileAtRef} />
                   {:else if at.kind === 'merge' && at.merge}
@@ -2142,7 +2168,7 @@
                   {:else if at.kind === 'md'}
                     <MarkdownTab bind:value={at.content} name={at.name} reveal={at.reveal ?? null} viewKey={at.path} />
                   {:else}
-                    <CodeTab bind:value={at.content} filename={at.name} gitPath={at.untitled || at.ro ? '' : at.path} reveal={at.reveal ?? null} readOnly={!!at.ro} viewKey={at.path} />
+                    <CodeTab bind:value={at.content} filename={at.fileName ?? at.name} gitPath={at.untitled || at.ro ? '' : at.path} reveal={at.reveal ?? null} readOnly={!!at.ro} viewKey={at.path} />
                   {/if}
                 {:else}
                   <div class="placeholder">Open a file from the tree.</div>

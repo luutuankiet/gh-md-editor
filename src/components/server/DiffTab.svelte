@@ -1,5 +1,5 @@
 <script lang="ts">
-  let { repo = '', path = '', staged = false, untracked = false, compare = null, onScratch = undefined, onOpenAtRef = undefined, base = '', baseLabel = '', to = '', toLabel = '', viewKey = '' }: {
+  let { repo = '', path = '', staged = false, untracked = false, compare = null, onScratch = undefined, onOpenAtRef = undefined, onOpenFile = undefined, base = '', baseLabel = '', to = '', toLabel = '', viewKey = '' }: {
     repo?: string;
     path?: string;
     // Which tab this diff is hosted in, for the state the tab remembers on its
@@ -27,6 +27,10 @@
     // Open the file as it stood at a ref, read-only, in its own tab. Same
     // signature the commit graph and the tree compare panel already use.
     onOpenAtRef?: (repo: string, rel: string, ref: string, label: string) => void;
+    // Open the working copy -- the actual file on disk, editable, the same one
+    // the explorer opens. Distinct from every ref above: those are commits, and
+    // the file on disk is whatever it is right now.
+    onOpenFile?: (repo: string, rel: string) => void;
   } = $props();
 
   import { untrack } from 'svelte';
@@ -38,7 +42,7 @@
   import { EditorState } from '@codemirror/state';
   import type { Extension } from '@codemirror/state';
   import { MergeView, unifiedMergeView } from '@codemirror/merge';
-  import { isCollapsedAt, revealSearchMatch } from '../../lib/cm-merge-reveal';
+  import { isCollapsedAt, revealSearchMatch, revealAllMatches } from '../../lib/cm-merge-reveal';
   import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands';
   import { bracketMatching, indentOnInput } from '@codemirror/language';
   import { grammarFor } from '../../lib/lang-detect';
@@ -65,16 +69,22 @@
   // otherwise the old side is the index or HEAD, and HEAD is the thing that can
   // actually be opened. A pinned new side exists only when BOTH ends are
   // commits — everywhere else the new side is the working file, which the
-  // explorer already opens. HEAD earns a button of its own only when neither
-  // end is already it. An untracked file exists at no ref at all.
+  // button beside them opens. An untracked file exists at no ref at all.
+  //
+  // Only refs this diff is actually built from get a button. An extra HEAD on a
+  // comparison between two other commits offers a third, unrelated version of
+  // the file under the same clock icon as the two being read.
   const atRefs = $derived.by(() => {
     if (!onOpenAtRef || compare || untracked || !repo || !path) return [];
     const out: { ref: string; label: string; incoming: boolean }[] = [];
     out.push({ ref: base || 'HEAD', label: base ? baseLabel || base.slice(0, 7) : 'HEAD', incoming: false });
     if (to) out.push({ ref: to, label: toLabel || to.slice(0, 7), incoming: true });
-    if (!out.some((r) => r.label === 'HEAD')) out.push({ ref: 'HEAD', label: 'HEAD', incoming: false });
     return out;
   });
+
+  // The working copy is openable whenever the diff names a real file, including
+  // an untracked one — it exists on disk, that is what untracked means.
+  const canOpenFile = $derived(!!onOpenFile && !compare && !!path);
 
   let hunks = $state<Hunk[]>([]);
   let flags = $state<{ binary?: boolean; tooBig?: boolean }>({});
@@ -485,12 +495,40 @@
     } catch { return null; }
   }
 
+  // Matches hidden behind fold strips, waiting to be revealed as a batch. The
+  // query changes on every keystroke and each change re-walks the document, so
+  // the unfold is debounced rather than run per character; the pending set is
+  // replaced wholesale because the newest walk is the authority on what is still
+  // hidden. Deferred out of the update cycle too — recomputeTicks runs from
+  // inside an update listener, and a view cannot dispatch into itself there.
+  let expandTimer: ReturnType<typeof setTimeout> | null = null;
+  let expandJobs: { view: EditorView; positions: number[] }[] = [];
+
+  function scheduleExpand(jobs: { view: EditorView; positions: number[] }[]) {
+    expandJobs = jobs;
+    if (expandTimer) clearTimeout(expandTimer);
+    expandTimer = setTimeout(() => {
+      expandTimer = null;
+      const pending = expandJobs;
+      expandJobs = [];
+      if (!mv && !uv) return;
+      let opened = 0;
+      // Unfolding one column unfolds its sibling, so by the time the second job
+      // runs its positions are usually visible already and it does nothing.
+      for (const j of pending) opened += revealAllMatches(j.view, j.positions);
+      // The rail drew those matches as hollow; they are solid now, and the
+      // lines below them have all moved.
+      if (opened) recomputeTicks();
+    }, 180);
+  }
+
   function recomputeTicks() {
     const sc = scroller();
     const panes = mv ? [mv.a, mv.b] : uv ? [uv] : [];
     paneCount = panes.length || 1;
     if (!sc || !panes.length) { matchTicks = []; currentTickY = null; return; }
     const ticks: { y: number; side: number; hidden: boolean }[] = [];
+    const jobs: { view: EditorView; positions: number[] }[] = [];
     let current: number | null = null;
     let currentSide = 0;
     for (let side = 0; side < panes.length; side++) {
@@ -506,17 +544,25 @@
       const cur = q.getCursor(vw.state.doc);
       let safety = 5000;
       let next = cur.next();
+      const buried: number[] = [];
       while (!next.done && safety-- > 0) {
         const r = next.value;
         const y = tickY(vw, sc, r.from);
-        if (y != null) ticks.push({ y, side, hidden: isCollapsedAt(vw, r.from) != null });
+        const folded = isCollapsedAt(vw, r.from) != null;
+        if (y != null) ticks.push({ y, side, hidden: folded });
+        if (folded) buried.push(r.from);
         if (r.from === sel.from && r.to === sel.to) { current = y; currentSide = side; }
         next = cur.next();
       }
+      // One character matches most of a file. Unfolding on it would blow every
+      // strip open on the first keystroke of a search that has not been typed
+      // yet, and the folds do not come back.
+      if (buried.length && q.search.length >= 2) jobs.push({ view: vw, positions: buried });
     }
     matchTicks = ticks;
     currentTickY = current;
     currentTickSide = currentSide;
+    if (jobs.length) scheduleExpand(jobs);
   }
 
   function scroller(): HTMLElement | null {
@@ -966,7 +1012,7 @@
     {:else if shownView !== 'hunks'}
       <span class="pill">read-only</span>
     {/if}
-    {#if atRefs.length}
+    {#if atRefs.length || canOpenFile}
       <span class="atrefs">
         {#each atRefs as r (r.ref + ':' + r.label)}
           <button
@@ -978,6 +1024,15 @@
             onclick={() => onOpenAtRef?.(repo, path, r.ref, r.label)}
           >&#9719; {r.label}</button>
         {/each}
+        {#if canOpenFile}
+          <button
+            type="button"
+            class="atref working"
+            title="Open the working copy of this file — the editable one on disk"
+            aria-label="Open file"
+            onclick={() => onOpenFile?.(repo, path)}
+          >&#8615; file</button>
+        {/if}
       </span>
     {/if}
     <span class="viewtoggle">

@@ -1086,6 +1086,20 @@
   // spawning a duplicate tab.
   const pendingOpens = new Map<string, { pinned: boolean }>();
 
+  // The preview slot: the first unpinned, unmodified tab in a group, recycled
+  // so that reading down a tree does not bury the workspace in tabs.
+  //
+  // A diff is exempt from every opener except another diff. It is a reference
+  // view — read beside the file it opens, held while a commit is picked apart —
+  // so recycling it to show one of its own sides destroys the thing the click
+  // was made from. Stepping down a list of changed files still recycles,
+  // because there the opener is itself a diff.
+  function previewIdxIn(home: { tabs: Tab[] }, opening: Tab['kind']) {
+    return home.tabs.findIndex(
+      (t) => !t.pinned && !isDirty(t) && (opening === 'diff' || t.kind !== 'diff')
+    );
+  }
+
   async function openFile(path: string, opts: { pinned: boolean; line?: number; word?: string }) {
     // If open in ANY group, focus it there — duplicating a file across groups
     // would fork its content buffer and make saves ambiguous.
@@ -1133,7 +1147,7 @@
     if (opts.line || opts.word) tab.reveal = { line: opts.line ?? 1, seq: ++revealSeq, word: opts.word };
 
     const home = groups.includes(target) ? target : groups[0];
-    const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
+    const previewIdx = previewIdxIn(home, tab.kind);
     if (!tab.pinned && previewIdx >= 0) {
       home.tabs[previewIdx] = tab;
     } else {
@@ -1185,13 +1199,7 @@
       error: error || undefined,
     };
     const home = groups.includes(activeGroup) ? activeGroup : groups[0];
-    // The preview slot may not eat the diff that asked for this. A diff is a
-    // two-sided reference view read side by side with the file it opens, so
-    // recycling it to show one of its own sides destroys the comparison the
-    // click was made from. Every other unpinned clean tab stays fair game.
-    const previewIdx = home.tabs.findIndex(
-      (t) => !t.pinned && !isDirty(t) && !(t.kind === 'diff' && t.path === home.activePath)
-    );
+    const previewIdx = previewIdxIn(home, tab.kind);
     if (previewIdx >= 0) home.tabs[previewIdx] = tab;
     else home.tabs.push(tab);
     home.activePath = key;
@@ -1224,7 +1232,7 @@
       git: { repo, path: file.path, staged: file.staged, untracked: !!file.untracked, base: file.base, baseLabel: file.baseLabel, to: file.to, toLabel: file.toLabel },
     };
     const home = groups.includes(activeGroup) ? activeGroup : groups[0];
-    const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
+    const previewIdx = previewIdxIn(home, tab.kind);
     if (previewIdx >= 0) home.tabs[previewIdx] = tab;
     else home.tabs.push(tab);
     home.activePath = key;
@@ -1257,7 +1265,7 @@
       graph: { repo },
     };
     const home = groups.includes(activeGroup) ? activeGroup : groups[0];
-    const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
+    const previewIdx = previewIdxIn(home, tab.kind);
     if (previewIdx >= 0) home.tabs[previewIdx] = tab;
     else home.tabs.push(tab);
     home.activePath = key;
@@ -1288,7 +1296,7 @@
       merge: { repo, path: filePath },
     };
     const home = groups.includes(activeGroup) ? activeGroup : groups[0];
-    const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
+    const previewIdx = previewIdxIn(home, tab.kind);
     if (previewIdx >= 0) home.tabs[previewIdx] = tab;
     else home.tabs.push(tab);
     home.activePath = key;
@@ -1322,7 +1330,7 @@
       cmp,
     };
     const home = groups.includes(activeGroup) ? activeGroup : groups[0];
-    const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
+    const previewIdx = previewIdxIn(home, tab.kind);
     if (previewIdx >= 0) home.tabs[previewIdx] = tab;
     else home.tabs.push(tab);
     home.activePath = key;

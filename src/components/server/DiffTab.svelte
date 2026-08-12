@@ -1,5 +1,5 @@
 <script lang="ts">
-  let { repo = '', path = '', staged = false, untracked = false, compare = null, onScratch = undefined, base = '', baseLabel = '', to = '', toLabel = '', viewKey = '' }: {
+  let { repo = '', path = '', staged = false, untracked = false, compare = null, onScratch = undefined, onOpenAtRef = undefined, base = '', baseLabel = '', to = '', toLabel = '', viewKey = '' }: {
     repo?: string;
     path?: string;
     // Which tab this diff is hosted in, for the state the tab remembers on its
@@ -24,6 +24,9 @@
     // Called when the editable column has no file behind it to save to: the new
     // text goes back to whoever owns the buffer instead.
     onScratch?: (text: string) => void;
+    // Open the file as it stood at a ref, read-only, in its own tab. Same
+    // signature the commit graph and the tree compare panel already use.
+    onOpenAtRef?: (repo: string, rel: string, ref: string, label: string) => void;
   } = $props();
 
   import { untrack } from 'svelte';
@@ -53,6 +56,25 @@
 
   // Two commits, no working tree — nothing here can be staged or reverted.
   const readOnly = $derived(!!to);
+
+  // The file as it stood on either side of this diff, rather than what changed
+  // between them — the read-only twin of the clock buttons in the tree compare
+  // panel and the commit graph.
+  //
+  // A diff always has an old side, but only names it when a compare pinned one;
+  // otherwise the old side is the index or HEAD, and HEAD is the thing that can
+  // actually be opened. A pinned new side exists only when BOTH ends are
+  // commits — everywhere else the new side is the working file, which the
+  // explorer already opens. HEAD earns a button of its own only when neither
+  // end is already it. An untracked file exists at no ref at all.
+  const atRefs = $derived.by(() => {
+    if (!onOpenAtRef || compare || untracked || !repo || !path) return [];
+    const out: { ref: string; label: string; incoming: boolean }[] = [];
+    out.push({ ref: base || 'HEAD', label: base ? baseLabel || base.slice(0, 7) : 'HEAD', incoming: false });
+    if (to) out.push({ ref: to, label: toLabel || to.slice(0, 7), incoming: true });
+    if (!out.some((r) => r.label === 'HEAD')) out.push({ ref: 'HEAD', label: 'HEAD', incoming: false });
+    return out;
+  });
 
   let hunks = $state<Hunk[]>([]);
   let flags = $state<{ binary?: boolean; tooBig?: boolean }>({});
@@ -944,6 +966,20 @@
     {:else if shownView !== 'hunks'}
       <span class="pill">read-only</span>
     {/if}
+    {#if atRefs.length}
+      <span class="atrefs">
+        {#each atRefs as r (r.ref + ':' + r.label)}
+          <button
+            type="button"
+            class="atref"
+            class:incoming={r.incoming}
+            title="Open this file as it was at {r.label}"
+            aria-label="Open at {r.label}"
+            onclick={() => onOpenAtRef?.(repo, path, r.ref, r.label)}
+          >&#9719; {r.label}</button>
+        {/each}
+      </span>
+    {/if}
     <span class="viewtoggle">
       <button type="button" class:on={wrap} title="Word wrap in this tab (Alt/Opt+Z)" onclick={() => toggleWrapFor(viewKey)}>Wrap</button>
     </span>
@@ -1464,6 +1500,36 @@
     font-size: 13px;
   }
   .icon-btn:hover { background: #444444; color: #c5c8c6; }
+  /* The header already reads "origin/main vs v0.7.4"; these extend that label
+     into something clickable rather than introducing a second vocabulary for
+     the same two refs. Named rather than glyph-only: three identical clocks in
+     a row say nothing about which commit each one opens. */
+  .atrefs {
+    display: flex;
+    flex: 0 1 auto;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+  }
+  .atref {
+    border: none;
+    background: transparent;
+    color: #8a8a8a;
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 1px 5px;
+    font: inherit;
+    font-size: 11px;
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .atref:hover { background: #444444; color: #c5c8c6; }
+  /* Blue is the incoming side throughout the git panels, so it reads here
+     without a legend. */
+  .atref.incoming { color: #4d7ea8; }
+  .atref.incoming:hover { color: #79c0ff; }
   .viewtoggle {
     display: flex;
     flex: 0 0 auto;

@@ -220,6 +220,8 @@
     { label: 'Select All Occurrences', hint: 'Mod+Shift+D', run: () => window.dispatchEvent(new CustomEvent('gmd:select-all-occurrences')) },
     { label: 'Compare Active File With…', run: () => { if (compareSource()) browse = { mode: 'compare', action: 'same' }; } },
     { label: 'Compare Active File With Clipboard', run: () => void compareWithClipboard() },
+    { label: "Open Diff's File at This Commit", hint: 'active diff, old side', run: () => openActiveDiffAt('base') },
+    { label: "Open Diff's File at HEAD", hint: 'active diff', run: () => openActiveDiffAt('head') },
     { label: 'Checkout Branch…', hint: 'anchored repository', run: () => void openRefPicker(gitAnchor) },
     { label: 'Toggle Hidden Values', hint: '.env files', run: () => window.dispatchEvent(new CustomEvent('gmd:toggle-cloak')) },
     { label: 'Toggle Git Blame', hint: 'code editors', run: toggleBlame },
@@ -1177,7 +1179,13 @@
       error: error || undefined,
     };
     const home = groups.includes(activeGroup) ? activeGroup : groups[0];
-    const previewIdx = home.tabs.findIndex((t) => !t.pinned && !isDirty(t));
+    // The preview slot may not eat the diff that asked for this. A diff is a
+    // two-sided reference view read side by side with the file it opens, so
+    // recycling it to show one of its own sides destroys the comparison the
+    // click was made from. Every other unpinned clean tab stays fair game.
+    const previewIdx = home.tabs.findIndex(
+      (t) => !t.pinned && !isDirty(t) && !(t.kind === 'diff' && t.path === home.activePath)
+    );
     if (previewIdx >= 0) home.tabs[previewIdx] = tab;
     else home.tabs.push(tab);
     home.activePath = key;
@@ -1313,6 +1321,18 @@
     else home.tabs.push(tab);
     home.activePath = key;
     activeGroupId = home.id;
+  }
+
+  // The palette twin of the ref buttons in a diff's header: the same two refs,
+  // reached from the keyboard instead of the mouse. 'this commit' is the diff's
+  // OLD side — the state the change departed from — which is what a reader
+  // comparing against a commit actually wants to see whole.
+  function openActiveDiffAt(which: 'base' | 'head') {
+    const t = activeTab;
+    if (!t || t.kind !== 'diff' || !t.git || !t.git.repo || !t.git.path || t.git.untracked) return;
+    const g = t.git;
+    const pinned = which === 'base' ? g.base ?? '' : '';
+    void openFileAtRef(g.repo, g.path, pinned || 'HEAD', pinned ? g.baseLabel || pinned.slice(0, 7) : 'HEAD');
   }
 
   // The left side of a compare is whatever real file is on screen. A diff tab
@@ -2114,7 +2134,7 @@
                   {:else if at.kind === 'diff' && at.cmp}
                     <DiffTab compare={at.cmp} onScratch={(text) => applyScratch(at, text)} viewKey={at.path} />
                   {:else if at.kind === 'diff' && at.git}
-                    <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} to={at.git.to ?? ''} toLabel={at.git.toLabel ?? ''} viewKey={at.path} />
+                    <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} to={at.git.to ?? ''} toLabel={at.git.toLabel ?? ''} viewKey={at.path} onOpenAtRef={openFileAtRef} />
                   {:else if at.kind === 'graph' && at.graph}
                     <GitGraphTab repo={at.graph.repo} onOpenDiff={openDiff} onOpenFile={openRepoFile} onOpenAtRef={openFileAtRef} />
                   {:else if at.kind === 'merge' && at.merge}

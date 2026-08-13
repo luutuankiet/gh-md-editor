@@ -309,9 +309,18 @@ async function apiTree(res, params) {
   } catch (e) {
     return sendJson(res, e.code === 'ENOENT' ? 404 : 500, { error: String(e.message ?? e) });
   }
-  const out = entries.map((e) => ({
-    name: e.name,
-    type: e.isDirectory() ? 'dir' : e.isSymbolicLink() ? 'link' : 'file',
+  // A symlink is classified by what it points AT, never by being a link.
+  // readdir reports lstat types, so a symlinked directory used to arrive as
+  // neither dir nor file, and the explorer has no branch for that third
+  // shape: no chevron, no expand, and a click asked the file endpoint for a
+  // directory. The flag survives for the icon; behaviour keys off `type`.
+  const out = await Promise.all(entries.map(async (e) => {
+    if (!e.isSymbolicLink()) return { name: e.name, type: e.isDirectory() ? 'dir' : 'file' };
+    // A broken link degrades to a file so the read error surfaces in a tab
+    // rather than as a folder that opens onto nothing.
+    let type = 'file';
+    try { type = (await fs.stat(path.join(abs, e.name))).isDirectory() ? 'dir' : 'file'; } catch {}
+    return { name: e.name, type, link: true };
   }));
   out.sort((a, b) =>
     (a.type === 'dir' ? 0 : 1) - (b.type === 'dir' ? 0 : 1) ||
@@ -448,6 +457,13 @@ async function apiContext(res, params) {
 // filesystem — and there the destination inode has to survive the write, so
 // its bytes are overwritten in place instead.
 async function commitTemp(tmp, abs) {
+  // A symlinked destination is a pointer, and rename() replaces the pointer
+  // rather than the bytes behind it: the edit lands on a path the user never
+  // opened and the link is gone. Every writer publishes through here, so
+  // resolving the final hop once keeps a linked file editable in place.
+  try {
+    if ((await fs.lstat(abs)).isSymbolicLink()) abs = await fs.realpath(abs);
+  } catch {}
   try {
     return await fs.rename(tmp, abs);
   } catch (e) {
@@ -661,16 +677,29 @@ async function apiDownload(res, params) {
     if (!abs) return sendJson(res, 400, { error: 'path escapes root' });
     let st;
     try { st = await fs.lstat(abs); } catch { return sendJson(res, 404, { error: `not found: ${rel}` }); }
-    targets.push({ abs, st });
+    // What the tree handed over is a folder or a file to the person who
+    // clicked it, even when the entry itself is a link. Only links met
+    // *during* the walk stay unfollowed, so the loop and out-of-workspace
+    // guards below still hold. The selected name is kept either way, so the
+    // archive is still called after the thing that was selected.
+    const name = path.basename(abs) || 'root';
+    if (st.isSymbolicLink()) {
+      let real;
+      try { real = await fs.realpath(abs); st = await fs.stat(real); }
+      catch { return sendJson(res, 404, { error: `broken link: ${rel}` }); }
+      targets.push({ abs: real, st, name });
+      continue;
+    }
+    targets.push({ abs, st, name });
   }
 
   // Zipping a lone file would only make the user unpack it again.
   if (targets.length === 1 && targets[0].st.isFile()) {
-    const { abs, st } = targets[0];
+    const { abs, st, name } = targets[0];
     res.writeHead(200, {
       'content-type': 'application/octet-stream',
       'content-length': String(st.size),
-      'content-disposition': contentDisposition(path.basename(abs)),
+      'content-disposition': contentDisposition(name),
       'cache-control': 'no-store',
     });
     await new Promise((resolve) => {
@@ -703,7 +732,7 @@ async function apiDownload(res, params) {
       entries.push({ abs, name, st, dir: false });
     }
   };
-  for (const t of targets) await walk(t.abs, path.basename(t.abs) || 'root');
+  for (const t of targets) await walk(t.abs, t.name);
 
   if (!entries.length) return sendJson(res, 404, { error: 'nothing to download' });
   if (entries.length > ZIP_MAX_ENTRIES) {
@@ -717,7 +746,7 @@ async function apiDownload(res, params) {
 
   const baseAbs = resolveSafe(params.get('base') ?? '.') ?? ROOT;
   const zipName = targets.length === 1
-    ? `${path.basename(targets[0].abs) || 'workspace'}.zip`
+    ? `${targets[0].name || 'workspace'}.zip`
     : `${path.basename(baseAbs) || 'workspace'}-files.zip`;
   res.writeHead(200, {
     'content-type': 'application/zip',
@@ -798,7 +827,9 @@ function listFiles(baseAbs) {
   const hit = fileListCache.get(baseAbs);
   if (hit && Date.now() - hit.at < FILELIST_TTL) return Promise.resolve(hit);
   return new Promise((resolve) => {
-    const child = spawn(rgBin || 'rg', ['--files'], { cwd: baseAbs });
+    // --follow: a symlinked directory is part of the workspace the same way
+    // the explorer now treats it as one, so quick open must see through it.
+    const child = spawn(rgBin || 'rg', ['--files', '--follow'], { cwd: baseAbs });
     let buf = '';
     let truncated = false;
     // A missing rg used to resolve to an empty list with no error, so quick
@@ -1457,6 +1488,7 @@ function apiDefs(req, res, params) {
     '--json',
     '--no-messages',
     '--case-sensitive',
+    '--follow',
     '--max-filesize', '2M',
     // A declaration repeated four times in one file is a re-export or an
     // overload set; more of the same file crowds out other candidates.
@@ -1527,6 +1559,7 @@ function apiRefs(req, res, params) {
     '--case-sensitive',
     '--word-regexp',
     '--fixed-strings',
+    '--follow',
     '--max-filesize', '2M',
     '--max-columns', '400',
     '-e', name,
@@ -1601,6 +1634,7 @@ function apiRefCounts(req, res, params) {
     '--no-messages',
     '--case-sensitive',
     '--word-regexp',
+    '--follow',
     '--max-filesize', '2M',
     '--max-columns', '400',
     '-e', names.join('|'),
@@ -1775,6 +1809,7 @@ function apiSearch(req, res, params) {
   const args = [
     '--json',
     '--no-messages',
+    '--follow',
     '--max-filesize', '2M',
     '--max-count', '200',
     '--max-columns', '400',

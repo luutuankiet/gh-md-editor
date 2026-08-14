@@ -437,7 +437,7 @@
     );
   }
 
-  let { value = $bindable(''), filename, gitPath = '', reveal = null, marks = [], readOnly = false, viewKey = '' }: {
+  let { value = $bindable(''), filename, gitPath = '', folder = '', reveal = null, marks = [], readOnly = false, viewKey = '' }: {
     value?: string;
     filename: string;
     // Which tab this editor belongs to, for the state the tab remembers on its
@@ -452,6 +452,10 @@
     // git what this file looked like before the current edits — the editor
     // itself stays path-agnostic.
     gitPath?: string;
+    // The anchored workspace, root-relative, empty meaning the whole served
+    // root. This is what the definition and reference lookups are allowed to
+    // search — see searchScope() below.
+    folder?: string;
     // Search-result jump. `seq` is what makes a repeat click on the same line
     // fire again — a bare line number would compare equal and do nothing.
     // `select` carries a range to highlight instead of just placing the cursor,
@@ -569,12 +573,16 @@
     },
   });
 
-  // What the reference endpoints search. The workspace folder rather than the
-  // whole server root: a root holding a dozen sibling checkouts would report
-  // matches from projects the reader never opened.
+  // What the definition and reference endpoints search. The anchored workspace
+  // rather than the whole server root: a root holding a dozen sibling checkouts
+  // would report matches from projects the reader never opened.
+  //
+  // This used to guess the workspace from the first path segment of the open
+  // file, which is only right when the workspace sits exactly one level below
+  // the server root — too wide for a nested workspace, and too narrow when the
+  // root IS the workspace. The host knows the real answer and now passes it.
   function searchScope(): string {
-    const cut = gitPath.indexOf('/');
-    return cut > 0 ? gitPath.slice(0, cut) : (gitPath || '.');
+    return folder || '.';
   }
 
   const LENS_NAME_CAP = 120;
@@ -1048,7 +1056,12 @@
     }
 
     try {
-      const r = await fetch(`/api/defs?name=${encodeURIComponent(word)}`);
+      // Without the scope the server defaults to its own root, which on a root
+      // holding several checkouts answers with definitions from projects that
+      // are not even open.
+      const r = await fetch(
+        `/api/defs?name=${encodeURIComponent(word)}&path=${encodeURIComponent(searchScope())}`,
+      );
       const j = (await r.json()) as { hits?: { path: string; line: number }[]; error?: string };
       const hits = j.hits ?? [];
       if (!hits.length) {

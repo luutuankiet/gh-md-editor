@@ -2176,7 +2176,7 @@
                   {:else if at.kind === 'md'}
                     <MarkdownTab bind:value={at.content} name={at.name} reveal={at.reveal ?? null} viewKey={at.path} />
                   {:else}
-                    <CodeTab bind:value={at.content} filename={at.fileName ?? at.name} gitPath={at.untitled || at.ro ? '' : at.path} reveal={at.reveal ?? null} readOnly={!!at.ro} viewKey={at.path} />
+                    <CodeTab bind:value={at.content} filename={at.fileName ?? at.name} gitPath={at.untitled || at.ro ? '' : at.path} {folder} reveal={at.reveal ?? null} readOnly={!!at.ro} viewKey={at.path} />
                   {/if}
                 {:else}
                   <div class="placeholder">Open a file from the tree.</div>

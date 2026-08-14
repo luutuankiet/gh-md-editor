@@ -40,6 +40,7 @@
   // actually reached for Cmd or Shift.
   let selectionExplicit = $state(false);
   let menu = $state<{ x: number; y: number; path: string; type: EntryType; paths: string[] } | null>(null);
+  let menuEl = $state<HTMLDivElement | undefined>(undefined);
   let toast = $state('');
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
   let refreshing = $state(false);
@@ -480,14 +481,59 @@
     menu = { x: e.clientX, y: e.clientY, path: node.path, type: node.type, paths };
   }
 
-  // Click anywhere closes the menu. Listener registered only while the menu
-  // is open; the menu item's own click handler runs first (event target),
-  // then the bubble reaches window and clears state.
+  // Click outside closes the menu, and so does Escape. Listeners registered
+  // only while the menu is open. Clicks INSIDE are ignored now: every menu
+  // item already clears the menu itself, and once the menu is tall enough to
+  // scroll, releasing its scrollbar counts as a click on the menu and would
+  // otherwise close it mid-drag.
   $effect(() => {
     if (!menu) return;
-    const close = () => { menu = null; };
+    const close = (e: MouseEvent) => {
+      if (menuEl && e.target instanceof Node && menuEl.contains(e.target)) return;
+      menu = null;
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') menu = null; };
     window.addEventListener('click', close);
-    return () => window.removeEventListener('click', close);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('keydown', onKey);
+    };
+  });
+
+  // Keep the menu inside the viewport. Preference order: below the pointer as
+  // asked; flipped above it when the whole menu fits there; and only then
+  // capped in height with a scrollbar — a menu that would have fitted above is
+  // better flipped than scrolled. Clamped horizontally for the same reason,
+  // which the explorer rarely needs but a right-hand panel would.
+  $effect(() => {
+    const m = menu;
+    const el = menuEl;
+    if (!m || !el) return;
+    // Reset first, or a cap left over from the previous placement is measured
+    // as the menu's natural height.
+    el.style.maxHeight = '';
+    el.style.overflowY = '';
+    const gap = 8;
+    const h = el.offsetHeight;
+    const w = el.offsetWidth;
+    const below = window.innerHeight - m.y - gap;
+    const above = m.y - gap;
+    let top = m.y;
+    if (h > below) {
+      if (h <= above) {
+        top = m.y - h;
+      } else if (below >= above) {
+        el.style.maxHeight = `${Math.max(below, 80)}px`;
+        el.style.overflowY = 'auto';
+      } else {
+        top = gap;
+        el.style.maxHeight = `${Math.max(above, 80)}px`;
+        el.style.overflowY = 'auto';
+      }
+    }
+    el.style.top = `${Math.max(gap, top)}px`;
+    el.style.left = `${Math.max(gap, Math.min(m.x, window.innerWidth - w - gap))}px`;
   });
 
   // Three destinations, matching the recent-workspaces menu: this tab, a new
@@ -509,9 +555,33 @@
     editing = { mode: 'create', parent: folder, type, name: '' };
   }
 
+  // The header's New file / New folder buttons create relative to whatever is
+  // selected — a folder takes the new entry inside it, a file puts it beside
+  // itself — which is the same rule paste already follows. Nothing selected
+  // falls back to the workspace root.
+  async function createAtSelection(type: EntryType) {
+    menu = null;
+    const parent = pasteTarget();
+    // The draft row only renders inside an OPEN folder, so a collapsed target
+    // has to be expanded first or the input is invisible and untypeable.
+    if (parent && parent !== folder) await expandPath(parent);
+    editing = { mode: 'create', parent, type, name: '' };
+  }
+
   function handleRootDblClick(e: MouseEvent) {
     if (e.target !== treeEl) return;
     createAtRoot('file');
+  }
+
+  // Clicking empty space deselects, which is the only way back to "create at
+  // the workspace root" now that the header buttons follow the selection.
+  // Guarded on the target being the container itself so clicks on rows keep
+  // their own behaviour.
+  function handleRootClick(e: MouseEvent) {
+    if (e.target !== treeEl) return;
+    selected = new Set();
+    selectionExplicit = false;
+    anchorPath = '';
   }
 
   function showToast(msg: string) {
@@ -1041,10 +1111,10 @@
         {clip.mode === 'cut' ? 'cut' : 'copied'} {clip.paths.length} ✕
       </button>
     {/if}
-    <button type="button" class="ebtn" title="New file" aria-label="New file" onclick={() => createAtRoot('file')}>
+    <button type="button" class="ebtn" title="New file" aria-label="New file" onclick={() => void createAtSelection('file')}>
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h4.5V13H4.5V3h4.25v3.25H12V7.5h1.5V5zM11.25 9.5v2.25H9v1.5h2.25V15.5h1.5v-2.25H15v-1.5h-2.25V9.5z" /></svg>
     </button>
-    <button type="button" class="ebtn" title="New folder" aria-label="New folder" onclick={() => createAtRoot('dir')}>
+    <button type="button" class="ebtn" title="New folder" aria-label="New folder" onclick={() => void createAtSelection('dir')}>
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 2.5h4.2l1.3 1.6H14.5V8H13V5.6H6.3L5 4H3v7.4h5.5v1.5h-7zM11.25 9.5v2.25H9v1.5h2.25V15.5h1.5v-2.25H15v-1.5h-2.25V9.5z" /></svg>
     </button>
     <button
@@ -1077,6 +1147,7 @@
     class="tree"
     bind:this={treeEl}
     onkeydown={handleTreeKey}
+    onclick={handleRootClick}
     ondblclick={handleRootDblClick}
     ondragover={handleRootDragOver}
     ondrop={handleRootDrop}
@@ -1093,7 +1164,7 @@
 </div>
 
 {#if menu}
-  <div class="ctx-menu" style="left: {menu.x}px; top: {menu.y}px" role="menu">
+  <div class="ctx-menu" bind:this={menuEl} style="left: {menu.x}px; top: {menu.y}px" role="menu">
     {#if menu.type === 'dir' && menu.paths.length === 1}
       <button type="button" role="menuitem" class="ctx-item" onclick={() => menu && pickWorkspace(menu.path)}>
         Open workspace here

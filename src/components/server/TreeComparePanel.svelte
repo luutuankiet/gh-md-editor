@@ -1,18 +1,17 @@
 <script lang="ts">
   import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
 
-  let { visible = false, onOpenDiff, onOpenFile, onOpenAtRef }: {
+  let { visible = false, repo = '', onOpenDiff, onOpenFile, onOpenAtRef }: {
     visible?: boolean;
+    // The anchored repository, chosen once in the status bar and handed down.
+    repo?: string;
     onOpenDiff: (repo: string, file: { path: string; staged: boolean; untracked?: boolean; base?: string; baseLabel?: string; to?: string; toLabel?: string }) => void;
     onOpenFile?: (repo: string, rel: string) => void;
     onOpenAtRef?: (repo: string, rel: string, sha: string, label: string) => void;
   } = $props();
 
-  interface RepoInfo { repo: string; branch?: string; error?: string }
   interface FileRow { path: string; status: string }
 
-  let repos = $state<RepoInfo[]>([]);
-  let repo = $state('');
   let refs = $state<string[]>([]);
   let head = $state('');
   let base = $state('');
@@ -32,10 +31,6 @@
   let resolved = $state('');
   let error = $state('');
   let loading = $state(false);
-  // Plain let on purpose: reading it in the visibility effect must not make
-  // the effect re-run when it flips.
-  let loaded = false;
-
   const folder = new URLSearchParams(location.search).get('folder') ?? '';
   const baseKey = (r: string) => `ghmd.compareBase:${folder}:${r}`;
   const incomingKey = (r: string) => `ghmd.compareIncoming:${folder}:${r}`;
@@ -44,24 +39,19 @@
   // actually say whether it names a commit.
   const isSha = (s: string) => /^[0-9a-f]{7,40}$/i.test(s);
 
-  async function loadRepos() {
-    try {
-      const r = await fetch(`/api/git/repos?base=${encodeURIComponent(folder || '.')}`);
-      const d = await r.json();
-      repos = d.repos ?? [];
-      loaded = true;
-      if (!repo || !repos.some((x) => x.repo === repo && !x.error)) {
-        repo = repos.find((x) => !x.error)?.repo ?? '';
-      }
-      if (repo) await loadRefs();
-      else error = repos.length ? '' : 'no git repository in this folder';
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    }
-  }
-
   async function loadRefs() {
-    if (!repo) return;
+    // One scan, one choice, one owner — the status bar's. Nothing anchored
+    // means nothing to compare, and every field below has to be emptied so no
+    // stale ref pair survives into a workspace it does not belong to.
+    if (!repo) {
+      refs = [];
+      head = '';
+      base = '';
+      files = [];
+      resolved = '';
+      error = '';
+      return;
+    }
     try {
       const r = await fetch(`/api/git/refs?repo=${encodeURIComponent(repo)}`);
       const d = await r.json();
@@ -165,7 +155,7 @@
   $effect(() => {
     void repo; // track: switching repos refetches refs + files
     if (!visible) return;
-    void (loaded ? loadRefs() : loadRepos());
+    void loadRefs();
   });
   $effect(() => {
     const onRefresh = () => { if (visible) void refresh(); };
@@ -305,12 +295,14 @@
 
 <div class="tcmp">
   <div class="tcmp-top">
-    <select bind:value={repo} title="Repository">
-      {#each repos as r (r.repo)}
-        <option value={r.repo} disabled={!!r.error}>{r.repo}{r.error ? ' ⚠' : ''}</option>
-      {/each}
-    </select>
-    <button type="button" class="icon-btn" title="Refresh" onclick={() => void loadRepos()}>⟳</button>
+    <!-- A display, not a control: the one repository picker lives in the
+         status bar, so this panel can never be comparing a repository other
+         than the one the rest of the window is showing. -->
+    <span
+      style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#949494"
+      title={repo ? 'Anchored repository — change it in the status bar' : 'No repository is anchored for this workspace'}
+    >{repo || 'no repository'}</span>
+    <button type="button" class="icon-btn" title="Refresh" onclick={() => void loadRefs()}>⟳</button>
   </div>
   <div class="tcmp-top">
     <span class="sidelbl" title="Base — the side everything is compared against">base</span>
@@ -356,6 +348,10 @@
   <div class="rows">
     {#if loading && !files.length}
       <div class="empty">Loading…</div>
+    {:else if !repo || !base}
+      <!-- "No differences" is a result. Printing it when the compare never ran
+           is a claim about work that was never done. -->
+      <div class="empty">{repo ? 'Nothing to compare yet.' : 'No repository is anchored — pick one from the repository button in the status bar.'}</div>
     {:else if !files.length}
       <div class="empty">{error ? '' : 'No differences.'}</div>
     {:else}

@@ -2,8 +2,13 @@
   import { untrack } from 'svelte';
   import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
 
-  let { visible = true, onOpenDiff, onOpenMerge, onOpenFile, onOpenGraph }: {
+  let { visible = true, repo = '', onOpenDiff, onOpenMerge, onOpenFile, onOpenGraph }: {
     visible?: boolean;
+    // The anchored repository, chosen once in the status bar and handed down.
+    // This panel used to scan for repositories itself and pick its own
+    // default, which is how its commit button could act on a repository the
+    // status bar beside it was not naming.
+    repo?: string;
     onOpenDiff: (repo: string, file: { path: string; staged: boolean; untracked?: boolean }) => void;
     onOpenMerge: (repo: string, path: string) => void;
     // The working-tree file itself rather than the change to it: clicking a row
@@ -13,7 +18,6 @@
     onOpenGraph: (repo: string) => void;
   } = $props();
 
-  interface RepoInfo { repo: string; branch?: string; ahead?: number; behind?: number; changes?: number; error?: string }
   interface FileRow { path: string; status: string; untracked?: boolean; orig?: string | null }
   // `conflicts` is optional so a page left open against an older server still
   // renders the two groups it does know about.
@@ -21,8 +25,6 @@
   // `conflicts`: a page left open against an older server still renders.
   interface GitStatus { repo: string; branch: string; upstream: string; ahead: number; behind: number; empty: boolean; staged: FileRow[]; changes: FileRow[]; conflicts?: FileRow[]; merging?: boolean; mergeMessage?: string }
 
-  let repos = $state<RepoInfo[]>([]);
-  let repo = $state('');
   let status = $state<GitStatus | null>(null);
   let error = $state('');
   let message = $state('');
@@ -31,10 +33,6 @@
   // Which merge message has already been offered. Plain let: the effect below
   // must not re-run when it is written.
   let prefilledFor = '';
-  // Plain let on purpose: reading it in the visibility effect must not make
-  // the effect re-run when it flips (see CodeTab's effect-discipline lesson).
-  let loaded = false;
-
   const folder = new URLSearchParams(location.search).get('folder') ?? '';
 
   // Once per merge, git's own default message is dropped into the commit box
@@ -52,41 +50,16 @@
     });
   });
 
-  // Scans for repositories under the open workspace and re-anchors the picker
-  // to what it finds. The list is deliberately limited to the anchor: a
-  // workspace with no checkout in it shows an empty picker rather than falling
-  // back to a scan of the server's start directory, which is what used to
-  // mount the panel on an unrelated repo. The server puts the checkout that
-  // encloses the anchor first, so the default selection is the repo the open
-  // folder belongs to even when the anchor is a subdirectory of it.
-  async function loadRepos() {
-    try {
-      const r = await fetch(`/api/git/repos?base=${encodeURIComponent(folder || '.')}`);
-      const d = await r.json();
-      repos = d.repos ?? [];
-      loaded = true;
-      // A repo selected under a previous anchor is dropped once it is no longer
-      // in range, so the header can never show a repo outside the workspace.
-      if (!repo || !repos.some((x) => x.repo === repo && !x.error)) {
-        repo = repos.find((x) => !x.error)?.repo ?? '';
-        status = null;
-      }
-      if (repo) await refresh();
-      else {
-        status = null;
-        error = repos.length ? '' : 'no git repository in this folder';
-      }
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    }
-  }
-
   async function refresh() {
-    // If the initial /api/git/repos never landed (server still booting, network
-    // blip, tunnel down) the panel used to stay empty forever: refresh only
-    // refetched status, and status needs a repo that was never selected.
-    if (!repos.length) await loadRepos();
-    if (!repo) return;
+    // One scan, one choice, one owner — the status bar's. With nothing
+    // anchored this panel says so and does nothing else; it must not go
+    // looking for a repository of its own to fill the silence, which is
+    // exactly how it used to end up on a different one.
+    if (!repo) {
+      status = null;
+      error = '';
+      return;
+    }
     try {
       const r = await fetch(`/api/git/status?repo=${encodeURIComponent(repo)}`);
       const d = await r.json();
@@ -99,6 +72,13 @@
   }
 
   async function action(body: Record<string, unknown>): Promise<boolean> {
+    // An empty repo id does not fail server-side — it resolves to the served
+    // root, so a request sent without one quietly succeeds against a
+    // repository nobody chose. Refuse before the fetch, not after.
+    if (!repo) {
+      error = 'No repository is anchored — pick one from the repository button in the status bar.';
+      return false;
+    }
     busy = true;
     let ok = false;
     try {
@@ -158,7 +138,7 @@
   $effect(() => {
     void repo; // track: switching repos refetches
     if (!visible) return;
-    void (loaded ? refresh() : loadRepos());
+    void refresh();
   });
   $effect(() => {
     const onRefresh = () => { if (visible) void refresh(); };
@@ -308,13 +288,15 @@
 
 <div class="scm">
   <div class="scm-top">
-    <select bind:value={repo} title="Repository">
-      {#each repos as r (r.repo)}
-        <option value={r.repo} disabled={!!r.error}>{r.repo}{r.error ? ' ⚠' : ''}</option>
-      {/each}
-    </select>
-    <button type="button" class="icon-btn" title="Git Graph" onclick={() => onOpenGraph(repo)}>⎇</button>
-    <button type="button" class="icon-btn" title="Refresh" onclick={() => void loadRepos()}>⟳</button>
+    <!-- A display, not a control. Two pickers for one workspace is how this
+         panel and the status bar came to disagree about which repository was
+         open; there is one picker now, and it is in the status bar. -->
+    <span
+      style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#949494"
+      title={repo ? 'Anchored repository — change it in the status bar' : 'No repository is anchored for this workspace'}
+    >{repo || 'no repository'}</span>
+    <button type="button" class="icon-btn" title="Git Graph" disabled={!repo} onclick={() => onOpenGraph(repo)}>⎇</button>
+    <button type="button" class="icon-btn" title="Refresh" onclick={() => void refresh()}>⟳</button>
   </div>
   {#if status}
     <div class="branchline" title={status.upstream ? `upstream ${status.upstream}` : 'no upstream'}>
@@ -342,6 +324,10 @@
       >Continue</button>
     </div>
   {/if}
+  <!-- Never over a repository nobody chose. With no anchor the commit button
+       used to enable itself the moment `amend` was ticked, and the empty repo
+       id it posted resolved server-side to the served root. -->
+  {#if repo}
   <div class="commitbox">
     <textarea
       rows="3"
@@ -354,11 +340,12 @@
       <button
         type="button"
         class="commit-btn"
-        disabled={busy || (!amend && (!message.trim() || !(status?.staged.length)))}
+        disabled={busy || !repo || (!amend && (!message.trim() || !(status?.staged.length)))}
         onclick={() => void commit()}
       >✓ Commit{status?.staged.length ? ` (${status.staged.length})` : ''}</button>
     </div>
   </div>
+  {/if}
   {#if error}<div class="scm-error">{error}</div>{/if}
   <div class="scm-lists">
     {#if status}
@@ -411,7 +398,7 @@
         {@render gitTree(changesTree, 0, false)}
       </div>
     {:else if !error}
-      <div class="empty">No repository selected.</div>
+      <div class="empty">{repo ? 'Nothing to show yet.' : 'No repository is anchored — pick one from the repository button in the status bar.'}</div>
     {/if}
   </div>
 </div>

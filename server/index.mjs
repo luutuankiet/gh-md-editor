@@ -1968,21 +1968,202 @@ function cleanRepoPath(p) {
 // climb stops there — repo ids are relative to it, so a repo above would be
 // unaddressable. A workspace outside it addresses repos absolutely instead,
 // so that one climbs all the way to the filesystem root.
+// A `.git` entry alone does not make a usable checkout. A linked worktree and
+// a submodule both store a pointer file where an ordinary repository keeps a
+// directory, and a worktree's pointer goes stale the moment either side of the
+// pair is moved — at which point git refuses the directory outright. Classify
+// rather than assume, so discovery can tell "nothing here" apart from "a real
+// repository whose link broke", and so only the second one gets healed.
+async function inspectCheckout(abs) {
+  let st;
+  try {
+    st = await fs.lstat(path.join(abs, '.git'));
+  } catch {
+    return null;
+  }
+  if (st.isDirectory()) return { kind: 'repo' };
+  let raw = '';
+  try {
+    raw = await fs.readFile(path.join(abs, '.git'), 'utf8');
+  } catch {
+    return { kind: 'repo' };
+  }
+  const m = /^gitdir:\s*(.+?)\s*$/m.exec(raw);
+  if (!m) return { kind: 'repo' };
+  const target = path.resolve(abs, m[1]);
+  const seg = target.split(path.sep);
+  // `<owner>/.git/worktrees/<name>` is a linked worktree, and so is
+  // `<owner>.git/worktrees/<name>` — the bare layout, where the repository
+  // directory is itself the git directory with no working tree over it.
+  // `<super>/.git/modules/<name>` is a submodule: the same pointer shape, an
+  // entirely different repair, so it must never be handed a worktree one.
+  const gitdirName = seg[seg.length - 3] ?? '';
+  const isWorktree =
+    seg.length >= 4 && seg[seg.length - 2] === 'worktrees' && (gitdirName === '.git' || gitdirName.endsWith('.git'));
+  const isSubmodule = seg.length >= 4 && seg[seg.length - 2] === 'modules' && gitdirName === '.git';
+  let alive = false;
+  try {
+    await fs.stat(target);
+    alive = true;
+  } catch {
+    // the pointer names a git directory that is no longer there
+  }
+  if (isSubmodule) return { kind: 'submodule', gitdir: target, name: seg[seg.length - 1], alive };
+  if (!isWorktree) return { kind: 'repo', gitdir: target };
+  const name = seg[seg.length - 1];
+  // The owner is the directory holding the git directory the pointer names —
+  // except in the bare layout, where that git directory IS the repository.
+  const owner = (gitdirName === '.git' ? seg.slice(0, -3) : seg.slice(0, -2)).join(path.sep) || path.sep;
+  if (!alive) return { kind: 'worktree-broken', gitdir: target, name, owner };
+  // A link has two halves and either can rot alone. Moving the OWNER leaves a
+  // pointer at a git directory that is gone — caught above. Moving the
+  // WORKTREE leaves that pointer perfectly good and puts the staleness in the
+  // other half: the registry's `gitdir` back-pointer, still naming where this
+  // directory used to be. Git calls such a worktree prunable and declines to
+  // see it, and only reading the back-pointer tells the two cases apart. It is
+  // also what makes an owner provable rather than guessed at by name.
+  let back = '';
+  try {
+    back = (await fs.readFile(path.join(target, 'gitdir'), 'utf8')).trim();
+  } catch {
+    // no back-pointer to read — treat the link as intact
+  }
+  if (back && path.resolve(back) !== path.join(abs, '.git'))
+    return { kind: 'worktree-broken', gitdir: target, name, owner, stale: 'back' };
+  return { kind: 'worktree', gitdir: target, name, owner };
+}
+
+// Every repair, and every repository offered to the client as context, is
+// confined to the served root. A repo id is a handle each write endpoint
+// accepts, so naming one from outside would hand out a way to commit beyond
+// the jail — and repairing one would rewrite a repository nobody pointed the
+// server at.
+const insideRoot = (p) => p === ROOT || p.startsWith(ROOT + path.sep);
+
+// A worktree's NAME is not its identity: two unrelated repositories can each
+// own one called `main`. What proves ownership is the registry entry naming
+// this directory back, and that back-pointer is precisely the half that
+// survives when the owner is the side that moved. Matching on the name alone
+// would put a stranger's path into the command this server tells the user to
+// run — a command that, run, de-registers a worktree that was working fine.
+async function registersWorktree(abs, name, wtAbs, staleOwner) {
+  let back = '';
+  try {
+    back = (await fs.readFile(path.join(abs, '.git', 'worktrees', name, 'gitdir'), 'utf8')).trim();
+  } catch {
+    return false;
+  }
+  const target = path.resolve(back);
+  // The registry names this very directory: proven outright. That is the shape
+  // of a healthy pair, and of one where only the owner was moved.
+  if (target === path.join(wtAbs, '.git')) return true;
+  // It names somewhere else, which is one of two very different things: a
+  // stranger's live worktree, in which case this candidate is emphatically not
+  // the owner — or the place this worktree used to stand before both halves of
+  // the link were dragged apart. Only the second has a dead back-pointer.
+  try {
+    await fs.stat(target);
+    return false;
+  } catch {
+    // dead — the pair may still be a pair
+  }
+  // Nothing on disk connects them any more, so the two dead pointers have to
+  // corroborate each other: the worktree's pointer must name a repository
+  // called what this candidate is called, and the candidate's registry must
+  // name a directory called what this worktree is called. A stranger that
+  // merely reused a worktree name fails the first half, which is the entire
+  // reason for asking.
+  if (!staleOwner) return false;
+  if (path.basename(path.dirname(target)) !== path.basename(wtAbs)) return false;
+  return path.basename(staleOwner) === path.basename(abs);
+}
+
+// The checkout that owns a broken worktree is rarely an ancestor of it: the
+// common layout puts a repository and its worktrees side by side, which makes
+// the owner a *cousin* — reachable neither by climbing from the worktree nor
+// by descending into it. It is found by name instead. Every linked worktree
+// has a directory of the same name under its owner's `.git/worktrees/`, and
+// that name survives whatever move broke the pointers, so it is the one piece
+// of the link still trustworthy. The search climbs from the worktree and
+// glances one level sideways at each step, stopping at the served root — a
+// handful of stats, and only ever run when something is already broken.
+async function findWorktreeOwner(wtAbs, name, staleOwner) {
+  if (!name) return null;
+  // `startsWith(ROOT + sep)` alone is false when the workspace IS the served
+  // root — which is the headline case here, a worktree opened directly. Without
+  // the equality the climb had no stopping condition inside the jail at all,
+  // and walked to the filesystem root reading and repairing repositories the
+  // server was never given.
+  const inside = wtAbs === ROOT || wtAbs.startsWith(ROOT + path.sep);
+  const reachable = (p) => (inside ? insideRoot(p) : true);
+  // Served from outside the jail there is no root to stop at, so the climb is
+  // capped instead. A handful of levels covers every sibling layout, and a
+  // readdir of the home directory and of `/` per broken worktree is not
+  // something a panel refresh has any business doing.
+  let hops = 8;
+  let dir = path.dirname(wtAbs);
+  for (;;) {
+    if (reachable(dir) && (await registersWorktree(dir, name, wtAbs, staleOwner))) return dir;
+    let entries = [];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      // unreadable level — keep climbing rather than give up
+    }
+    for (const e of entries) {
+      if (!e.isDirectory() || e.name.startsWith('.') || GIT_SKIP.has(e.name)) continue;
+      const cand = path.join(dir, e.name);
+      if (cand === wtAbs || !reachable(cand)) continue;
+      if (await registersWorktree(cand, name, wtAbs, staleOwner)) return cand;
+    }
+    if (inside && dir === ROOT) return null;
+    if (--hops <= 0) return null;
+    const up = path.dirname(dir);
+    if (up === dir) return null;
+    dir = up;
+  }
+}
+
+// `worktree list --porcelain` from the owner: the authoritative roster of a
+// repository's worktrees, including ones that live nowhere near the workspace.
+function listWorktrees(ownerAbs) {
+  // `-z` because a path is bytes rather than a line: without it git cannot
+  // represent a checkout whose directory name contains a newline, and says so.
+  const r = git(['worktree', 'list', '--porcelain', '-z'], ownerAbs);
+  if (r.code !== 0) return [];
+  const out = [];
+  let cur = null;
+  for (const line of r.out.split('\0')) {
+    if (line.startsWith('worktree ')) {
+      cur = { abs: line.slice(9), branch: '', prunable: false };
+      out.push(cur);
+    } else if (!cur) {
+      continue;
+    } else if (line.startsWith('branch ')) {
+      cur.branch = line.slice(7).replace(/^refs\/heads\//, '');
+    } else if (line.startsWith('prunable')) {
+      cur.prunable = true;
+    }
+  }
+  return out;
+}
+
 async function findRepos(baseAbs = ROOT, depth = 2) {
   const found = [];
   const seen = new Set();
-  const add = (abs) => {
+  const add = (abs, info) => {
     if (seen.has(abs)) return;
     seen.add(abs);
-    found.push(abs);
+    found.push({ abs, ...info });
   };
   for (let abs = baseAbs; ; ) {
-    try {
-      await fs.stat(path.join(abs, '.git'));
-      add(abs);
-      break;
-    } catch {
-      // not a checkout — keep climbing
+    const info = await inspectCheckout(abs);
+    if (info) {
+      add(abs, info);
+      // A checkout whose link is broken is a dead end, not an answer. Stopping
+      // the climb on it is what used to hide a perfectly good repository one
+      // directory further up behind a child that git refuses to open.
+      if (info.kind !== 'worktree-broken') break;
     }
     if (abs === ROOT) break;
     const up = path.dirname(abs);
@@ -1997,7 +2178,7 @@ async function findRepos(baseAbs = ROOT, depth = 2) {
       return;
     }
     if (entries.some((e) => e.name === '.git')) {
-      add(abs);
+      add(abs, (await inspectCheckout(abs)) ?? { kind: 'repo' });
       return;
     }
     if (d <= 0) return;
@@ -2007,7 +2188,7 @@ async function findRepos(baseAbs = ROOT, depth = 2) {
     }
   }
   await walk(baseAbs, depth);
-  return found.map(toClientPath);
+  return found;
 }
 
 // `## main...origin/main [ahead 1, behind 2]`, or `## HEAD (no branch)`, or
@@ -2477,19 +2658,126 @@ async function apiGitRepos(res, params) {
   // Repo ids take whatever shape toClientPath gives them — relative to the
   // start directory inside it, absolute outside — and status, diff and action
   // all resolve them back through resolveSafe, which accepts both.
-  const baseAbs = resolveSafe(params?.get('base') || '.');
-  if (!baseAbs) return sendJson(res, 400, { error: 'base escapes root' });
+  const asked = resolveSafe(params?.get('base') || '.');
+  if (!asked) return sendJson(res, 400, { error: 'base escapes root' });
+  // Git reports the real path of every worktree it knows about, while the scan
+  // walks the path as written. Through a symlinked workspace the two spellings
+  // disagree and one directory comes back twice under two different ids, so
+  // the walk is pinned to git's spelling before either of them starts.
+  let baseAbs = asked;
+  try {
+    baseAbs = await fs.realpath(asked);
+  } catch {
+    // unresolvable as written — leave it, and let the one place that can say
+    // why report it
+  }
   const repos = [];
-  for (const rel of await findRepos(baseAbs)) {
-    const abs = resolveSafe(rel) ?? ROOT;
+  const listed = new Set();
+  const owners = new Set();
+
+  const describe = (abs, extra) => {
+    listed.add(abs);
+    const rel = toClientPath(abs);
     const st = git(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--branch'], abs);
     if (st.code !== 0 && !st.out) {
-      repos.push({ repo: rel, error: st.err || 'git status failed' });
-      continue;
+      // Every row carries the same fields whether or not git would answer, so
+      // a client can read `branch` or `changes` off any of them without first
+      // working out which of several shapes it was handed.
+      repos.push({ repo: rel, branch: '', ahead: 0, behind: 0, changes: 0, error: st.err || 'git status failed', ...extra });
+      return;
     }
     const s = parseStatus(st.out);
-    repos.push({ repo: rel, branch: s.branch, ahead: s.ahead, behind: s.behind, changes: s.files.length });
+    repos.push({ repo: rel, branch: s.branch, ahead: s.ahead, behind: s.behind, changes: s.files.length, ...extra });
+  };
+
+  // The panels ask about the open workspace and want the cheap default scan.
+  // The "open a repository" picker asks the same question of a whole tree and
+  // wants to see everything in it, so it may buy more depth — capped, because
+  // an unbounded walk of a home directory is a different kind of request.
+  // Absent, not zero: Number(null) is 0, which would quietly turn every
+  // panel's ordinary scan into a look at the anchor and nothing else.
+  const askedDepth = Number(params?.get('depth'));
+  const wanted = Number.isFinite(askedDepth) && params?.get('depth') ? Math.min(6, Math.max(0, askedDepth)) : 2;
+  // A base outside the served root is a starting point the caller chose, and
+  // every level of it costs a synchronous `git status` per checkout found. The
+  // deep scan exists for the picker walking the workspace it was given.
+  const depth = insideRoot(baseAbs) ? wanted : Math.min(2, wanted);
+
+  for (const hit of await findRepos(baseAbs, depth)) {
+    const { abs, kind, name, gitdir, owner } = hit;
+    // A submodule whose git directory is absent is not a repository this
+    // server can do anything with, and it is emphatically not a worktree to be
+    // repaired. Say which of the two it is instead of forwarding git's fatal.
+    if (kind === 'submodule' && !hit.alive) {
+      listed.add(abs);
+      repos.push({
+        repo: toClientPath(abs),
+        branch: '',
+        ahead: 0,
+        behind: 0,
+        changes: 0,
+        kind: 'submodule',
+        gitdir,
+        error: `submodule checkout — its git directory ${gitdir} is not present; run \`git submodule update --init\` in the superproject`,
+      });
+      continue;
+    }
+    if (kind === 'worktree-broken') {
+      // Finding the owner is worth doing; putting the link back is not this
+      // server's to do. The search below only reads — it works out which
+      // repository this checkout belongs to so the message can name the exact
+      // command. Repairing would rewrite two files in a repository nobody
+      // pointed this scan at, on an unauthenticated GET, off the back of an
+      // inference; and a wrong inference de-registers a worktree that was
+      // perfectly healthy. One command typed in a terminal is a small price
+      // for never being able to do that.
+      const ownerAbs = hit.stale === 'back' && owner ? owner : await findWorktreeOwner(abs, name, owner);
+      const fix = ownerAbs ? `git -C "${ownerAbs}" worktree repair "${abs}"` : '';
+      listed.add(abs);
+      repos.push({
+        repo: toClientPath(abs),
+        branch: '',
+        ahead: 0,
+        behind: 0,
+        changes: 0,
+        kind: 'worktree-broken',
+        worktree: name,
+        gitdir,
+        // Kept apart from the prose so a client can offer it as something to
+        // copy rather than something to retype out of the middle of a
+        // sentence.
+        ...(fix ? { fix } : {}),
+        error: ownerAbs
+          ? hit.stale === 'back'
+            ? `${toClientPath(ownerAbs)} no longer registers this directory as its worktree "${name}" — this checkout was moved after the link was made. Git will not open it until the link is put back.`
+            : `The git directory this worktree points at (${gitdir}) is gone. It belongs to ${toClientPath(ownerAbs)}, which moved after the link was made.`
+          : `The git directory this worktree points at (${gitdir}) is gone, and no repository nearby registers a worktree named "${name}". Repair it from the repository that owns it: git -C <that repository> worktree repair "${abs}"`,
+      });
+      continue;
+    }
+    if (kind === 'worktree' && owner) owners.add(owner);
+    describe(abs, {
+      kind,
+      ...(kind === 'worktree' && owner ? { worktree: name, group: toClientPath(owner) } : {}),
+    });
   }
+
+  // A worktree on its own is one branch of a repository presented as if it
+  // were the whole of it. The checkout that owns it and its sibling worktrees
+  // come along so the picker can show the repository entire — flagged
+  // `related`, because they are the context around the workspace rather than
+  // the thing the workspace was opened on, and a client that wants a quiet
+  // list should be able to fold them away without guessing which is which.
+  for (const ownerAbs of owners) {
+    if (!insideRoot(ownerAbs)) continue;
+    const group = toClientPath(ownerAbs);
+    if (!listed.has(ownerAbs)) describe(ownerAbs, { kind: 'repo', group, related: true });
+    for (const wt of listWorktrees(ownerAbs)) {
+      if (wt.prunable || wt.abs === ownerAbs || listed.has(wt.abs) || !insideRoot(wt.abs)) continue;
+      describe(wt.abs, { kind: 'worktree', worktree: path.basename(wt.abs), group, related: true });
+    }
+  }
+
   return sendJson(res, 200, { repos });
 }
 

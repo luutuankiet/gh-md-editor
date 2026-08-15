@@ -62,6 +62,16 @@
   });
 
   async function load(r: string) {
+    // An empty repo id resolves server-side to the served root, which answers
+    // with the workspace's own name and no commits — a graph that looks like a
+    // real but empty repository. Say what actually happened instead.
+    if (!r) {
+      commits = [];
+      head = '';
+      truncated = false;
+      error = 'No repository is anchored for this workspace — pick one from the repository button in the status bar.';
+      return;
+    }
     loading = true;
     try {
       const res = await fetch(`/api/git/log?repo=${encodeURIComponent(r)}&limit=400`);
@@ -268,6 +278,7 @@
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { toast = ''; }, 2000);
   }
+  $effect(() => () => clearTimeout(toastTimer));
 
   async function copyPath(p: string) {
     await toClipboard(p);
@@ -328,10 +339,12 @@
 
 <div class="graph">
   <header class="ghead">
-    <span class="repo">{repo || 'workspace'}</span>
-    <span class="count">{commits.length}{truncated ? '+' : ''} commits</span>
+    <!-- "workspace" is not a repository, and a commit count is a claim about
+         one that was actually queried. With nothing anchored, neither holds. -->
+    <span class="repo">{repo || 'no repository'}</span>
+    {#if repo}<span class="count">{commits.length}{truncated ? '+' : ''} commits</span>{/if}
     {#if loading}<span class="count">loading…</span>{/if}
-    <button type="button" class="btn" onclick={() => { seq++; }}>Refresh</button>
+    <button type="button" class="btn" disabled={!repo} onclick={() => { seq++; }}>Refresh</button>
   </header>
 
   {#if error}

@@ -216,6 +216,7 @@
     { label: 'Close All Editor Tabs', run: closeAllTabs },
     { label: 'Close Other Editor Tabs', run: closeOtherTabs },
     { label: 'Git Graph', hint: 'anchored repo', run: () => openGraph(gitAnchor) },
+    { label: 'Open Git Repository…', hint: 'anchor for every git panel', run: () => window.dispatchEvent(new CustomEvent('gmd:open-repo-picker')) },
     { label: 'Refresh Explorer', run: () => window.dispatchEvent(new CustomEvent('gmd:refresh-explorer')) },
     { label: 'Refresh Outline', run: refreshOutline },
     { label: 'Show Outline', run: () => { layout.showLeft = true; sideView = 'explorer'; toggleOutline(true); } },
@@ -820,6 +821,12 @@
   // Which repository every git segment in the status bar refers to. Owned here
   // rather than in the bar so palette commands can act on the same choice.
   let gitAnchor = $state('');
+  // The status bar sets this when the anchored checkout is one git will not
+  // open — a worktree whose link is broken, most often. The git panels are
+  // handed an empty repository in that case rather than a poisoned one: they
+  // fall back to the empty state that points at the status bar, which is the
+  // single place carrying the reason and the command to fix it.
+  let gitBlocked = $state(false);
 
   // ---- Editor groups: split view. Tabs live in groups; groups render side-by-side. ----
   interface Group {
@@ -2081,7 +2088,7 @@
         <SearchPanel {folder} onOpen={(p, line) => openFile(p, { pinned: false, line })} />
       </div>
       <div class="side-view" class:hidden={sideView !== 'compare'}>
-        <TreeComparePanel visible={layout.showLeft && sideView === 'compare'} onOpenDiff={openDiff} onOpenFile={openRepoFile} onOpenAtRef={openFileAtRef} />
+        <TreeComparePanel visible={layout.showLeft && sideView === 'compare'} repo={gitBlocked ? '' : gitAnchor} onOpenDiff={openDiff} onOpenFile={openRepoFile} onOpenAtRef={openFileAtRef} />
       </div>
 
     </aside>
@@ -2224,13 +2231,14 @@
     </div>
     <aside class="rightpanel" class:hidden={!layout.showRight} style="flex-basis: {layout.rightW}px">
       <div class="panel-title">Source Control</div>
-      <SourceControlPanel visible={layout.showRight} onOpenDiff={openDiff} onOpenMerge={openMerge} onOpenFile={openRepoFile} onOpenGraph={openGraph} />
+      <SourceControlPanel visible={layout.showRight} repo={gitBlocked ? '' : gitAnchor} onOpenDiff={openDiff} onOpenMerge={openMerge} onOpenFile={openRepoFile} onOpenGraph={openGraph} />
     </aside>
   </div>
   <StatusBar
     host={rootInfo?.host ?? ''}
     {folder}
     bind:anchor={gitAnchor}
+    bind:blocked={gitBlocked}
     tokens={activeTokens}
     tokenLabel={activeTab?.name ?? ''}
     onPickRef={(repo) => void openRefPicker(repo)}

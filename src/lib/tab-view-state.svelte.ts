@@ -46,6 +46,17 @@ export interface TabViewState {
   // reader did, and the pane it opens is the whole reason the tab was left.
   sha?: string;
   folds?: string[];
+  // Where the merge tab's three reference panes were left, as a fraction of
+  // their scrollable height. A fraction rather than a pixel because that is the
+  // coordinate those panes already scroll each other in: the three sides are
+  // different lengths, so one number is what brings all of them back together.
+  // The editable result pane is not covered by this — it is a code editor and
+  // keeps `anchor` above, which is the more accurate of the two.
+  frac?: number;
+  // Which conflict the merge tab had selected. Without it, a tab returned to
+  // announces "Conflict 1 of N" and reveals the first one no matter which was
+  // being worked on, while the result pane comes back where it was left.
+  conflict?: number;
 }
 
 interface Stored {

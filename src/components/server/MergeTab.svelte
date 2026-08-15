@@ -4,7 +4,7 @@
   import CodeTab from './CodeTab.svelte';
   import MergePane from './MergePane.svelte';
   import type { PaneAction } from './MergePane.svelte';
-  import { wrapFor, toggleWrapFor } from '../../lib/tab-view-state.svelte';
+  import { wrapFor, toggleWrapFor, patchTabView, tabViewOf } from '../../lib/tab-view-state.svelte';
   import { splitter } from '../../lib/split-handle';
 
   let { repo, path, viewKey = '' }: { repo: string; path: string; viewKey?: string } = $props();
@@ -81,6 +81,12 @@
       result = f.content;
       saved = f.content;
       mtimeMs = f.mtimeMs ?? 0;
+      // Which conflict was open when the tab was last left, applied after the
+      // buffer rather than at construction: a freshly mounted tab parses an
+      // empty document, and the clamp further down would fold any index into
+      // zero before the real file had arrived.
+      const wanted = viewKey ? (tabViewOf(viewKey)?.conflict ?? 0) : 0;
+      if (wanted > 0) current = Math.min(wanted, Math.max(0, conflicts.length - 1));
       // Staging the file removes its stage entries, so an already-resolved
       // file lands here with no sides to compare. Say so rather than showing
       // three empty panes.
@@ -165,6 +171,15 @@
   $effect(() => {
     const n = conflicts.length;
     untrack(() => { if (current > 0 && current >= n) current = Math.max(0, n - 1); });
+  });
+
+  // Held outside the component so the selection survives the tab switch that
+  // destroys it. Skipped while loading, when `current` is still the zero a
+  // fresh mount starts at rather than anything the reader chose.
+  $effect(() => {
+    const i = current;
+    const stillLoading = loading;
+    untrack(() => { if (viewKey && !stillLoading) patchTabView(viewKey, { conflict: i }); });
   });
 
   // Where a conflicting region sits inside a full side. The text came out of
@@ -273,13 +288,70 @@
   // the same neighbourhood is most of the value.
   const paneViews = new Map<string, EditorView>();
   let syncing = false;
+  let fracTimer: ReturnType<typeof setTimeout> | undefined;
+  let restoreTimer: ReturnType<typeof setTimeout> | undefined;
+  let restored = false;
+  let restoring = false;
+
+  $effect(() => () => {
+    clearTimeout(fracTimer);
+    clearTimeout(restoreTimer);
+  });
 
   // Keyed by slot rather than collected in a set: a side can unmount on its
   // own when it turns out not to exist in that version, and a set would have
   // to guess which entry that was.
   function registerPane(v: EditorView | null, slot: 'ours' | 'base' | 'theirs') {
-    if (v) paneViews.set(slot, v);
-    else paneViews.delete(slot);
+    if (v) {
+      paneViews.set(slot, v);
+      restorePanes();
+    } else paneViews.delete(slot);
+  }
+
+  // Put the reference panes back where they were left. Deliberately not the
+  // result pane: that one is a code editor and restores itself from a document
+  // anchor, which keeps pointing at the same text across the wrap and font
+  // changes a fraction drifts under.
+  //
+  // Retried rather than applied once, because CodeMirror reports no scrollable
+  // span until it has laid the document out, and a fraction of zero span is a
+  // silent scroll to the top that reads as "the position was never saved".
+  function restorePanes() {
+    if (restored || !viewKey) return;
+    restored = true;
+    const frac = untrack(() => tabViewOf(viewKey)?.frac) ?? 0;
+    if (frac <= 0) return;
+    restoring = true;
+    let left = 25;
+    let lastSpan = -1;
+    // A beat after the last write, so the scroll events it queued land while the
+    // guard is still up rather than being read back as a position the reader
+    // chose. Without it the restore feeds itself.
+    const finish = () => { restoreTimer = setTimeout(() => { restoring = false; }, 200); };
+    const attempt = () => {
+      const views = [...paneViews.values()];
+      const probe = views[0]?.scrollDOM;
+      const span = probe ? probe.scrollHeight - probe.clientHeight : 0;
+      if (span > 0) {
+        // The same guard the lockstep sync uses: these writes fire scroll events
+        // of their own, and without it the panes would drive each other.
+        syncing = true;
+        for (const v of views) mirror(v.scrollDOM, frac, 0);
+        requestAnimationFrame(() => { syncing = false; });
+        // CodeMirror's scroll height starts as an estimate and shrinks as real
+        // line heights replace guessed ones. A fraction applied against the
+        // inflated figure lands too far down the file, and the position read
+        // back from there is a larger fraction than the one that was saved — a
+        // drift that compounds every time the tab is rebuilt. Measured at about
+        // one percent of the document per rebuild before this loop waited for
+        // the height to stop moving.
+        if (span === lastSpan) { finish(); return; }
+        lastSpan = span;
+      }
+      if (left-- > 0) restoreTimer = setTimeout(attempt, 60);
+      else finish();
+    };
+    restoreTimer = setTimeout(attempt, 0);
   }
 
   function resultScroller(): HTMLElement | null {
@@ -298,6 +370,13 @@
     const s = src.scrollDOM;
     const span = s.scrollHeight - s.clientHeight;
     const frac = span > 0 ? s.scrollTop / span : 0;
+    // Only ever reached from a pane the reader actually scrolled — the mirrored
+    // writes below bounce off the guard above — so this records a deliberate
+    // position rather than an echo of one.
+    if (viewKey && !restoring) {
+      clearTimeout(fracTimer);
+      fracTimer = setTimeout(() => patchTabView(viewKey, { frac }), 150);
+    }
     for (const v of paneViews.values()) {
       if (v !== src) mirror(v.scrollDOM, frac, s.scrollLeft);
     }

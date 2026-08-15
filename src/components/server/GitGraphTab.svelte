@@ -4,8 +4,10 @@
   // already live in the ref picker, and a graph that also moves HEAD is a graph
   // you cannot click around in freely.
 
+  import { untrack } from 'svelte';
   import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
   import { toClipboard } from '../../lib/clipboard';
+  import { patchTabView, tabViewOf } from '../../lib/tab-view-state.svelte';
 
   type Commit = { sha: string; parents: string[]; author: string; date: string; refs: string[]; subject: string };
   type FileChange = { status: string; path: string; from?: string };
@@ -13,15 +15,26 @@
 
   let {
     repo = '',
+    viewKey = '',
     onOpenDiff,
     onOpenFile,
     onOpenAtRef,
   }: {
     repo?: string;
+    // Which tab this graph is hosted in, for the state the tab remembers on
+    // its behalf: the open commit, the folders folded under it, and where both
+    // scrollers were left.
     onOpenDiff: (repo: string, file: { path: string; staged: boolean; untracked?: boolean; base?: string; baseLabel?: string; to?: string; toLabel?: string }) => void;
     onOpenFile: (repo: string, path: string) => void;
     onOpenAtRef: (repo: string, path: string, sha: string, label: string) => void;
+    viewKey?: string;
   } = $props();
+
+  // What this tab remembered from last time. Read once, at construction: the
+  // shell renders only a group's active tab and does so inside a `{#key}`, so
+  // opening a file from the commit's list destroys this component outright.
+  // Anything worth coming back to has to live outside it.
+  const remembered = untrack(() => (viewKey ? tabViewOf(viewKey) : undefined));
 
   const ROW_H = 24;
   const LANE_W = 14;
@@ -43,7 +56,7 @@
   let loading = $state(false);
   let seq = $state(0);
 
-  let selected = $state('');
+  let selected = $state(remembered?.sha ?? '');
   let detail = $state<Detail | null>(null);
   let detailError = $state('');
 
@@ -51,6 +64,24 @@
     const r = repo;
     seq;
     void load(r);
+  });
+
+  // The remembered commit is re-fetched rather than stored: a body and a file
+  // list are cheap over a local socket, while a cached copy of either would
+  // outlive the amend or rebase that invalidated it. A sha that no longer
+  // resolves is quietly forgotten instead of reported — nobody asked for it
+  // this time, they just came back to the tab.
+  let restored = false;
+  $effect(() => {
+    const r = repo;
+    if (restored || !r || !untrack(() => selected)) return;
+    restored = true;
+    void loadDetail(untrack(() => selected)).then((ok) => {
+      if (ok) return;
+      selected = '';
+      detailError = '';
+      patchTabView(viewKey, { sha: '' });
+    });
   });
 
   // Checkout, commit and stage all announce themselves on one event rather than
@@ -184,8 +215,7 @@
     return { text: r, kind: 'local' };
   }
 
-  async function select(sha: string) {
-    selected = sha;
+  async function loadDetail(sha: string): Promise<boolean> {
     detail = null;
     detailError = '';
     try {
@@ -193,12 +223,27 @@
       const d = await res.json();
       if (!res.ok) {
         detailError = d.error ?? `HTTP ${res.status}`;
-        return;
+        return false;
       }
       detail = d;
+      return true;
     } catch (e) {
       detailError = e instanceof Error ? e.message : String(e);
+      return false;
     }
+  }
+
+  function select(sha: string) {
+    selected = sha;
+    patchTabView(viewKey, { sha });
+    void loadDetail(sha);
+  }
+
+  function closeDetail() {
+    selected = '';
+    detail = null;
+    detailError = '';
+    patchTabView(viewKey, { sha: '' });
   }
 
   // What this commit did to this file: its own state against its first parent,
@@ -268,7 +313,15 @@
 
   // Keyed by folder path and deliberately not reset between commits: walking a
   // series of commits through the same subtree keeps the shape you set up.
-  let folded = $state<Record<string, boolean>>({});
+  // Remembered as the list of folded paths rather than the whole map, because
+  // open is the default and a folder nobody touched has nothing to record.
+  let folded = $state<Record<string, boolean>>(
+    Object.fromEntries((remembered?.folds ?? []).map((d) => [d, true])),
+  );
+  function toggleFold(dir: string) {
+    folded[dir] = !folded[dir];
+    patchTabView(viewKey, { folds: Object.keys(folded).filter((k) => folded[k]) });
+  }
   const tree = $derived(detail ? buildTree(detail.files) : null);
 
   let toast = $state('');
@@ -292,6 +345,52 @@
     onOpenAtRef(repo, f.path, detail.sha, short(detail.sha));
   }
 
+  // Neither scroller has a document behind it to anchor against, so both keep
+  // pixels: `px` for the commit list, `aux` for the details beside it. The
+  // write is debounced because a scroll fires per frame and this one ends up
+  // in localStorage.
+  let rowsEl = $state<HTMLElement | null>(null);
+  let detailEl = $state<HTMLElement | null>(null);
+
+  function trackScroll(el: HTMLElement | null, field: 'px' | 'aux') {
+    if (!el || !viewKey) return;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const on = () => {
+      clearTimeout(t);
+      t = setTimeout(() => patchTabView(viewKey, { [field]: el.scrollTop }), 150);
+    };
+    el.addEventListener('scroll', on, { passive: true });
+    return () => {
+      clearTimeout(t);
+      el.removeEventListener('scroll', on);
+    };
+  }
+  $effect(() => trackScroll(rowsEl, 'px'));
+  $effect(() => trackScroll(detailEl, 'aux'));
+
+  // Placed only once, and only against content that exists: an offset means
+  // nothing over an empty list, and the list arrives a fetch after the element
+  // does. The guards are also what stops a freshly clicked commit inheriting
+  // the scroll position of the one that was open before the reload.
+  let rowsPlaced = false;
+  $effect(() => {
+    const el = rowsEl;
+    const n = graph.rows.length;
+    if (!el || !n || rowsPlaced) return;
+    rowsPlaced = true;
+    const want = remembered?.px ?? 0;
+    if (want > 0) requestAnimationFrame(() => { el.scrollTop = want; });
+  });
+
+  let detailPlaced = false;
+  $effect(() => {
+    const el = detailEl;
+    if (!el || !detail || detailPlaced) return;
+    detailPlaced = true;
+    const want = remembered?.aux ?? 0;
+    if (want > 0) requestAnimationFrame(() => { el.scrollTop = want; });
+  });
+
   const STATUS: Record<string, string> = { A: 'added', M: 'modified', D: 'deleted', R: 'renamed', C: 'copied', T: 'typechange' };
 </script>
 
@@ -304,7 +403,7 @@
         class="frow"
         style="padding-left: {depth * 12}px"
         title={k.dir}
-        onclick={() => (folded[k.dir] = !folded[k.dir])}
+        onclick={() => toggleFold(k.dir)}
       >
         <span class="chev" class:open={!folded[k.dir]}>▸</span>
         <img class="ficon" alt="" aria-hidden="true" src={folderIconUrl(baseOf(k.dir), !folded[k.dir])} />
@@ -354,7 +453,7 @@
   {/if}
 
   <div class="body">
-    <div class="rows">
+    <div class="rows" bind:this={rowsEl}>
       <svg class="lanes" width={graphW} height={graph.rows.length * ROW_H} aria-hidden="true">
         {#each paths as p (p.stroke)}
           <path d={p.d} stroke={p.stroke} fill="none" stroke-width="1.5" />
@@ -377,7 +476,7 @@
           class="row"
           class:sel={selected === r.c.sha}
           style="padding-left: {graphW}px"
-          onclick={() => void select(r.c.sha)}
+          onclick={() => select(r.c.sha)}
         >
           {#each r.c.refs as ref (ref)}
             {@const b = badge(ref)}
@@ -396,7 +495,7 @@
     </div>
 
     {#if selected}
-      <aside class="detail">
+      <aside class="detail" bind:this={detailEl}>
         {#if detailError}
           <div class="note err">{detailError}</div>
         {:else if !detail}
@@ -404,7 +503,7 @@
         {:else}
           <div class="dhead">
             <span class="dsubject">{detail.subject}</span>
-            <button type="button" class="btn close" title="Close details" onclick={() => { selected = ''; detail = null; }}>✕</button>
+            <button type="button" class="btn close" title="Close details" onclick={closeDetail}>✕</button>
           </div>
           <div class="meta">{detail.author} &lt;{detail.email}&gt;</div>
           <div class="meta">{detail.date}</div>

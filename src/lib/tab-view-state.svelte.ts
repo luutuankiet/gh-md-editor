@@ -40,6 +40,12 @@ export interface TabViewState {
   // pixels. `aux` is the second scroller in the tabs that have two.
   px?: number;
   aux?: number;
+  // Which commit the graph tab has open in its details pane, and which folders
+  // are folded shut in that commit's file tree. Stored rather than re-derived
+  // because there is nothing to re-derive them from: a selection is a thing the
+  // reader did, and the pane it opens is the whole reason the tab was left.
+  sha?: string;
+  folds?: string[];
 }
 
 interface Stored {

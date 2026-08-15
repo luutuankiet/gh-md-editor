@@ -928,6 +928,16 @@
           kind: t.kind,
           pinned: t.pinned,
           git: t.git,
+          // Which repository a graph tab is drawing. The restore below already
+          // knew how to rebuild one and was never given the field to do it
+          // with, so it fell through to the branch that looks the tab's path up
+          // on disk — and dropped the tab on every reload when that missed.
+          graph: t.graph,
+          // Which conflicted file a merge tab is resolving. Safe to bring back
+          // even when the conflict is gone: the merge view re-reads git's
+          // stages on mount and says so plainly when there are none left,
+          // rather than showing three panes of a merge that already happened.
+          merge: t.merge,
           // A compare with a column held in memory — pasted text, an unsaved
           // buffer — has nothing on disk to re-derive it from, so it
           // deliberately does not survive a reload.
@@ -973,6 +983,8 @@
           tab = { path: st.path, name: st.name ?? st.path, kind: 'diff', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0, cmp: st.cmp };
         } else if (st.kind === 'graph' && st.graph) {
           tab = { path: st.path, name: st.name ?? st.path, kind: 'graph', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0, graph: st.graph };
+        } else if (st.kind === 'merge' && st.merge) {
+          tab = { path: st.path, name: st.name ?? st.path, kind: 'merge', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0, merge: st.merge };
         } else if (st.kind === 'diff' && st.git) {
           // Diff tabs own no content — DiffTab re-derives from git on mount.
           tab = { path: st.path, name: st.name ?? st.path, kind: 'diff', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0, git: st.git };
@@ -2177,7 +2189,7 @@
                   {:else if at.kind === 'diff' && at.git}
                     <DiffTab repo={at.git.repo} path={at.git.path} staged={at.git.staged} untracked={at.git.untracked} base={at.git.base ?? ''} baseLabel={at.git.baseLabel ?? ''} to={at.git.to ?? ''} toLabel={at.git.toLabel ?? ''} viewKey={at.path} onOpenAtRef={openFileAtRef} onOpenFile={openRepoFile} />
                   {:else if at.kind === 'graph' && at.graph}
-                    <GitGraphTab repo={at.graph.repo} onOpenDiff={openDiff} onOpenFile={openRepoFile} onOpenAtRef={openFileAtRef} />
+                    <GitGraphTab repo={at.graph.repo} viewKey={at.path} onOpenDiff={openDiff} onOpenFile={openRepoFile} onOpenAtRef={openFileAtRef} />
                   {:else if at.kind === 'merge' && at.merge}
                     <MergeTab repo={at.merge.repo} path={at.merge.path} viewKey={at.path} />
                   {:else if at.kind === 'md'}

@@ -75,8 +75,10 @@ gates() {
   staged="$(git diff --cached --name-only)"
   [ -n "$staged" ] || die "nothing is staged, so there is nothing to check"
 
-  if printf '%s\n' "$staged" | rg -q 'gsd-lite/|\.claude/'; then
-    printf '%s\n' "$staged" | rg 'gsd-lite/|\.claude/' >&2
+  # .claude/skills/ is deliberately public - it is the pointer into docs/.
+  # Everything else under .claude/ is private.
+  if printf '%s\n' "$staged" | rg -q 'gsd-lite/|\.claude/(?!skills/)' --pcre2; then
+    printf '%s\n' "$staged" | rg 'gsd-lite/|\.claude/(?!skills/)' --pcre2 >&2
     die "private files are staged. Fix .gitignore, unstage them, and retry."
   fi
   ok "no private directories staged"

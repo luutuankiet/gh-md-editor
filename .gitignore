@@ -11,5 +11,9 @@ gsd-lite/
 !.env.example
 .svelte-kit/
 .vite/
-.claude/
+# Everything under .claude/ is private EXCEPT the two index skills, which are how
+# a session finds docs/ at all. The trailing /* matters: git will not descend into
+# an excluded directory, so a plain `.claude/` cannot be re-included below.
+.claude/*
+!.claude/skills/
 Bn\\

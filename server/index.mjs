@@ -3233,6 +3233,12 @@ function createSession(cwd) {
       // outside any session often has none — which is what makes vim draw
       // its box drawing as `~` and mangle multibyte input.
       LANG: process.env.LANG || process.env.LC_ALL || 'en_US.UTF-8',
+      // Everything a shell can inherit is inherited right here. On macOS the
+      // security session is the exception: it is kernel state, not an env var,
+      // so a server started outside the graphical login hands every terminal a
+      // sessionless pty with no login keychain, and git silently starts asking
+      // for passwords. See
+      // docs/traps/GIT_ASKS_FOR_A_PASSWORD_IN_THE_TERMINAL_BUT_NOT_IN_TERMINAL_APP.md
       COLORTERM: process.env.COLORTERM || 'truecolor',
       ...(auth ? { GMD_TOKEN: auth } : {}),
     },

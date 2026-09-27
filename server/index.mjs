@@ -392,6 +392,57 @@ async function apiFileGet(res, params) {
   sendJson(res, 200, { content: buf.toString('utf8'), mtimeMs: st.mtimeMs, size: st.size });
 }
 
+// Raw bytes with their real content type, so an <img> or <iframe> can show a
+// file in place. /api/file answers JSON and /api/download forces a save
+// dialog; neither can be pointed at by a media element. Only types in
+// MEDIA_MIME are served: anything else would come back as HTML-sniffable
+// bytes under the server's own origin. SVG is safe here because it is only
+// ever loaded through <img>, where its scripts do not run. HEAD answers the
+// same headers with no body; the preview polls it to notice a re-render.
+const MEDIA_MIME = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
+  '.bmp': 'image/bmp',
+  '.ico': 'image/x-icon',
+  '.svg': 'image/svg+xml',
+  '.pdf': 'application/pdf',
+};
+
+async function apiRaw(req, res, params) {
+  const abs = resolveSafe(params.get('path'));
+  if (!abs) return sendJson(res, 400, { error: 'path escapes root' });
+  const type = MEDIA_MIME[path.extname(abs).toLowerCase()];
+  if (!type) return sendJson(res, 415, { error: 'not a previewable media type' });
+  let st;
+  try {
+    st = await fs.stat(abs);
+  } catch (e) {
+    return sendJson(res, e.code === 'ENOENT' ? 404 : 500, { error: String(e.message ?? e) });
+  }
+  if (!st.isFile()) return sendJson(res, 400, { error: 'not a file' });
+  res.writeHead(200, {
+    'content-type': type,
+    'content-length': String(st.size),
+    'content-disposition': 'inline',
+    'x-content-type-options': 'nosniff',
+    'x-mtime-ms': String(st.mtimeMs),
+    // The client busts the cache itself with ?v=<mtime>; no-store keeps a
+    // re-rendered file from ever being answered out of the browser cache.
+    'cache-control': 'no-store',
+  });
+  if (req.method === 'HEAD') return res.end();
+  await new Promise((resolve) => {
+    const s = createReadStream(abs);
+    s.on('error', () => { res.destroy(); resolve(); });
+    s.on('end', resolve);
+    s.pipe(res);
+  });
+}
+
 // Copy-as-context: walk a file or directory and wrap every text file in
 // <file src="relpath">…</file> blocks inside one <context> envelope —
 // ported (raw variant only) from the mouse-word-highlight VS Code
@@ -1360,6 +1411,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/browse' && req.method === 'GET') return await apiBrowse(res, url.searchParams);
     if (url.pathname === '/api/file' && req.method === 'GET') return await apiFileGet(res, url.searchParams);
     if (url.pathname === '/api/file' && req.method === 'PUT') return await apiFilePut(req, res);
+    if (url.pathname === '/api/raw' && (req.method === 'GET' || req.method === 'HEAD')) return await apiRaw(req, res, url.searchParams);
     if (url.pathname === '/api/exists' && req.method === 'GET') return await apiExists(res, url.searchParams);
     if (url.pathname === '/api/upload' && req.method === 'POST') return await apiUpload(req, res);
     if (url.pathname === '/api/search' && req.method === 'GET') return apiSearch(req, res, url.searchParams);

@@ -7,13 +7,17 @@
   import TreeComparePanel from './server/TreeComparePanel.svelte';
   import DiffTab from './server/DiffTab.svelte';
   import MergeTab from './server/MergeTab.svelte';
+  import MediaTab from './server/MediaTab.svelte';
+  import { mediaKindOf } from '../lib/media-kind';
   import SaveAsModal from './server/SaveAsModal.svelte';
   import WorkspaceBrowser from './server/WorkspaceBrowser.svelte';
 
   interface Tab {
     path: string;
     name: string;
-    kind: 'md' | 'code' | 'diff' | 'merge' | 'graph';
+    // 'media' is a read-only image or PDF preview. It holds no content: the
+    // preview streams the bytes itself and follows the file's mtime.
+    kind: 'md' | 'code' | 'diff' | 'merge' | 'graph' | 'media';
     pinned: boolean;
     content: string;
     savedContent: string;
@@ -988,6 +992,12 @@
         } else if (st.kind === 'diff' && st.git) {
           // Diff tabs own no content — DiffTab re-derives from git on mount.
           tab = { path: st.path, name: st.name ?? st.path, kind: 'diff', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0, git: st.git };
+        } else if (st.kind === 'media' || (mediaKindOf(baseName(st.path)) && !/\.svg$/i.test(st.path))) {
+          // A preview re-reads the file on mount, so nothing is fetched here.
+          // The second test upgrades a picture saved by an older build as a
+          // "binary file" code tab. SVG is excluded from it: an SVG saved as
+          // code was opened as text on purpose.
+          tab = { path: st.path, name: st.name ?? baseName(st.path), kind: 'media', pinned: !!st.pinned, content: '', savedContent: '', mtimeMs: 0 };
         } else {
           try {
             const res = await fetch(`/api/file?path=${encodeURIComponent(st.path)}`);
@@ -1046,6 +1056,21 @@
       tab.mtimeMs = data.mtimeMs;
       tab.stale = false;
     } catch { /* offline or mid-restart: the next focus tries again */ }
+  }
+
+  // An SVG is both a picture and source. It opens as a preview; this turns the
+  // same tab into the text editor, in place, so the path is never open twice.
+  async function openMediaAsText(tab: Tab) {
+    try {
+      const res = await fetch(`/api/file?path=${encodeURIComponent(tab.path)}`);
+      const data = await res.json();
+      if (!res.ok || data.binary) return;
+      tab.content = data.content;
+      tab.savedContent = data.content;
+      tab.mtimeMs = data.mtimeMs;
+      tab.kind = 'code';
+      tab.pinned = true;
+    } catch { /* leave the preview up; the button can be pressed again */ }
   }
 
   // Explicit discard of local edits in favour of what is on disk.
@@ -1144,7 +1169,12 @@
 
     const name = baseName(path);
     let tab: Tab;
-    try {
+    if (mediaKindOf(name)) {
+      // Decided by name, before /api/file: that endpoint caps reads at 5 MB,
+      // and a PDF past the cap would fail there before it could be previewed.
+      tab = { path, name, kind: 'media', pinned: opt.pinned, content: '', savedContent: '', mtimeMs: 0 };
+      pendingOpens.delete(path);
+    } else try {
       const res = await fetch(`/api/file?path=${encodeURIComponent(path)}`);
       const data = await res.json();
       if (!res.ok) {
@@ -2182,6 +2212,12 @@
                   {/if}
                   {#if at.error}
                     <div class="placeholder">Cannot open {at.name}: {at.error}</div>
+                  {:else if at.kind === 'media'}
+                    <MediaTab
+                      path={at.path}
+                      name={baseName(at.path)}
+                      onOpenAsText={/\.svg$/i.test(at.path) ? () => void openMediaAsText(at) : undefined}
+                    />
                   {:else if at.binary}
                     <div class="placeholder">{at.name} is a binary file.</div>
                   {:else if at.kind === 'diff' && at.cmp}

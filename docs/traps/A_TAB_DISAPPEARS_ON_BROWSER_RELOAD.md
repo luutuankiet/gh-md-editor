@@ -17,8 +17,8 @@ not there.
 Session save and session restore are **two independent, hand-maintained field
 lists**:
 
-- `sessionSnapshot()` — `src/components/App-server.svelte:916`
-- `restoreSession()` — `src/components/App-server.svelte:970`
+- `sessionSnapshot()` — `src/components/App-server.svelte:920`
+- `restoreSession()` — `src/components/App-server.svelte:974`
 
 They must agree, and nothing enforces that they do. Measured twice on the same
 codebase: `restoreSession()` already carried a `st.kind === 'graph' && st.graph`

@@ -218,7 +218,7 @@
     { label: 'Open Workspace in New Window', run: () => { browse = { mode: 'workspace', action: 'window' }; } },
     { label: 'Open File…', run: () => { browse = { mode: 'file', action: 'same' }; } },
     { label: 'Close All Editor Tabs', run: closeAllTabs },
-    { label: 'Close Other Editor Tabs', run: closeOtherTabs },
+    { label: 'Close Other Editor Tabs', run: () => closeOtherTabs() },
     { label: 'Git Graph', hint: 'anchored repo', run: () => openGraph(gitAnchor) },
     { label: 'Open Git Repository…', hint: 'anchor for every git panel', run: () => window.dispatchEvent(new CustomEvent('gmd:open-repo-picker')) },
     { label: 'Refresh Explorer', run: () => window.dispatchEvent(new CustomEvent('gmd:refresh-explorer')) },
@@ -768,6 +768,7 @@
   import PortsPanel from './server/PortsPanel.svelte';
   import { fileIconUrl, folderIconUrl } from '../lib/file-icons';
   import { TAB_DND_MIME, PATH_DND_MIME } from '../lib/dnd';
+  import { tabDirLabels, dropSlot } from '../lib/tab-strip';
 
   // ---- Layout shell: VS Code-style panels (explorer / secondary side bar / bottom panel) ----
   interface LayoutState {
@@ -844,15 +845,14 @@
   let activeGroupId = $state(1);
 
   let activeGroup = $derived(groups.find((g) => g.id === activeGroupId) ?? groups[0]);
-  // VS Code prints the containing folder dimmed beside the filename so two
-  // tabs called index.ts stay distinguishable. Relative to the anchored
-  // workspace folder, empty for files sitting at its root.
-  function tabDir(p: string): string {
-    if (!p || p.includes(':')) return '';
-    const rel = folder && p.startsWith(`${folder}/`) ? p.slice(folder.length + 1) : p;
-    const i = rel.lastIndexOf('/');
-    return i === -1 ? '' : rel.slice(0, i);
+  // Path relative to the anchored workspace folder, for messages.
+  function relPath(p: string): string {
+    return folder && p.startsWith(`${folder}/`) ? p.slice(folder.length + 1) : p;
   }
+  // The dimmed folder label beside a tab's name, per group: shown only when two
+  // tabs in that group share a file name, and only as much of the folder as
+  // tells them apart. Unique names get none, so more tabs fit on a row.
+  let tabLabels = $derived(new Map(groups.map((g) => [g.id, tabDirLabels(g.tabs.map((t) => t.path), folder)])));
 
   let activeTab = $derived(activeGroup.tabs.find((t) => t.path === activeGroup.activePath) ?? null);
   // A workspace outside the served root is already an absolute path, so
@@ -1605,11 +1605,13 @@
     home.activePath = tab.path;
   }
 
-  function closeTab(g: Group, path: string) {
+  // `force` skips the per-tab unsaved prompt; only closeTabsBulk passes it,
+  // after it has already asked once for the whole batch.
+  function closeTab(g: Group, path: string, force = false) {
     const idx = g.tabs.findIndex((t) => t.path === path);
     if (idx < 0) return;
     const tab = g.tabs[idx];
-    if (isDirty(tab) && !window.confirm(`${tab.name} has unsaved changes. Close anyway?`)) return;
+    if (!force && isDirty(tab) && !window.confirm(`${tab.name} has unsaved changes. Close anyway?`)) return;
     g.tabs.splice(idx, 1);
     if (g.activePath === path) {
       g.activePath = g.tabs[Math.min(idx, g.tabs.length - 1)]?.path ?? null;
@@ -1617,19 +1619,34 @@
     if (g.tabs.length === 0 && groups.length > 1) removeGroup(g.id);
   }
 
-  function closeAllTabs() {
-    for (const g of [...groups]) for (const t of [...g.tabs]) closeTab(g, t.path);
+  // Close All and Close Others, from the palette and the tab menu alike. One
+  // confirm names every unsaved file in the batch; Cancel closes nothing, so a
+  // bulk close never leaves the strip half-emptied.
+  function closeTabsBulk(keep: (g: Group, t: Tab) => boolean) {
+    const doomed = groups.flatMap((g) => g.tabs.filter((t) => !keep(g, t)).map((t) => ({ g, t })));
+    const dirty = doomed.filter(({ t }) => isDirty(t));
+    if (dirty.length) {
+      const list = dirty.map(({ t }) => `  ${t.path.includes(':') ? t.name : relPath(t.path)}`).join('\n');
+      const head = dirty.length === 1 ? '1 file has unsaved changes:' : `${dirty.length} files have unsaved changes:`;
+      if (!window.confirm(`${head}\n\n${list}\n\nClose anyway? Unsaved changes will be lost.`)) return;
+    }
+    for (const { g, t } of doomed) closeTab(g, t.path, true);
   }
 
-  function closeOtherTabs() {
-    const keepGroup = activeGroupId;
-    const keepPath = activeGroup.activePath;
-    for (const g of [...groups]) {
-      for (const t of [...g.tabs]) {
-        if (g.id === keepGroup && t.path === keepPath) continue;
-        closeTab(g, t.path);
-      }
+  function closeAllTabs() {
+    closeTabsBulk(() => false);
+  }
+
+  // Keeps exactly one tab across the whole window, not per split group. From
+  // the palette that is the active tab; from the tab menu it is the tab that
+  // was right-clicked, which becomes active along with its group.
+  function closeOtherTabs(keepGroup = activeGroupId, keepPath = activeGroup.activePath) {
+    const g = groups.find((x) => x.id === keepGroup);
+    if (g && keepPath && g.tabs.some((t) => t.path === keepPath)) {
+      activeGroupId = g.id;
+      g.activePath = keepPath;
     }
+    closeTabsBulk((x, t) => x.id === keepGroup && t.path === keepPath);
   }
 
   // A deleted file's tab has nothing left to save back to — drop it without the
@@ -1698,6 +1715,39 @@
   // Slot the dragged tab would occupy in the hovered strip, or null when the
   // pointer is over an editor body rather than a strip.
   let dropIndex = $state<number | null>(null);
+  // Right-click menu on a tab. x is clamped so the menu never opens past the
+  // right edge when the tab sits at the end of a row.
+  let tabMenu = $state<{ x: number; y: number; groupId: number; path: string } | null>(null);
+  function tabMenuAct(act: 'close' | 'others' | 'all') {
+    const m = tabMenu;
+    tabMenu = null;
+    if (!m) return;
+    const g = groups.find((x) => x.id === m.groupId);
+    if (act === 'close') { if (g) closeTab(g, m.path); }
+    else if (act === 'others') closeOtherTabs(m.groupId, m.path);
+    else closeAllTabs();
+  }
+
+  // Keeps a group's active tab visible when the strip is past its 3-row cap
+  // and scrolling inside itself. Nearest-edge, so the strip moves only when
+  // the tab is hidden. Re-runs whenever the active path changes: explorer
+  // click, quick open, go to definition, a restored session.
+  function keepActiveVisible(strip: HTMLElement, _active: string | null) {
+    let raf = 0;
+    const run = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const el = strip.querySelector<HTMLElement>('.tab.active');
+        if (!el) return;
+        const s = strip.getBoundingClientRect();
+        const r = el.getBoundingClientRect();
+        if (r.top < s.top) strip.scrollTop -= s.top - r.top;
+        else if (r.bottom > s.bottom) strip.scrollTop += r.bottom - s.bottom;
+      });
+    };
+    run();
+    return { update: run, destroy: () => cancelAnimationFrame(raf) };
+  }
 
   function handleDragOver(e: DragEvent, groupId: number, tabstrip: boolean) {
     if (!dragSrc) return;
@@ -1705,16 +1755,11 @@
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
     let zone: 'center' | 'right' = 'center';
     if (tabstrip) {
-      // First tab whose midpoint sits right of the pointer wins the slot;
-      // past every midpoint means the end of the strip. Measured here rather
+      // Row-aware once the strip wraps: see dropSlot. Measured here rather
       // than per-tab so one listener covers the whole strip, including the
-      // empty space after the last tab.
-      const tabs = [...(e.currentTarget as HTMLElement).querySelectorAll('.tab')];
-      let idx = tabs.length;
-      for (let i = 0; i < tabs.length; i++) {
-        const r = tabs[i].getBoundingClientRect();
-        if (e.clientX < r.left + r.width / 2) { idx = i; break; }
-      }
+      // empty space after the last tab of each row.
+      const rects = [...(e.currentTarget as HTMLElement).querySelectorAll('.tab')].map((t) => t.getBoundingClientRect());
+      const idx = dropSlot(e.clientX, e.clientY, rects);
       if (dropIndex !== idx) dropIndex = idx;
     } else {
       const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -1818,6 +1863,12 @@
       // what makes an embedded terminal feel broken, so while the shell has
       // focus only the chords it has no claim on stay ours: the
       // Shift-augmented ones, and the two that act on the panel itself.
+      if (e.key === 'Escape' && (tabMenu || rwMenu)) {
+        e.preventDefault();
+        tabMenu = null;
+        rwMenu = null;
+        return;
+      }
       const inShell = !!(e.target as HTMLElement | null)?.closest?.('.xterm');
       const workbenchClaim =
         (e.metaKey || e.ctrlKey) &&
@@ -2138,6 +2189,21 @@
     <div class="resizer v" class:hidden={!layout.showLeft} onpointerdown={(e) => startDrag(e, { left: true })}></div>
     <main class="main">
       <div class="center">
+        {#if tabMenu}
+          <!-- Same markup, look and dismissal as the recent-workspaces menu. Lives
+             here, not in the sidebar, so it still opens with the explorer hidden. -->
+          <div
+            class="rw-scrim"
+            role="presentation"
+            onclick={() => { tabMenu = null; }}
+            oncontextmenu={(e) => { e.preventDefault(); tabMenu = null; }}
+          ></div>
+          <div class="rw-menu tab-menu" style="left: {tabMenu.x}px; top: {tabMenu.y}px" role="menu">
+            <button type="button" role="menuitem" onclick={() => tabMenuAct('close')}>Close</button>
+            <button type="button" role="menuitem" onclick={() => tabMenuAct('others')}>Close Others</button>
+            <button type="button" role="menuitem" onclick={() => tabMenuAct('all')}>Close All</button>
+          </div>
+        {/if}
       <div class="groups">
         {#each groups as g, gi (g.id)}
           {@const at = g.tabs.find((t) => t.path === g.activePath) ?? null}
@@ -2151,10 +2217,12 @@
               class="tabstrip"
               role="tablist"
               tabindex="-1"
+              use:keepActiveVisible={g.activePath}
               ondragover={(e) => handleDragOver(e, g.id, true)}
               ondrop={(e) => { e.preventDefault(); handleDrop(g.id); }}
             >
               {#each g.tabs as tab, i (tab.path)}
+                {@const dir = tabLabels.get(g.id)?.get(tab.path) ?? ''}
                 {#if dragSrc && dropTarget?.groupId === g.id && dropIndex === i}
                   <span class="tab-caret"></span>
                 {/if}
@@ -2172,18 +2240,21 @@
                   onclick={() => { g.activePath = tab.path; }}
                   ondblclick={() => { tab.pinned = true; }}
                   onauxclick={(e) => { if (e.button === 1) { e.preventDefault(); closeTab(g, tab.path); } }}
+                  oncontextmenu={(e) => { e.preventDefault(); tabMenu = { x: Math.min(e.clientX, window.innerWidth - 190), y: e.clientY, groupId: g.id, path: tab.path }; }}
                   onkeydown={(e) => { if (e.key === 'Enter') g.activePath = tab.path; }}
                 >
                   <span class="tab-name">{tab.name}</span>
-                  {#if tabDir(tab.path)}<span class="tab-dir">{tabDir(tab.path)}</span>{/if}
-                  {#if isDirty(tab)}<span class="dirty-dot" aria-label="Unsaved changes">●</span>{/if}
+                  {#if dir}<span class="tab-dir">{dir}</span>{/if}
+                  <!-- One fixed slot for both glyphs, so hovering never changes
+                       the tab's width and the row never reflows under the pointer. -->
                   <button
                     type="button"
                     class="tab-close"
-                    aria-label="Close tab"
+                    class:dirty={isDirty(tab)}
+                    aria-label={isDirty(tab) ? 'Close tab (unsaved changes)' : 'Close tab'}
                     onclick={(e) => { e.stopPropagation(); closeTab(g, tab.path); }}
                     ondblclick={(e) => e.stopPropagation()}
-                  >×</button>
+                  ><span class="glyph-x">×</span><span class="glyph-dot">●</span></button>
                 </div>
               {/each}
               {#if dragSrc && dropTarget?.groupId === g.id && dropIndex === g.tabs.length}
@@ -2645,7 +2716,7 @@
   .tab-caret {
     flex: 0 0 auto;
     width: 2px;
-    align-self: stretch;
+    height: 30px;
     background: #e58520;
     pointer-events: none;
   }
@@ -2765,16 +2836,28 @@
     display: flex;
     flex-direction: column;
   }
+  /* Wraps like VS Code with wrapTabs on: never a horizontal scrollbar, at most
+     three 30px rows, then it scrolls vertically inside itself. border-box is
+     global, so the 1px bottom border is added on top of the three rows. */
   .tabstrip {
     flex: 0 0 auto;
     display: flex;
+    flex-wrap: wrap;
     align-items: stretch;
-    overflow-x: auto;
+    overflow-x: hidden;
+    overflow-y: auto;
+    max-height: calc(3 * 30px + 1px);
     border-bottom: 1px solid #404040;
     background: #272727;
-    min-height: 30px;
+    min-height: 31px;
   }
+  /* Sized to the full name, no cap. max-width only stops a name wider than
+     the whole group from overflowing it; that is the one case it ellipsizes. */
   .tab {
+    flex: 0 0 auto;
+    height: 30px;
+    max-width: 100%;
+    min-width: 0;
     display: flex;
     align-items: center;
     gap: 6px;
@@ -2791,20 +2874,18 @@
     box-shadow: inset 0 -2px 0 #e58520;
   }
   .tab.preview .tab-name { font-style: italic; }
+  .tab-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .tab-dir {
+    flex: 0 0 auto;
     color: #8a8a8a;
     font-size: 10.5px;
-    max-width: 180px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    direction: rtl;
   }
-  .dirty-dot {
-    color: #e58520;
-    font-size: 10px;
-    line-height: 1;
-  }
+  /* The slot is always reserved (visibility, never display), so a tab is the
+     same width hovered or not. × shows on the active tab and on hover; an
+     unsaved tab shows ● in its place, which turns into × on hover. */
   .tab-close {
+    flex: 0 0 auto;
+    display: grid;
     border: none;
     background: transparent;
     color: inherit;
@@ -2813,7 +2894,17 @@
     line-height: 1;
     padding: 2px 4px;
     border-radius: 4px;
+    visibility: hidden;
   }
+  .tab-close > span { grid-area: 1 / 1; text-align: center; }
+  .tab-close .glyph-dot { color: #e58520; font-size: 10px; align-self: center; visibility: hidden; }
+  .tab.active .tab-close,
+  .tab:hover .tab-close,
+  .tab-close.dirty { visibility: visible; }
+  .tab-close.dirty .glyph-x { visibility: hidden; }
+  .tab-close.dirty .glyph-dot { visibility: visible; }
+  .tab:hover .tab-close.dirty .glyph-x { visibility: visible; }
+  .tab:hover .tab-close.dirty .glyph-dot { visibility: hidden; }
   .tab-close:hover { background: #444444; }
   .content {
     flex: 1 1 0;

@@ -12,7 +12,7 @@ verified: 2026-08-20
 does so inside a keyed block:
 
 ```svelte
-{#key g.activePath}        <!-- App-server.svelte:2174 -->
+{#key g.activePath}        <!-- App-server.svelte:2275 -->
 ```
 
 Keying on the active path means switching tabs **unmounts the component and builds
@@ -34,7 +34,7 @@ A per-tab override map, roughly 160 lines.
 | eviction | LRU, 300 entries |
 | writes | debounced 300 ms |
 | cross-tab | synced via the `storage` event |
-| init | `initTabViewState(folder)` at `App-server.svelte:64` |
+| init | `initTabViewState(folder)` at `App-server.svelte:68` |
 
 Fields: `wrap`, `diffView`, `lang`, `anchor` (a `{line, off}` document position),
 `px` and `aux` (pixel scroll offsets), `sha` and `folds` (the commit graph),
@@ -53,8 +53,8 @@ question, not a defect.
 Surviving a tab *switch* and surviving a browser *reload* are two different
 mechanisms, and this is where the trap is:
 
-- `sessionSnapshot()` — `App-server.svelte:916`
-- `restoreSession()` — `App-server.svelte:970`
+- `sessionSnapshot()` — `App-server.svelte:920`
+- `restoreSession()` — `App-server.svelte:974`
 
 They are **two hand-maintained field lists that must agree**. Adding a tab `kind`
 means editing both, or the tab vanishes silently on reload. See

@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,6 +6,28 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const parentRoot = path.resolve(__dirname, '..');
+
+// @vscode/vscode-languagedetection is a webpack build for node that loads its
+// CPU backend with `require("./" + chunkFile)`. The build's commonjs step turns
+// that dynamic require into a stub that always throws, so the model would fail
+// on its first guess. Pointing it at `globalThis.require` instead reaches the
+// shim src/lib/lang-model.worker.ts installs, which hands back the chunk it
+// imported statically. The dev server needs no help: its pre-bundler already
+// falls back to a global `require` for a dynamic one.
+function languageDetectionChunkLoader(): Plugin {
+  const call = 'require("./"+r.u(e))';
+  return {
+    name: 'gmd:languagedetection-chunk',
+    enforce: 'pre',
+    transform(code, id) {
+      if (!/vscode-languagedetection[\\/]dist[\\/]lib[\\/]index\.js$/.test(id)) return null;
+      if (!code.includes(call)) {
+        this.error(`${call} not found in ${id}; the package's chunk loader changed, update this plugin`);
+      }
+      return { code: code.replace(call, `globalThis.${call}`), map: null };
+    },
+  };
+}
 
 // Third app shell (server mode). Same pattern as vscode/vite.config.mts:
 // own root + entry, shared components via the @gmd alias, so everything in
@@ -18,6 +40,9 @@ export default defineConfig({
     }),
   ],
   base: './',
+  worker: {
+    plugins: () => [languageDetectionChunkLoader()],
+  },
   resolve: {
     alias: {
       '@gmd': path.join(parentRoot, 'src'),

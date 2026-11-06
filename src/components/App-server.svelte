@@ -59,6 +59,7 @@
   import OutlinePanel from './server/OutlinePanel.svelte';
   import type { OutlineNode } from '../lib/code-outline';
   import { initTabViewState, toggleWrapFor, renameTabView } from '../lib/tab-view-state.svelte';
+  import { filterLangModes } from '../lib/lang-mode-list';
 
   const folder = new URLSearchParams(location.search).get('folder') ?? '';
 
@@ -114,8 +115,13 @@
   // the palette's Open Folder commands switch it to), `@` the symbol list of
   // whatever file is on screen.
   let qoFolderAction = $state<'same' | 'tab' | 'window'>('same');
+  // The language list has no sigil, as in VS Code: it is only ever opened for
+  // one code tab, whose view key is held here while it is on screen.
+  let qoLangKey = $state<string | null>(null);
   let qoMode = $derived(
-    qoQuery.startsWith('>')
+    qoLangKey !== null
+      ? 'lang'
+      : qoQuery.startsWith('>')
       ? 'cmd'
       : qoQuery.startsWith('#')
         ? 'folder'
@@ -125,7 +131,7 @@
             ? 'ref'
             : 'file'
   );
-  let qoTerm = $derived(qoQuery.replace(/^[>#@:]\s*/, '').trim());
+  let qoTerm = $derived(qoMode === 'lang' ? qoQuery.trim() : qoQuery.replace(/^[>#@:]\s*/, '').trim());
 
   // `:` is the ref picker. Which repository it acts on is filled in before the
   // modal opens — the modal itself stays repo-agnostic.
@@ -225,6 +231,7 @@
     { label: 'Refresh Outline', run: refreshOutline },
     { label: 'Show Outline', run: () => { layout.showLeft = true; sideView = 'explorer'; toggleOutline(true); } },
     { label: 'New Untitled File', hint: 'Alt+N', run: () => newUntitledTab() },
+    { label: 'Change Language Mode', hint: 'active code editor', run: changeLanguageMode },
     { label: 'Format Document', hint: 'Shift+Alt+F', run: () => window.dispatchEvent(new CustomEvent('gmd:format-document')) },
     { label: 'Select All Occurrences', hint: 'Mod+Shift+D', run: () => window.dispatchEvent(new CustomEvent('gmd:select-all-occurrences')) },
     { label: 'Compare Active File With…', run: () => { if (compareSource()) browse = { mode: 'compare', action: 'same' }; } },
@@ -245,7 +252,7 @@
   async function qoSearch() {
     // Commands and symbols are filtered in memory; only files and folders
     // involve the server.
-    if (qoMode === 'cmd' || qoMode === 'symbol' || qoMode === 'ref') { qoSel = 0; return; }
+    if (qoMode === 'cmd' || qoMode === 'symbol' || qoMode === 'ref' || qoMode === 'lang') { qoSel = 0; return; }
     // Pin the mode at request time: the box can flip between send and receive.
     const mode = qoMode === 'folder' ? 'folder' : 'file';
     if (!qoTerm) {
@@ -418,6 +425,17 @@
         run: c.run,
       }));
     }
+    if (qoMode === 'lang') {
+      // Captured now: picking closes the modal, which clears qoLangKey before
+      // the row's action runs.
+      const viewKey = qoLangKey ?? '';
+      return filterLangModes(qoTerm).map((m) => ({
+        key: `lang:${m.value ?? ''}`,
+        label: m.label,
+        glyph: m.value === null ? '✦' : '',
+        run: () => window.dispatchEvent(new CustomEvent('gmd:set-language', { detail: { viewKey, lang: m.value } })),
+      }));
+    }
     if (qoMode === 'ref') {
       const needle = qoTerm.toLowerCase();
       const rows = needle ? qoRefs.filter((r) => r.name.toLowerCase().includes(needle)) : qoRefs;
@@ -500,7 +518,9 @@
   });
 
   let qoPlaceholder = $derived(
-    qoMode === 'cmd'
+    qoMode === 'lang'
+      ? 'Select Language Mode'
+      : qoMode === 'cmd'
       ? 'Type a command name'
       : qoMode === 'folder'
         ? 'Type a folder path to open as a workspace'
@@ -517,7 +537,9 @@
       ? `Search failed: ${qoError}`
       : qoLoading
         ? 'Searching…'
-        : qoMode === 'ref'
+        : qoMode === 'lang'
+          ? 'No matching languages'
+          : qoMode === 'ref'
           ? 'No branches or tags in this repository'
           : qoMode === 'symbol'
             ? 'No symbols in the active file'
@@ -583,6 +605,7 @@
     void openFile(repo ? `${repo}/${p}` : p, { pinned: false });
 
   function qoShow(prefix: string) {
+    qoLangKey = null;
     qoQuery = prefix;
     qoResults = [];
     qoError = '';
@@ -593,11 +616,41 @@
 
   function qoClose() {
     qoOpen = false;
+    qoLangKey = null;
     qoQuery = '';
     qoResults = [];
     qoError = '';
     qoSel = 0;
   }
+
+  // The language list for one code tab, keyed the way CodeTab keys its view
+  // state. CodeTab's own button asks for it through `gmd:open-language-picker`.
+  function openLanguagePicker(viewKey: string) {
+    if (!viewKey) return;
+    qoLangKey = viewKey;
+    qoQuery = '';
+    qoResults = [];
+    qoError = '';
+    qoSel = 0;
+    qoOpen = true;
+  }
+
+  // Palette entry: the active tab of the focused group, and only when that tab
+  // renders as a code editor. Anything else is a silent no-op.
+  function changeLanguageMode() {
+    const t = activeTab;
+    if (!t || t.kind !== 'code' || t.binary || t.error) return;
+    openLanguagePicker(t.path);
+  }
+
+  $effect(() => {
+    const on = (e: Event) => {
+      const key = (e as CustomEvent<{ viewKey?: string }>).detail?.viewKey;
+      if (key) openLanguagePicker(key);
+    };
+    window.addEventListener('gmd:open-language-picker', on);
+    return () => window.removeEventListener('gmd:open-language-picker', on);
+  });
 
   function qoPickItem(item: QoItem) {
     qoClose();

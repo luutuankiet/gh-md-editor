@@ -34,6 +34,7 @@
   import { outlineFromState } from '../../lib/code-outline';
   import type { OutlineNode } from '../../lib/code-outline';
   import { LANGS, describeFor } from '../../lib/lang-detect';
+  import { PLAIN_TEXT } from '../../lib/lang-mode-list';
   import { expandSelection, shrinkSelection, resetSelectionHistory } from '../../lib/expand-selection';
   import { formatDocumentText } from '../../lib/format-doc';
   import { wrapFor, toggleWrapFor, tabViewOf, patchTabView } from '../../lib/tab-view-state.svelte';
@@ -1253,7 +1254,7 @@
     vw.dispatch({ effects: wrapCompartment.reconfigure(appliedWrap ? EditorView.lineWrapping : []) });
   }
 
-  const PLAIN = 'plain text';
+  const PLAIN = PLAIN_TEXT;
   const languageNames = [PLAIN, ...LANGS.map((l) => l.name).sort((a, b) => a.localeCompare(b))];
   let selectedLanguage = $state(PLAIN);
 
@@ -1350,6 +1351,45 @@
       } catch { /* swallow — ticks are non-critical */ }
     });
   }
+
+  // The Change Language Mode list (hosted by the shell's quick open) answers
+  // with `gmd:set-language`: a language name pins it, null is Auto Detect.
+  function setLanguage(name: string) {
+    selectedLanguage = name;
+    void applyLanguage(name).then(() => {
+      // A hand-picked grammar has to re-feed the outline itself. Nothing else
+      // fires on this path, and on an unsaved buffer the filename effect, the
+      // only other feeder, never will, so the strip would stay empty.
+      const vw = view;
+      if (vw) pushOutline(vw);
+    });
+  }
+
+  function pinLanguage(name: string) {
+    if (!languageNames.includes(name)) return;
+    // Remembered for this tab so it survives switching away and back.
+    if (viewKey) patchTabView(viewKey, { lang: name });
+    setLanguage(name);
+  }
+
+  // Auto Detect. Until content detection exists this only drops the pin, so the
+  // filename decides again (plain text when it maps to nothing). The one place
+  // that has to change once detection keeps its own un-pinned state.
+  function unpinLanguage() {
+    if (viewKey) patchTabView(viewKey, { lang: undefined });
+    setLanguage(describeFor(filename)?.name ?? PLAIN);
+  }
+
+  $effect(() => {
+    const on = (e: Event) => {
+      const d = (e as CustomEvent<{ viewKey?: string; lang?: string | null }>).detail;
+      if (!d || !viewKey || d.viewKey !== viewKey) return;
+      if (d.lang === null) unpinLanguage();
+      else if (typeof d.lang === 'string') pinLanguage(d.lang);
+    };
+    window.addEventListener('gmd:set-language', on);
+    return () => window.removeEventListener('gmd:set-language', on);
+  });
 
   async function applyLanguage(name: string) {
     if (!view) return;
@@ -2002,29 +2042,14 @@
         </button>
       {/each}
     </div>
-    <select
+    <button
+      type="button"
       class="lang-picker"
       class:hidden={searchOpen}
-      bind:value={selectedLanguage}
-      onchange={() => {
-        // Remembered for this tab so it survives switching away and back.
-        if (viewKey) patchTabView(viewKey, { lang: selectedLanguage });
-        void applyLanguage(selectedLanguage).then(() => {
-          // A hand-picked grammar has to re-feed the outline itself. Nothing
-          // else fires on this path, and on an unsaved buffer the filename
-          // effect — the only other feeder — never will, so the strip would
-          // stay empty.
-          const vw = view;
-          if (vw) pushOutline(vw);
-        });
-      }}
-      title="Syntax language"
-      aria-label="Syntax language"
-    >
-      {#each languageNames as name (name)}
-        <option value={name}>{name}</option>
-      {/each}
-    </select>
+      onclick={() => window.dispatchEvent(new CustomEvent('gmd:open-language-picker', { detail: { viewKey } }))}
+      title="Change Language Mode"
+      aria-label="Syntax language: {selectedLanguage}"
+    >{selectedLanguage}</button>
   </div>
   <div class="code-body">
     <div class="code-host" bind:this={host}></div>
@@ -2500,6 +2525,11 @@
   }
   .lang-picker {
     flex: 0 0 auto;
+    cursor: pointer;
+    font-family: inherit;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     font-size: 11px;
     line-height: 1.4;
     padding: 0 2px;

@@ -17,3 +17,6 @@ gsd-lite/
 .claude/*
 !.claude/skills/
 Bn\\
+
+# Per-session scratch: notes, logs, recon. Promote to evidence/ or docs/ before relying on it.
+tmp/

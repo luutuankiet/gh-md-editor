@@ -18,7 +18,7 @@ something is implemented.
 | [Release and delivery](architecture/release-and-delivery.md) | which manifest publishes what, what a v* tag triggers, and how a running server upgrades itself | 2026-08-20 |
 | [The server HTTP surface](architecture/server-http-surface.md) | where an API handler lives in server/index.mjs, how paths are made safe, and how symlinks are classified | 2026-08-20 |
 | [Source-line mapping and reveal-counterpart](architecture/source-line-mapping.md) | how a preview element knows which markdown line produced it, and why the panes do not scroll together | 2026-08-20 |
-| [Tab lifecycle and per-tab view state](architecture/tab-lifecycle-and-view-state.md) | why state kept in a tab component disappears when you switch tabs, and where to put it instead | 2026-08-20 |
+| [Tab lifecycle and per-tab view state](architecture/tab-lifecycle-and-view-state.md) | why state kept in a tab component disappears when you switch tabs, and where to put it instead | 2026-11-07 |
 | [Two shells, one source tree](architecture/two-shells-one-repo.md) | which components belong to the browser editor, which to the server IDE, and why a change in src/lib touches both | 2026-08-20 |
 
 ## Traps

@@ -1,7 +1,7 @@
 ---
 title: Tab lifecycle and per-tab view state
 covers: why state kept in a tab component disappears when you switch tabs, and where to put it instead
-verified: 2026-08-20
+verified: 2026-11-07
 ---
 
 # Tab lifecycle and per-tab view state
@@ -34,9 +34,10 @@ A per-tab override map, roughly 160 lines.
 | eviction | LRU, 300 entries |
 | writes | debounced 300 ms |
 | cross-tab | synced via the `storage` event |
-| init | `initTabViewState(folder)` at `App-server.svelte:68` |
+| init | `initTabViewState(folder)` at `App-server.svelte:70` |
 
-Fields: `wrap`, `diffView`, `lang`, `anchor` (a `{line, off}` document position),
+Fields: `wrap`, `diffView`, `lang` (a picked language; absent means Auto Detect),
+`autoLang` (the last detected language), `anchor` (a `{line, off}` document position),
 `px` and `aux` (pixel scroll offsets), `sha` and `folds` (the commit graph),
 `frac` and `conflict` (the merge view).
 
@@ -87,7 +88,7 @@ an offset is not applied over an empty list that has not arrived from the server
 
 | tab | keeps |
 |---|---|
-| code | `anchor`, `wrap`, `lang` |
+| code | `anchor`, `wrap`, `lang`, `autoLang` |
 | diff | `diffView`, `px` — hunks mode has **no** scroll restore, its gate needs an editor generation hunks mode never produces |
 | git graph | `sha`, `folds`, `px` (rows), `aux` (detail pane) — the commit is **re-fetched** from the stored sha, never cached, so an amend between visits shows the commit as it is now |
 | merge | `frac` (three read-only panes), `conflict` (selected index); the editable result pane inherits `anchor` from the inner `<CodeTab>` |

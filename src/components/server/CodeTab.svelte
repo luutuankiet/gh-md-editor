@@ -1853,6 +1853,9 @@
   // different file, when anyone pins or un-pins the tab through the view state
   // (the picker, the palette), and when detection settles on a new answer.
   let resolvedLanguage: string | null = null;
+  // True when the shebang or the model chose the language, not a pin or the
+  // filename; the picker button then reads `Shell (auto)`.
+  let langAuto = $state(false);
   $effect(() => {
     const name = filename;
     const pinned = pinnedLang();
@@ -1862,11 +1865,12 @@
       // The shebang is read synchronously right here as well as in the
       // detection pass, so a script reopened or restored after a reload never
       // shows a frame of plain text while the debounce runs down.
-      const next = pinned
-        ?? describeFor(name)?.name
-        ?? shebangLang(view?.state.doc.sliceString(0, 1024) ?? '')
-        ?? detected
-        ?? PLAIN;
+      const fixed = pinned ?? describeFor(name)?.name;
+      const guessed = fixed ? null : shebangLang(view?.state.doc.sliceString(0, 1024) ?? '') ?? detected;
+      const next = fixed ?? guessed ?? PLAIN;
+      // Set before the no-op guard: un-pinning a tab whose detection agrees
+      // with the pin changes only the label, not the grammar.
+      langAuto = !!guessed;
       if (wantsDetection()) scheduleDetect();
       if (next === resolvedLanguage && next === selectedLanguage) return;
       resolvedLanguage = next;
@@ -2099,8 +2103,8 @@
       class:hidden={searchOpen}
       onclick={() => window.dispatchEvent(new CustomEvent('gmd:open-language-picker', { detail: { viewKey } }))}
       title="Change Language Mode"
-      aria-label="Syntax language: {selectedLanguage}"
-    >{selectedLanguage}</button>
+      aria-label="Syntax language: {selectedLanguage}{langAuto ? ' (auto)' : ''}"
+    >{selectedLanguage}{langAuto ? ' (auto)' : ''}</button>
   </div>
   <div class="code-body">
     <div class="code-host" bind:this={host}></div>

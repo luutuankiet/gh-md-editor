@@ -58,7 +58,8 @@
 
   import OutlinePanel from './server/OutlinePanel.svelte';
   import type { OutlineNode } from '../lib/code-outline';
-  import { initTabViewState, toggleWrapFor, renameTabView } from '../lib/tab-view-state.svelte';
+  import { initTabViewState, toggleWrapFor, renameTabView, tabViewOf, patchTabView, pinnedLangFor, autoLangFor } from '../lib/tab-view-state.svelte';
+  import { describeFor, shebangLang, extensionFor } from '../lib/lang-detect';
   import { filterLangModes } from '../lib/lang-mode-list';
 
   const folder = new URLSearchParams(location.search).get('folder') ?? '';
@@ -1636,6 +1637,13 @@
     // wrap and scroll across so it does not visibly reset on being named.
     renameTabView(oldPath, relPath);
     tab.name = baseName(relPath);
+    // The new name decides the language now. A detected one is dropped, and a
+    // pin survives only when the name maps to no language (`notes` pinned to
+    // Shell stays Shell; `run.py` pinned to Shell becomes Python).
+    const st = tabViewOf(relPath);
+    if (st && (st.autoLang !== undefined || st.lang !== undefined)) {
+      patchTabView(relPath, { autoLang: undefined, lang: describeFor(tab.name) ? undefined : st.lang });
+    }
     tab.kind = kindOf(tab.name);
     tab.untitled = false;
     tab.savedContent = tab.content;
@@ -1646,6 +1654,16 @@
 
   // Alt/Opt+N — blank buffer, VS Code's untitled model. Pinned from birth: a
   // preview-slot untitled tab would be silently replaced by the next open.
+  // Save As pre-fill for an untitled buffer: its name plus the extension of
+  // the language it shows, resolved in the editor's order (pin, shebang, last
+  // detection). Plain text keeps the bare name.
+  function saveAsName(tab: Tab): string {
+    if (!tab.untitled) return tab.name;
+    const lang = pinnedLangFor(tab.path) ?? shebangLang(tab.content.slice(0, 1024)) ?? autoLangFor(tab.path);
+    const ext = lang ? extensionFor(lang) : '';
+    return ext ? `${tab.name}.${ext}` : tab.name;
+  }
+
   let untitledSeq = 1;
   function newUntitledTab() {
     const used = new Set(groups.flatMap((g) => g.tabs.map((t) => t.path)));
@@ -2421,7 +2439,7 @@
   <SaveAsModal
     root={rootInfo}
     {folder}
-    initialName={saveAs.tab.name}
+    initialName={saveAsName(saveAs.tab)}
     onCancel={() => { saveAs = null; }}
     onSave={saveAsCommit}
   />

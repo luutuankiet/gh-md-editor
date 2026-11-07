@@ -200,3 +200,15 @@ export function detectPlan(text: string): { lang: string } | 'model' | null {
   if (sb) return { lang: sb };
   return head.replace(/\s+/g, '').length >= DETECT.minModelChars ? 'model' : null;
 }
+
+// The extension Save As appends for a language, or '' when it has none. The
+// first listed extension is the usual one, but a few lists open with a build
+// file name (Python's starts with `BUILD`), so mixed-case entries are skipped
+// and Python, whose next entry is Bazel's `bzl`, is named outright.
+const PREFERRED_EXT: Record<string, string> = { Python: 'py' };
+
+export function extensionFor(langName: string): string {
+  const desc = LANGS.find((l) => l.name === langName);
+  if (!desc) return '';
+  return PREFERRED_EXT[langName] ?? desc.extensions.find((e) => e === e.toLowerCase()) ?? '';
+}

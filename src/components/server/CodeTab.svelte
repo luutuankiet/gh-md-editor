@@ -33,11 +33,15 @@
 
   import { outlineFromState } from '../../lib/code-outline';
   import type { OutlineNode } from '../../lib/code-outline';
-  import { LANGS, describeFor } from '../../lib/lang-detect';
+  import { LANGS, describeFor, shebangLang, detectPlan, acceptGuess, DETECT } from '../../lib/lang-detect';
+  import { guessLanguage } from '../../lib/lang-model';
   import { PLAIN_TEXT } from '../../lib/lang-mode-list';
   import { expandSelection, shrinkSelection, resetSelectionHistory } from '../../lib/expand-selection';
   import { formatDocumentText } from '../../lib/format-doc';
-  import { wrapFor, toggleWrapFor, tabViewOf, patchTabView } from '../../lib/tab-view-state.svelte';
+  import {
+    wrapFor, toggleWrapFor, tabViewOf, patchTabView,
+    pinnedLangFor, autoLangFor, setAutoLangFor, pinLangFor, unpinLangFor,
+  } from '../../lib/tab-view-state.svelte';
   import { readScrollAnchor, applyScrollAnchor } from '../../lib/cm-scroll-anchor';
   import { highlightToLines, scopeForFilename } from '../../lib/diff-highlight';
   import type { Tok } from '../../lib/diff-highlight';
@@ -1354,30 +1358,15 @@
 
   // The Change Language Mode list (hosted by the shell's quick open) answers
   // with `gmd:set-language`: a language name pins it, null is Auto Detect.
-  function setLanguage(name: string) {
-    selectedLanguage = name;
-    void applyLanguage(name).then(() => {
-      // A hand-picked grammar has to re-feed the outline itself. Nothing else
-      // fires on this path, and on an unsaved buffer the filename effect, the
-      // only other feeder, never will, so the strip would stay empty.
-      const vw = view;
-      if (vw) pushOutline(vw);
-    });
-  }
-
+  // Both only write the view state; the resolver effect below re-applies the
+  // grammar and re-feeds the outline.
   function pinLanguage(name: string) {
-    if (!languageNames.includes(name)) return;
-    // Remembered for this tab so it survives switching away and back.
-    if (viewKey) patchTabView(viewKey, { lang: name });
-    setLanguage(name);
+    if (!viewKey || !languageNames.includes(name)) return;
+    pinLangFor(viewKey, name);
   }
 
-  // Auto Detect. Until content detection exists this only drops the pin, so the
-  // filename decides again (plain text when it maps to nothing). The one place
-  // that has to change once detection keeps its own un-pinned state.
   function unpinLanguage() {
-    if (viewKey) patchTabView(viewKey, { lang: undefined });
-    setLanguage(describeFor(filename)?.name ?? PLAIN);
+    if (viewKey) unpinLangFor(viewKey);
   }
 
   $effect(() => {
@@ -1638,6 +1627,7 @@
             pushOutline(u.view);
             // The ladder holds document offsets; an edit invalidates them.
             resetSelectionHistory(u.view);
+            scheduleDetect();
           }
           if (
             u.docChanged || u.selectionSet || u.viewportChanged || u.geometryChanged ||
@@ -1831,33 +1821,94 @@
     };
   });
 
-  // Detect + apply the grammar for the current filename. Runs at mount (the
-  // creation effect above is declared first, so `view` exists) and again when
-  // a preview tab is reused for a different file — which previously kept the
-  // old file's grammar. Only `filename` is tracked.
+  // Env files open covered. Anything else opens clear — including a preview tab
+  // reused for a different file, which is why this is unconditional rather
+  // than only armed on a match. Only `filename` is tracked.
   $effect(() => {
     const name = filename;
     if (!untrack(() => view)) return;
-    const detected = describeFor(name);
+    untrack(() => view?.dispatch({ effects: setCloak.of(isDotenvFile(name)) }));
+  });
+
+  // Language mode. A tab is either pinned (`lang` in its view state, picked by
+  // hand) or in auto mode (no `lang`). In auto mode the filename decides, and a
+  // name that maps to nothing (an untitled buffer, an extensionless script)
+  // falls to content detection, whose last answer is kept as `autoLang` so it
+  // survives a tab switch and a reload. Outside the IDE shell there is no view
+  // key to store it under, and the detected language lives here only.
+  let localAutoLang = $state<string | undefined>(undefined);
+  // Validated against the current list so a name left in the cache by an older
+  // version cannot send applyLanguage hunting for a grammar that no longer
+  // exists; an unknown pin reads as no pin.
+  const knownLang = (n: string | undefined) => (n && languageNames.includes(n) ? n : undefined);
+  const pinnedLang = () => knownLang(pinnedLangFor(viewKey));
+  const detectedLang = () => knownLang(viewKey ? autoLangFor(viewKey) : localAutoLang);
+  // Content detection runs only for a tab in auto mode whose filename maps to
+  // no language.
+  const wantsDetection = () => !pinnedLang() && !describeFor(filename);
+
+  // Resolve and apply the grammar: pinned `lang` > filename > shebang >
+  // detected (model) > plain text. Runs at mount (the creation effect above is
+  // declared first, so `view` exists), when a preview tab is reused for a
+  // different file, when anyone pins or un-pins the tab through the view state
+  // (the picker, the palette), and when detection settles on a new answer.
+  let resolvedLanguage: string | null = null;
+  $effect(() => {
+    const name = filename;
+    const pinned = pinnedLang();
+    const detected = detectedLang();
+    if (!untrack(() => view)) return;
     untrack(() => {
-      // Env files open covered. Anything else opens clear — including a preview
-      // tab reused for a different file, which is why this is unconditional
-      // rather than only armed on a match.
-      view?.dispatch({ effects: setCloak.of(isDotenvFile(name)) });
-      // A grammar picked by hand outranks the one the filename implies, and is
-      // remembered per tab. Validated against the current list so a name left in
-      // the cache by an older version cannot send applyLanguage hunting for a
-      // grammar that no longer exists.
-      const picked = viewKey ? tabViewOf(viewKey)?.lang : undefined;
-      selectedLanguage = picked && languageNames.includes(picked)
-        ? picked
-        : detected ? detected.name : PLAIN;
-      void applyLanguage(selectedLanguage).then(() => {
+      // The shebang is read synchronously right here as well as in the
+      // detection pass, so a script reopened or restored after a reload never
+      // shows a frame of plain text while the debounce runs down.
+      const next = pinned
+        ?? describeFor(name)?.name
+        ?? shebangLang(view?.state.doc.sliceString(0, 1024) ?? '')
+        ?? detected
+        ?? PLAIN;
+      if (wantsDetection()) scheduleDetect();
+      if (next === resolvedLanguage && next === selectedLanguage) return;
+      resolvedLanguage = next;
+      selectedLanguage = next;
+      void applyLanguage(next).then(() => {
         const vw = view;
         if (vw) pushOutline(vw);
       });
     });
   });
+
+  // Detection is debounced from the editor's update listener and from the
+  // resolver above. Whatever this editor is showing is the tab its group has
+  // active, since inactive tabs are unmounted, and only the editor being typed
+  // in re-arms the timer; a hidden browser tab skips the pass entirely.
+  let detectTimer: ReturnType<typeof setTimeout> | undefined;
+  let detectRun = 0;
+
+  function scheduleDetect() {
+    clearTimeout(detectTimer);
+    if (!wantsDetection()) return;
+    detectTimer = setTimeout(() => void runDetect(), DETECT.debounceMs);
+  }
+
+  async function runDetect() {
+    const vw = view;
+    if (!vw || !wantsDetection() || document.hidden) return;
+    const text = vw.state.doc.sliceString(0, DETECT.maxChars);
+    const plan = detectPlan(text);
+    // Too little text to guess from: keep whatever the tab already shows.
+    if (!plan) return;
+    const run = ++detectRun;
+    const lang = plan === 'model' ? acceptGuess(await guessLanguage(text)) : plan.lang;
+    // A newer pass, a pin, a rename or an unmount while the model was working
+    // all make this answer stale.
+    if (run !== detectRun || view !== vw || !wantsDetection()) return;
+    if (!knownLang(lang ?? undefined)) return;
+    if (viewKey) setAutoLangFor(viewKey, lang!);
+    else localAutoLang = lang!;
+  }
+
+  $effect(() => () => clearTimeout(detectTimer));
 
   // Refetch when the tab is pointed at a different file. `originalText` is
   // cleared first so the no-op guard in loadOriginal cannot mistake the

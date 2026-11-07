@@ -29,7 +29,16 @@ export interface TabViewState {
   // implies. Load-bearing for a buffer that has no filename yet: the pick is
   // the only thing recording what the text is, so losing it on a tab switch
   // dropped the whole document back to plain text.
+  //
+  // Absent means the tab is in auto mode ("Auto Detect"): the language comes
+  // from the filename, or failing that from `autoLang`. Present means pinned,
+  // and detection leaves the tab alone until it is un-pinned again.
   lang?: string;
+  // The language content detection last settled on (shebang or model), a
+  // `LANGS` name. Only read while `lang` is absent and the filename maps to
+  // nothing. Kept even when a pin covers it, so un-pinning returns straight to
+  // the last guess instead of flashing plain text until detection re-runs.
+  autoLang?: string;
   // A document line plus the pixel remainder inside it, for CodeMirror
   // surfaces. A raw pixel offset stops pointing at the same text the moment
   // wrap or font size changes, and wrap is now per-tab and can differ from what
@@ -156,8 +165,38 @@ export function diffViewFor(key: string, fallback: DiffViewMode): DiffViewMode {
   return own ?? fallback;
 }
 
+// Language mode. Reactive like wrapFor: they read `tabs`, so an editor that
+// resolves its grammar from them re-resolves the moment any caller (the
+// picker, the palette) changes the pin.
+export function pinnedLangFor(key: string): string | undefined {
+  return key ? tabs[key]?.lang : undefined;
+}
+
+export function autoLangFor(key: string): string | undefined {
+  return key ? tabs[key]?.autoLang : undefined;
+}
+
+// Pick a language by hand. The tab stops following detection.
+export function pinLangFor(key: string, lang: string) {
+  patchTabView(key, { lang });
+}
+
+// "Auto Detect": drop the pin, so the filename or detection decides again.
+export function unpinLangFor(key: string) {
+  if (!key || tabs[key]?.lang === undefined) return;
+  patchTabView(key, { lang: undefined });
+}
+
+export function setAutoLangFor(key: string, autoLang: string) {
+  if (!key || tabs[key]?.autoLang === autoLang) return;
+  patchTabView(key, { autoLang });
+}
+
 // Save As turns a synthetic `untitled:` key into a real path. Carrying the
 // state across keeps the tab from visibly resetting the moment it gains a name.
+// The whole entry moves, so the pin (`lang`) and the last detected language
+// (`autoLang`) both travel with it; deciding which of them still applies once
+// the file has an extension is the caller's business.
 export function renameTabView(from: string, to: string) {
   const state = from ? tabs[from] : undefined;
   if (!state || from === to) return;

@@ -66,6 +66,14 @@ export default defineConfig({
   server: {
     port: 5174,
     host: '127.0.0.1',
+    // Vite only serves files under the workspace root it finds, which here is
+    // server/ (its own package.json). Modules from src/ still load because the
+    // import graph vouches for them, but a worker is fetched by URL from
+    // `new URL(..., import.meta.url)`, so src/lib/lang-model.worker.ts got a 403
+    // and the browser reported it as a blocked MIME type. Allow the repo root.
+    fs: {
+      allow: [parentRoot],
+    },
     proxy: {
       // Dev loop: vite serves the client with HMR, node server owns the API.
       // The pty rule must come first — key order is match order.

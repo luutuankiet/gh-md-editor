@@ -2,12 +2,13 @@ import { LanguageDescription } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
 import type { Extension } from '@codemirror/state';
 import { dotenvLanguage } from './lang-dotenv';
+import { lookmlLanguage } from './lang-lookml';
 
 // One list, every consumer: the language picker's names, the picker's lookup,
 // filename auto-detection in the editor, and the grammar the diff views load.
 // Anything appended here has to be visible to all of them, or the picker and
 // the detector disagree about what exists.
-export const LANGS = [dotenvLanguage, ...languages];
+export const LANGS = [dotenvLanguage, lookmlLanguage, ...languages];
 
 // Extensions @codemirror/language-data ships no grammar for. Without an entry
 // here `matchFilename` returns null and the document renders as unhighlighted
@@ -24,6 +25,8 @@ const EXT_ALIAS: Record<string, string> = {
   mdx: 'md',
   jsonc: 'json',
   json5: 'json',
+  // Legacy LookML dashboards are YAML documents; only `.lkml` is LookML proper.
+  lookml: 'yaml',
 };
 
 // Resolve by real filename first so anything the library knows about wins, and

@@ -1,6 +1,6 @@
 // One word-wrap preference, shared by every text surface in the app: the
-// markdown cockpit, the code editor, both diff panes, the four merge panes and
-// the search results.
+// markdown cockpit, the code editor, both diff panes and the four merge panes.
+// The search results deliberately never wrap and do not read it.
 //
 // These used to be four independent localStorage keys with three different
 // value encodings, so turning wrap on in the diff left the code editor

@@ -1,6 +1,5 @@
 <script lang="ts">
   import { fileIconUrl } from '../../lib/file-icons';
-  import { wrapPref } from '../../lib/wrap-pref.svelte';
   // Workspace search, VS Code layout, backed by the streamed /api/search
   // ripgrep endpoint. Results are rendered as they arrive rather than after
   // the scan completes — the reason the endpoint streams at all.
@@ -310,7 +309,7 @@
       </button>
     </div>
   {/if}
-  <div class="sresults" class:wrapon={wrapPref.on}>
+  <div class="sresults">
     {#if error}
       <div class="smsg err">{error}</div>
     {:else if query.trim() && !running && files.length === 0}
@@ -591,7 +590,9 @@
      so a long match extends the scroll region instead of being cut with an
      ellipsis — the thing that made a hit in minified or deeply indented code
      unreadable. Every clip below has to be lifted for that to work: an
-     ellipsis anywhere inside leaves the scroller nothing to reveal. */
+     ellipsis anywhere inside leaves the scroller nothing to reveal. Results
+     never wrap, like the Explorer tree; the app-wide wrap preference does not
+     reach this panel. */
   .sresults { overflow-x: auto; }
   .sfile-head,
   .shit {
@@ -611,22 +612,6 @@
     text-overflow: clip;
   }
 
-  /* Wrap on: give up that horizontal scroller and let a long hit take as many
-     rows as it needs. Every max-content width above has to come back to 100%
-     first — leave one in place and the row keeps sizing to its longest line,
-     so there is nothing for the wrap to happen inside. */
-  .sresults.wrapon { overflow-x: hidden; }
-  .sresults.wrapon .sfile-head,
-  .sresults.wrapon .shit {
-    width: 100%;
-    min-width: 0;
-  }
-  .sresults.wrapon .shit-text {
-    flex: 1 1 auto;
-    min-width: 0;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-  }
   .sv-gap { flex: 1; }
   .sv-icon {
     line-height: 0;

@@ -6,6 +6,7 @@
   import { formatTokens } from '../../lib/token-estimate';
   import LspStatus from './LspStatus.svelte';
   import PythonInterpreter from './PythonInterpreter.svelte';
+  import SchemaPicker from './SchemaPicker.svelte';
 
   type Repo = {
     repo: string;
@@ -327,6 +328,7 @@
   <span class="gap"></span>
 
   <PythonInterpreter path={lspPath} />
+  <SchemaPicker path={lspPath} />
   <LspStatus path={lspPath} />
 
   {#if tokens > 0}

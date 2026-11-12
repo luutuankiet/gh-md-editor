@@ -4074,7 +4074,17 @@ function lspFromServer(s, msg) {
   if (msg.method === 'window/logMessage' || msg.method === 'window/showMessage') {
     lspLog(s, msg.method === 'window/logMessage' ? 'log' : 'message', msg.params?.message ?? '');
   }
-  if (msg.method === 'textDocument/publishDiagnostics' && lspUriIgnored(s, msg.params?.uri)) return;
+  if (msg.method === 'textDocument/publishDiagnostics') {
+    const uri = msg.params?.uri;
+    if (lspUriIgnored(s, uri)) return;
+    const empty = !msg.params?.diagnostics?.length;
+    if (s.detachClosed.has(uri)) {
+      s.detachClosed.delete(uri);
+      if (empty) return;
+    }
+    if (empty) s.diagCache.delete(uri);
+    else s.diagCache.set(uri, msg);
+  }
   lspSendBrowser(s, msg);
 }
 
@@ -4126,6 +4136,7 @@ function lspFromBrowser(s, sock, msg) {
   }
   if (msg.id !== undefined && m) s.browserPending.set(msg.id, m);
   lspSendServer(s, msg);
+  if (m === 'textDocument/didOpen' && uri && s.diagCache.has(uri)) lspSendBrowser(s, s.diagCache.get(uri));
   if (m === 'initialized' && LSP_KINDS[s.kind].pushOnInit) lspPushSettings(s, 'after initialized');
   if (m === 'initialized') void LSP_KINDS[s.kind].onSettings?.(s);
   if ((m === 'textDocument/didOpen' || m === 'textDocument/didChange') && uri) lspSchedulePull(s, uri);
@@ -4136,6 +4147,7 @@ function lspFromBrowser(s, sock, msg) {
 function lspDetach(s, sock, code, reason) {
   if (s.socket !== sock) return;
   for (const uri of sock.docs) {
+    s.detachClosed.add(uri);
     lspSendServer(s, { jsonrpc: '2.0', method: 'textDocument/didClose', params: { textDocument: { uri } } });
     clearTimeout(s.pullTimers.get(uri));
     s.pullTimers.delete(uri);
@@ -4193,6 +4205,12 @@ async function lspStart(kind, folderAbs, allowDownload, workspaceAbs) {
     bridgePending: new Map(),
     bridgeSeq: 0,
     pullTimers: new Map(),
+    // Last diagnostics per URI, replayed when a reattaching editor reopens a
+    // file: basedpyright does not publish again for a reopened, unchanged file.
+    diagCache: new Map(),
+    // URIs the bridge closed on detach; the server's empty publish for them is
+    // an artifact of the detach, not a fix, so it must not wipe the cache.
+    detachClosed: new Set(),
     forwarded: new Map(),
     progressTokens: new Set(),
     progress: new Map(),

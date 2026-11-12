@@ -414,6 +414,8 @@ const bulbGutter = gutter({
 
 const theme = EditorView.baseTheme({
   '.gmd-hover-problem': { padding: '2px 0' },
+  // Servers indent the "because" lines of a message; keep them on their own lines like VS Code.
+  '.gmd-hover-msg': { whiteSpace: 'pre-wrap' },
   '.gmd-hover-rule': { opacity: '0.75', marginLeft: '4px' },
   'a.gmd-hover-rule': { color: '#3794ff', textDecoration: 'none' },
   'a.gmd-hover-rule:hover': { textDecoration: 'underline' },

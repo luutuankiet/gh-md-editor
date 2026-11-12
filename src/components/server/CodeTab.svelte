@@ -1127,15 +1127,15 @@
 
   // --- sticky scroll ---------------------------------------------------------
   // The enclosing declarations, pinned over the top of the viewport once their
-  // own lines have scrolled past. Deliberately translucent: these rows cover
-  // real code, and being able to read what is underneath is what keeps them
-  // from feeling like the editor has lost two lines.
+  // own lines have scrolled past. Opaque and exactly one editor line tall, so
+  // a pinned row hides the line it covers cleanly instead of blending with it.
   const STICKY_ROW_H = 20;
   const STICKY_MAX = 5;
   let stickyRows = $state<{ line: number; html: string }[]>([]);
   let stickyKey = '';
   let stickyFont = $state('');
   let stickyPad = $state(8);
+  let stickyRowH = STICKY_ROW_H;
 
   const escHtml = (s: string) =>
     s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -1170,7 +1170,7 @@
     const box = vw.scrollDOM.getBoundingClientRect();
     // Probe below the rows already pinned, not at the very top: probing the
     // covered line makes a row hide itself and reappear on the next frame.
-    const probeY = box.top + stickyRows.length * STICKY_ROW_H + 2;
+    const probeY = box.top + stickyRows.length * stickyRowH + 2;
     const topPos = vw.posAtCoords({ x: box.left + 4, y: probeY }) ?? vw.viewport.from;
     const topLine = vw.state.doc.lineAt(topPos);
     const rows: { line: number; html: string }[] = [];
@@ -1191,7 +1191,13 @@
       // duplicated in CSS: the theme owns the font and the gutter owns its own
       // width, and a pinned row that does not line up reads as a rendering bug.
       const cs = getComputedStyle(vw.contentDOM);
-      stickyFont = `font-family:${cs.fontFamily};font-size:${cs.fontSize}`;
+      // Row height and surface come from the view as well: a fixed 20px row
+      // over 19.6px lines drifted a little more with every pinned row, and a
+      // hard-coded dark fill would be wrong under the light theme.
+      stickyRowH = vw.defaultLineHeight || STICKY_ROW_H;
+      const bg = getComputedStyle(vw.dom).backgroundColor;
+      stickyFont = `font-family:${cs.fontFamily};font-size:${cs.fontSize};--sticky-row-h:${stickyRowH}px` +
+        (bg && bg !== 'rgba(0, 0, 0, 0)' ? `;--sticky-bg:${bg}` : '');
       const gutters = vw.dom.querySelector('.cm-gutters') as HTMLElement | null;
       stickyPad = (gutters?.offsetWidth ?? 0) + 4;
     }
@@ -2322,22 +2328,23 @@
     display: block;
     width: 100%;
     box-sizing: border-box;
-    height: 20px;
-    line-height: 20px;
+    height: var(--sticky-row-h, 20px);
+    line-height: var(--sticky-row-h, 20px);
     text-align: left;
     white-space: pre;
     overflow: hidden;
     border: none;
-    /* Translucent on purpose — enough of the covered code shows through to
-       stay oriented, not so much that either layer becomes hard to read. */
-    background: rgba(30, 30, 30, 0.78);
+    /* Opaque, as in VS Code. A translucent row let the covered line's glyphs
+       show through at a slightly different height, which read as garbled
+       text rather than as context. */
+    background: var(--sticky-bg, #1e1e1e);
     color: #c5c8c6;
     font: inherit;
     cursor: pointer;
     pointer-events: auto;
   }
   .sticky-row:hover {
-    background: rgba(45, 45, 45, 0.92);
+    background: var(--sticky-hover, #2d2d2d);
   }
   /* The gutter underneath shows the numbers of the lines being covered, which
      are not these lines. Carry each pinned row's own number instead. */

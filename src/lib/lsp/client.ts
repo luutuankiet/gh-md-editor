@@ -18,7 +18,7 @@ import {
   type WorkspaceFile,
 } from '@codemirror/lsp-client';
 import type { Extension, Text } from '@codemirror/state';
-import type { EditorView } from '@codemirror/view';
+import { EditorView } from '@codemirror/view';
 import { errorLens } from './error-lens';
 
 // Not exported by the package; recovered from the method that returns it.
@@ -220,6 +220,72 @@ function sanitizeHTML(html: string): string {
   return doc.body.innerHTML;
 }
 
+// The package's hover is a bare div of server Markdown with no size limit, so
+// a long docstring became one unbounded line across the whole editor. Lay it
+// out as VS Code does: a bounded card that scrolls, the signature (the
+// server's leading code fence) on top above a rule, prose that wraps, and code
+// blocks that scroll sideways inside the card rather than widening it.
+// Colours come from the editor theme (`.cm-tooltip` in monokai-dimmed.ts);
+// only layout lives here, so the light theme gets the same shape.
+const hoverCard = EditorView.baseTheme({
+  '.cm-tooltip.cm-tooltip-hover:has(> .cm-lsp-hover-tooltip)': {
+    borderRadius: '4px',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.36)',
+  },
+  '.cm-tooltip .cm-lsp-hover-tooltip': {
+    boxSizing: 'border-box',
+    maxWidth: 'min(700px, calc(100vw - 48px))',
+    maxHeight: 'min(420px, 50vh)',
+    overflow: 'auto',
+    padding: '0',
+    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+    fontSize: '13px',
+    lineHeight: '1.45',
+    whiteSpace: 'normal',
+    overflowWrap: 'anywhere',
+  },
+  // `.cm-tooltip` in front outranks the package's own `p, pre { margin: 2px 0 }`.
+  '.cm-tooltip .cm-lsp-hover-tooltip > *, .cm-tooltip .cm-lsp-hover-tooltip p': { margin: '6px 10px' },
+  '.cm-lsp-hover-tooltip code': {
+    fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+    fontSize: '12px',
+  },
+  '.cm-lsp-hover-tooltip :not(pre) > code': {
+    padding: '0 3px',
+    borderRadius: '3px',
+    backgroundColor: 'rgba(128,128,128,0.17)',
+  },
+  '.cm-lsp-hover-tooltip pre': {
+    whiteSpace: 'pre',
+    overflowX: 'auto',
+    overflowWrap: 'normal',
+    lineHeight: '1.4',
+  },
+  '.cm-lsp-hover-tooltip pre code': { fontSize: '12.5px' },
+  // The signature wraps, as VS Code's does: it has to be read whole, and a
+  // long parameter list is the usual reason a hover is wide.
+  '.cm-lsp-hover-tooltip > pre:first-child': {
+    margin: '0',
+    padding: '6px 10px',
+    whiteSpace: 'pre-wrap',
+    overflowWrap: 'anywhere',
+    borderBottom: '1px solid rgba(128,128,128,0.35)',
+  },
+  '.cm-lsp-hover-tooltip > pre:only-child': { borderBottom: 'none' },
+  // Some servers put their own `---` under the signature; one rule is enough.
+  '.cm-lsp-hover-tooltip > pre:first-child + hr': { display: 'none' },
+  '.cm-lsp-hover-tooltip hr': {
+    border: 'none',
+    borderTop: '1px solid rgba(128,128,128,0.35)',
+    margin: '6px 0',
+  },
+  '.cm-lsp-hover-tooltip ul, .cm-lsp-hover-tooltip ol': { paddingLeft: '22px' },
+  '.cm-lsp-hover-tooltip h1, .cm-lsp-hover-tooltip h2, .cm-lsp-hover-tooltip h3, .cm-lsp-hover-tooltip h4': {
+    fontSize: '13px',
+    fontWeight: '600',
+  },
+});
+
 // --- connections -------------------------------------------------------------
 
 function wsTransport(ws: WebSocket): Transport {
@@ -271,6 +337,10 @@ function makeConn(entry: ServerEntry): Conn {
     extensions: [
       serverCompletion({ override: true }),
       hoverTooltips(),
+      // In an array on purpose: LSPClient keeps a config entry only when it is
+      // an array or has `.extension`, and the bare Prec wrapper baseTheme
+      // returns is neither, so it would be dropped without a warning.
+      [hoverCard],
       signatureHelp({ keymap: false }),
       serverDiagnostics(),
       errorLens,

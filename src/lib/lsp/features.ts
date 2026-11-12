@@ -309,7 +309,10 @@ const formatViaServer: Command = (view) => {
 
 // Opens the problems list on the problem under the cursor (the next one when
 // the cursor is on none). The lint panel keeps its own selection and only
-// moves it on a click, so the matching row is clicked for it.
+// moves it on a click, so the matching row is clicked for it. The panel is
+// mounted synchronously by openLintPanel, so the row exists here. After
+// editing this file reload the page: a hot-swapped copy of this module looks
+// like the click is ignored (the first row stays selected).
 const viewProblem: Command = (view) => {
   const head = view.state.selection.main.head;
   let at = -1, after = -1, i = 0;

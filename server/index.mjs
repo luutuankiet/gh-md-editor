@@ -1466,6 +1466,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/lsp/settings' && req.method === 'GET') return await apiLspSettingsGet(res, url.searchParams);
     if (url.pathname === '/api/lsp/settings' && req.method === 'PATCH') return await apiLspSettingsPatch(req, res);
     if (url.pathname === '/api/lsp/schema-catalog' && req.method === 'GET') return await apiSchemaCatalog(res);
+    if (url.pathname === '/api/lsp/schema-resolve' && req.method === 'GET') return await apiSchemaResolve(res, url.searchParams);
     if (url.pathname === '/api/python/interpreters' && req.method === 'GET') return await apiPyInterpreters(res, url.searchParams);
     if (url.pathname === '/api/python/interpreter' && req.method === 'POST') return await apiPySelect(req, res);
     if (url.pathname === '/api/version' && req.method === 'GET') return await apiVersion(res);
@@ -3312,6 +3313,8 @@ wss.on('connection', (ws, req) => {
 //   GET    /api/lsp/offer?path=  → {offers:[{kind, label, folder, available, install}]}
 //   GET    /api/lsp/log?id=x     → text: stderr, window/logMessage, bridge events
 //   GET    /api/lsp/schema-catalog → the SchemaStore catalog, cached on disk
+//   GET    /api/lsp/schema-resolve?workspace=&ref= → {url, name} for a schema
+//                                URL or a path (absolute, ~/, or workspace-relative)
 //   GET    /api/lsp/settings?workspace=  → stored settings plus the effective tree
 //   PATCH  /api/lsp/settings     {workspace, shared?, servers?, autoStart?}
 //                                (JSON merge patch; null deletes a key)
@@ -3648,6 +3651,55 @@ async function lspSchemaCatalog() {
     }
   })();
   return schemaCatalogFetch;
+}
+
+// A schema the user types into the picker: an http(s) or file URL, an
+// absolute path, a ~/ path, or a path relative to the workspace. Paths become
+// file:// URLs, the form both servers load. The schema must exist and, when it
+// is JSON, parse; its title (if any) names the pick. yaml-language-server also
+// reads schemas written in YAML, so a .yaml schema is only checked to exist.
+async function lspResolveSchemaRef(ref, workspaceAbs) {
+  const raw = String(ref ?? '').trim();
+  if (!raw) throw new Error('enter a schema URL or a file path');
+  let text;
+  let url;
+  if (/^https?:\/\//i.test(raw)) {
+    url = new URL(raw).href;
+    let r;
+    try {
+      r = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+    } catch (e) {
+      throw new Error(`could not fetch ${url}: ${e.cause?.message ?? e.message}`);
+    }
+    if (!r.ok) throw new Error(`${url} answered HTTP ${r.status}`);
+    text = await r.text();
+  } else if (/^[a-z][a-z0-9+.-]+:/i.test(raw) && !/^file:/i.test(raw) && !/^[a-z]:[\\/]/i.test(raw)) {
+    throw new Error('only http(s) URLs, file URLs and file paths are supported');
+  } else {
+    const abs = /^file:/i.test(raw)
+      ? fileURLToPath(raw)
+      : raw === '~' || raw.startsWith('~/')
+        ? path.join(os.homedir(), raw.slice(1))
+        : path.resolve(workspaceAbs, raw);
+    let st;
+    try {
+      st = await fs.stat(abs);
+    } catch {
+      throw new Error(`no such file: ${abs}`);
+    }
+    if (!st.isFile()) throw new Error(`not a file: ${abs}`);
+    text = await fs.readFile(abs, 'utf8');
+    url = pathToFileURL(abs).href;
+  }
+  let title = '';
+  try {
+    const j = JSON.parse(text);
+    if (typeof j?.title === 'string') title = j.title.trim();
+  } catch (e) {
+    if (/\.json$/i.test(new URL(url).pathname)) throw new Error(`not valid JSON: ${e.message}`);
+  }
+  const base = decodeURIComponent(new URL(url).pathname.split('/').pop() || url);
+  return { url, name: title ? `${title} (${base})` : base };
 }
 
 // json/schemaAssociations replaces the previous set on every send. The JSON
@@ -4664,6 +4716,16 @@ async function apiSchemaCatalog(res) {
     return sendJson(res, 200, await lspSchemaCatalog());
   } catch (e) {
     return sendJson(res, 502, { error: e.message });
+  }
+}
+
+async function apiSchemaResolve(res, params) {
+  const workspaceAbs = lspWorkspaceAbs(params.get('workspace'));
+  if (!workspaceAbs) return sendJson(res, 400, { error: 'workspace is outside the served root' });
+  try {
+    return sendJson(res, 200, await lspResolveSchemaRef(params.get('ref'), workspaceAbs));
+  } catch (e) {
+    return sendJson(res, 400, { error: e.message });
   }
 }
 

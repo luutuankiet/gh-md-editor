@@ -8,6 +8,9 @@
   type Pick = { url: string; name: string };
   type Item =
     | { kind: 'auto' }
+    | { kind: 'custom' }
+    | { kind: 'use'; ref: string }
+    | { kind: 'recent'; p: Pick }
     | { kind: 'entry'; e: Entry }
     | { kind: 'version'; label: string; url: string; name: string };
 
@@ -24,6 +27,11 @@
   const DBT_VERSIONS = ['1.5', '1.6', '1.7', 'latest', 'latest_fusion'];
   const CATALOG_KEY = 'gmd:schema-catalog';
   const CATALOG_MAX_AGE = 7 * 24 * 3600 * 1000;
+  // Schemas typed into the picker (URLs and paths), newest first, per browser.
+  const RECENT_KEY = 'gmd:schema-recent';
+  const RECENT_MAX = 8;
+  // What the input reads as a URL or a path rather than a catalog search.
+  const LOOKS_LIKE_REF = /^(https?:\/\/|file:|\/|~\/|\.{1,2}\/|[a-z]:[\\/])|\.(json|ya?ml)$/i;
 
   let isYaml = $derived(/\.ya?ml$/i.test(path));
   let isSchemaFile = $derived(/\.(ya?ml|jsonc?)$/i.test(path));
@@ -36,6 +44,23 @@
   let error = $state('');
   let busy = $state(false);
   let input = $state<HTMLInputElement | null>(null);
+  // The picker's second mode: the input takes a schema URL or path.
+  let entering = $state(false);
+  let recent = $state<Pick[]>([]);
+
+  function loadRecent() {
+    try {
+      const r = JSON.parse(localStorage.getItem(RECENT_KEY) ?? '[]');
+      recent = Array.isArray(r) ? r.filter((p) => typeof p?.url === 'string' && typeof p?.name === 'string') : [];
+    } catch {
+      recent = [];
+    }
+  }
+
+  function remember(p: Pick) {
+    recent = [p, ...recent.filter((r) => r.url !== p.url)].slice(0, RECENT_MAX);
+    try { localStorage.setItem(RECENT_KEY, JSON.stringify(recent)); } catch { /* quota */ }
+  }
   const probed = new Map<string, boolean>();
 
   async function loadCatalog() {
@@ -104,8 +129,16 @@
 
   let items = $derived.by((): Item[] => {
     if (step) return step.items;
+    if (entering) return query.trim() ? [{ kind: 'use', ref: query.trim() }] : [];
     const q = query.trim().toLowerCase();
     const words = q.split(/\s+/).filter(Boolean);
+    const mine = recent
+      .filter((p) => words.every((w) => `${p.name} ${p.url}`.toLowerCase().includes(w)))
+      .map((p): Item => ({ kind: 'recent', p }));
+    // A pick that is neither in the catalog nor recent (another browser made it).
+    const orphan = pick && !recent.some((r) => r.url === pick!.url) && !catalog.some((e) => e.url === pick!.url) && pick.url !== DBT_PROFILES.url && !q
+      ? [{ kind: 'recent', p: pick } as Item]
+      : [];
     const pool = isYaml ? [DBT_PROFILES, ...catalog] : catalog;
     const hits = pool
       .filter((e) => {
@@ -117,12 +150,15 @@
       .sort((a, b) => a.rank - b.rank)
       .slice(0, 200)
       .map(({ e }): Item => ({ kind: 'entry', e }));
-    return q ? hits : [{ kind: 'auto' }, ...hits];
+    if (q) return [...(LOOKS_LIKE_REF.test(query.trim()) ? [{ kind: 'use', ref: query.trim() } as Item] : []), ...mine, ...hits];
+    return [{ kind: 'auto' }, { kind: 'custom' }, ...orphan, ...mine, ...hits];
   });
 
   function show() {
     open = true;
     step = null;
+    entering = false;
+    loadRecent();
     query = '';
     error = '';
     active = 0;
@@ -186,8 +222,32 @@
     }
   }
 
+  // The server checks the URL or file and turns a path into a file:// URL.
+  async function useRef(ref: string) {
+    busy = true;
+    error = '';
+    let p: Pick;
+    try {
+      const r = await fetch(`/api/lsp/schema-resolve?workspace=${encodeURIComponent(currentWorkspace())}&ref=${encodeURIComponent(ref)}`, { cache: 'no-store' });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { error = j.error ?? `HTTP ${r.status}`; return; }
+      p = { url: j.url, name: j.name };
+    } catch (e) {
+      error = (e as Error).message;
+      return;
+    } finally {
+      busy = false;
+      setTimeout(() => input?.focus());
+    }
+    remember(p);
+    await save(p);
+  }
+
   function choose(it: Item) {
     if (it.kind === 'auto') void save(null);
+    else if (it.kind === 'custom') { entering = true; query = ''; active = 0; error = ''; input?.focus(); }
+    else if (it.kind === 'use') void useRef(it.ref);
+    else if (it.kind === 'recent') { remember(it.p); void save(it.p); }
     else if (it.kind === 'entry') void openVersions(it.e);
     else void save({ url: it.url, name: it.name });
   }
@@ -195,7 +255,7 @@
   function onKey(e: KeyboardEvent) {
     if (e.key === 'Escape') {
       e.preventDefault();
-      if (step) { step = null; query = ''; active = 0; } else open = false;
+      if (step || entering) { step = null; entering = false; query = ''; active = 0; error = ''; } else open = false;
       return;
     }
     if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(items.length - 1, active + 1); }
@@ -233,15 +293,22 @@
       bind:this={input}
       bind:value={query}
       onkeydown={onKey}
-      placeholder={step ? `Select a version of ${step.entry.name}` : `Select Schema (current: ${statusText})`}
+      placeholder={step
+        ? `Select a version of ${step.entry.name}`
+        : entering
+          ? 'Schema URL, absolute path, or path relative to the workspace'
+          : `Select Schema (current: ${statusText})`}
       spellcheck="false"
       autocomplete="off"
       readonly={!!step}
       disabled={busy}
     />
     {#if error}<div class="banner err">{error}</div>{/if}
+    {#if entering && !query.trim()}
+      <div class="banner hint">https://example.com/schema.json, /abs/path/schema.json, ~/schemas/x.json or schemas/x.json. Enter to use, Esc to go back.</div>
+    {/if}
     <div class="list" role="listbox">
-      {#each items as it, i (it.kind === 'entry' ? `e:${it.e.url}:${it.e.name}` : it.kind === 'version' ? `v:${it.url}` : it.kind)}
+      {#each items as it, i (it.kind === 'entry' ? `e:${it.e.url}:${it.e.name}` : it.kind === 'version' ? `v:${it.url}` : it.kind === 'recent' ? `r:${it.p.url}` : it.kind)}
         <button
           type="button"
           role="option"
@@ -255,6 +322,18 @@
             <span class="mark">{pick ? '' : '✓'}</span>
             <span class="label">Auto (SchemaStore)</span>
             <span class="detail">{auto ? auto.name : 'no match for this file'}</span>
+          {:else if it.kind === 'custom'}
+            <span class="mark"></span>
+            <span class="label">Enter schema URL or path...</span>
+            <span class="detail">http(s) URL, absolute path, or relative to the workspace</span>
+          {:else if it.kind === 'use'}
+            <span class="mark"></span>
+            <span class="label">Use</span>
+            <span class="detail">{it.ref}</span>
+          {:else if it.kind === 'recent'}
+            <span class="mark">{pick?.url === it.p.url ? '✓' : ''}</span>
+            <span class="label">{it.p.name}</span>
+            <span class="detail">{it.p.url.replace(/^file:\/\//, '')}</span>
           {:else if it.kind === 'entry'}
             <span class="mark">{(pick?.url ?? auto?.url) === it.e.url ? '✓' : ''}</span>
             <span class="label">{it.e.name}</span>
@@ -320,6 +399,7 @@
     padding: 5px 8px;
     font-size: 12px;
   }
+  .banner.hint { color: #9a9a9a; }
   .banner.err { color: #e5534b; border-left: 2px solid #e5534b; background: rgba(229, 83, 75, 0.08); }
   .list {
     max-height: 50vh;

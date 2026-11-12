@@ -10,7 +10,7 @@
 
 import { StateField, StateEffect, Prec, EditorState, Text, Compartment, type Extension } from '@codemirror/state';
 import {
-  EditorView, Decoration, WidgetType, keymap, lineNumbers, ViewPlugin,
+  EditorView, Decoration, WidgetType, keymap, lineNumbers, ViewPlugin, drawSelection, highlightActiveLine,
   type DecorationSet, type ViewUpdate,
 } from '@codemirror/view';
 import { history, historyKeymap, defaultKeymap } from '@codemirror/commands';
@@ -34,9 +34,21 @@ export interface PeekSpec {
 
 export const setPeek = StateEffect.define<PeekSpec | null>();
 
-// How many lines of code the left pane shows at once.
+// How many lines of code the left pane shows at once, until the user drags
+// the bottom edge; the dragged height (pixels of the body) is kept per browser.
 const ROWS = 18;
 const HEAD = 24;
+const GRIP = 5;
+const HEIGHT_KEY = 'gmd:peek-height';
+const MIN_BODY = 80;
+
+function maxBody() { return Math.max(MIN_BODY, Math.round(window.innerHeight * 0.8)); }
+
+function bodyHeight(lineHeight: number) {
+  const saved = Number(localStorage.getItem(HEIGHT_KEY));
+  const h = Number.isFinite(saved) && saved > 0 ? saved : Math.round(ROWS * lineHeight);
+  return Math.min(maxBody(), Math.max(MIN_BODY, h));
+}
 
 function openAt(path: string, line: number, word?: string) {
   window.dispatchEvent(new CustomEvent('gmd:open-request', { detail: { kind: 'file', path, line, word } }));
@@ -96,6 +108,9 @@ const innerTheme = EditorView.theme({
   '.cm-scroller': { overflow: 'auto' },
 });
 
+// Pixels of the box around the body: header, the resize grip, the borders.
+const CHROME = HEAD + GRIP + 4;
+
 interface Group { path: string; base: string; dir: string; hits: number[] }
 
 class Peek {
@@ -110,8 +125,7 @@ class Peek {
   constructor(readonly spec: PeekSpec, readonly st: UiState, readonly outer: EditorView) {
     const box = el('div', 'cm-peekW');
     box.contentEditable = 'false';
-    const bodyH = Math.round(ROWS * outer.defaultLineHeight);
-    box.style.height = `${HEAD + bodyH + 4}px`;
+    box.style.height = `${CHROME + bodyHeight(outer.defaultLineHeight)}px`;
     this.head = el('div', 'cm-peekHead');
     const body = el('div', 'cm-peekBody');
     const left = el('div', 'cm-peekCode');
@@ -132,7 +146,10 @@ class Peek {
       this.list.addEventListener('keydown', (e) => this.listKey(e));
       body.append(this.list);
     }
-    box.append(this.head, body);
+    const grip = el('div', 'cm-peekGrip');
+    grip.title = 'Drag to resize';
+    grip.addEventListener('pointerdown', (e) => this.drag(e, grip));
+    box.append(this.head, body, grip);
     this.dom = box;
 
     this.inner = new EditorView({
@@ -144,7 +161,32 @@ class Peek {
   }
 
   get estimatedHeight() {
-    return HEAD + Math.round(ROWS * this.outer.defaultLineHeight) + 4;
+    return CHROME + bodyHeight(this.outer.defaultLineHeight);
+  }
+
+  // Dragging the bottom edge sets the height of every peek from now on.
+  private drag(e: PointerEvent, grip: HTMLElement) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    grip.setPointerCapture(e.pointerId);
+    const y0 = e.clientY;
+    const h0 = this.dom.getBoundingClientRect().height - CHROME;
+    let body = h0;
+    const move = (m: PointerEvent) => {
+      body = Math.min(maxBody(), Math.max(MIN_BODY, Math.round(h0 + m.clientY - y0)));
+      this.dom.style.height = `${CHROME + body}px`;
+    };
+    const up = () => {
+      grip.removeEventListener('pointermove', move);
+      grip.removeEventListener('pointerup', up);
+      grip.removeEventListener('pointercancel', up);
+      try { localStorage.setItem(HEIGHT_KEY, String(body)); } catch { /* quota */ }
+      this.outer.requestMeasure();
+      this.inner?.requestMeasure();
+    };
+    grip.addEventListener('pointermove', move);
+    grip.addEventListener('pointerup', up);
+    grip.addEventListener('pointercancel', up);
   }
 
   close() {
@@ -372,6 +414,10 @@ class Peek {
     return [
       lineNumbers(),
       history(),
+      // The outer editor's drawSelection hides the native caret and selection
+      // in every .cm-line below it, these included; this pane draws its own.
+      drawSelection(),
+      highlightActiveLine(),
       this.spec.theme,
       innerTheme,
       lang,
@@ -476,7 +522,7 @@ class PeekWidget extends WidgetType {
   private peek: Peek | null = null;
   constructor(readonly spec: PeekSpec) { super(); }
   eq(o: PeekWidget) { return o.spec === this.spec; }
-  get estimatedHeight() { return HEAD + Math.round(ROWS * 19) + 4; }
+  get estimatedHeight() { return CHROME + bodyHeight(19); }
   toDOM(view: EditorView) {
     let st = ui.get(this.spec);
     const first = !st;
@@ -555,8 +601,8 @@ const theme = EditorView.baseTheme({
     whiteSpace: 'normal',
     cursor: 'default',
   },
-  '&dark .cm-peekW': { backgroundColor: '#252526', color: '#cccccc' },
-  '&light .cm-peekW': { backgroundColor: '#f3f3f3', color: '#333333' },
+  '&dark .cm-peekW': { backgroundColor: '#252526', color: '#cccccc', colorScheme: 'dark' },
+  '&light .cm-peekW': { backgroundColor: '#f3f3f3', color: '#333333', colorScheme: 'light' },
   '.cm-peekHead': {
     flex: `0 0 ${HEAD}px`,
     display: 'flex',
@@ -576,9 +622,8 @@ const theme = EditorView.baseTheme({
   '.cm-peekClose:hover': { opacity: '1' },
   '.cm-peekBody': { flex: '1 1 auto', display: 'flex', minHeight: '0' },
   '.cm-peekCode': { flex: '1 1 65%', minWidth: '0', height: '100%' },
-  // Tinted, so the borrowed code reads as a window onto another place.
-  '&dark .cm-peekCode .cm-editor, &dark .cm-peekCode .cm-gutters': { backgroundColor: '#001b2e' },
-  '&light .cm-peekCode .cm-editor, &light .cm-peekCode .cm-gutters': { backgroundColor: '#eaf3fb' },
+  // The code keeps the editor theme's own background, so it reads exactly like
+  // the file around it; the blue borders and header frame it as a peek.
   '.cm-peekCode .cm-editor': { height: '100%' },
   '.cm-peekCode .cm-editor.cm-focused': { outline: 'none' },
   '&dark .cm-peekCode .cm-peekTarget': { backgroundColor: 'rgba(255, 255, 255, 0.07)' },
@@ -587,6 +632,9 @@ const theme = EditorView.baseTheme({
     backgroundColor: 'rgba(234, 92, 0, 0.33)',
     outline: '1px solid #f38518',
   },
+  '.cm-peekGrip': { flex: `0 0 ${GRIP}px`, cursor: 'ns-resize', touchAction: 'none' },
+  '&dark .cm-peekGrip:hover': { backgroundColor: accent },
+  '&light .cm-peekGrip:hover': { backgroundColor: accent },
   '.cm-peekList': {
     flex: '0 0 35%',
     maxWidth: '480px',

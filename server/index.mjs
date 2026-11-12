@@ -1464,6 +1464,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/lsp/log' && req.method === 'GET') return await apiLspLog(res, url.searchParams.get('id'));
     if (url.pathname === '/api/lsp/settings' && req.method === 'GET') return await apiLspSettingsGet(res, url.searchParams);
     if (url.pathname === '/api/lsp/settings' && req.method === 'PATCH') return await apiLspSettingsPatch(req, res);
+    if (url.pathname === '/api/python/interpreters' && req.method === 'GET') return await apiPyInterpreters(res, url.searchParams);
+    if (url.pathname === '/api/python/interpreter' && req.method === 'POST') return await apiPySelect(req, res);
     if (url.pathname === '/api/version' && req.method === 'GET') return await apiVersion(res);
     if (url.pathname === '/api/upgrade' && req.method === 'POST') return apiUpgrade(res);
     if (url.pathname.startsWith('/api/')) return sendJson(res, 404, { error: 'unknown endpoint' });
@@ -3363,6 +3365,12 @@ const LSP_KINDS = {
     download: { via: 'uvx', bin: 'uvx', args: ['ty', 'server'], package: 'ty' },
     sections: ['ty'],
     defaults: {},
+    derive({ shared }) {
+      const interpreter = shared?.python?.interpreter;
+      return typeof interpreter === 'string' && interpreter
+        ? { ty: { configuration: { environment: { python: interpreter } } } }
+        : {};
+    },
   },
   basedpyright: {
     label: 'Python (basedpyright)',
@@ -4348,15 +4356,256 @@ async function apiLspSettingsPatch(req, res) {
   } catch (e) {
     return sendJson(res, 500, { error: `could not save settings: ${e.message}` });
   }
-  // Every live server of this workspace gets the new tree: pushed for those
-  // that read the push (JSON), and a nudge to pull again for the rest.
+  await lspApplySettings(workspaceAbs);
+  return sendJson(res, 200, await lspSettingsView(workspaceAbs));
+}
+
+// Every live server of this workspace gets the new tree: pushed for those
+// that read the push (JSON), and a nudge to pull again for the rest.
+async function lspApplySettings(workspaceAbs) {
   const settings = await lspReadSettings(workspaceAbs);
   for (const s of lspServers.values()) {
     if (s.workspaceAbs !== workspaceAbs || s.state === 'exited' || s.state === 'stopping') continue;
     s.settings = lspEffectiveSettings(s.kind, settings, s.folderAbs, s.ignored);
     lspPushSettings(s, 'settings changed');
   }
-  return sendJson(res, 200, await lspSettingsView(workspaceAbs));
+}
+
+// --- Python interpreter picker -------------------------------------------------
+//   GET  /api/python/interpreters?workspace=  → {selected, current, auto,
+//        candidates:[{path, display, version, name, kind, label}], warning}
+//   POST /api/python/interpreter {workspace, path|null} → same view; saves the
+//        absolute path in shared.python.interpreter and pushes it live.
+// Discovery is file checks only. The one process it runs is `<python>
+// --version` with a short timeout, for interpreters with no version on disk.
+
+const PY_BIN = process.platform === 'win32' ? ['Scripts/python.exe'] : ['bin/python', 'bin/python3'];
+
+async function pyIsFile(p) {
+  try { return (await fs.stat(p)).isFile(); } catch { return false; }
+}
+
+// A venv folder → its interpreter, or null when it holds none.
+async function pyVenvInterpreter(dir) {
+  for (const b of PY_BIN) {
+    const p = path.join(dir, b);
+    if (await pyIsFile(p)) return p;
+  }
+  return null;
+}
+
+async function pyVenvVersion(dir) {
+  try {
+    const cfg = await fs.readFile(path.join(dir, 'pyvenv.cfg'), 'utf8');
+    const m = cfg.match(/^\s*(?:version_info|version)\s*=\s*([0-9][^\s]*)/m);
+    return m ? m[1] : '';
+  } catch { return ''; }
+}
+
+async function pyListDirs(dir) {
+  try {
+    return (await fs.readdir(dir, { withFileTypes: true }))
+      .filter((d) => d.isDirectory() || d.isSymbolicLink())
+      .map((d) => path.join(dir, d.name));
+  } catch { return []; }
+}
+
+function pyRunVersion(bin) {
+  return new Promise((resolve) => {
+    let out = '';
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    let p;
+    try {
+      p = spawn(bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch { return finish(''); }
+    const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* gone */ } finish(''); }, 1500);
+    p.stdout.on('data', (d) => { out += d; });
+    p.stderr.on('data', (d) => { out += d; });
+    p.on('error', () => { clearTimeout(t); finish(''); });
+    p.on('close', () => { clearTimeout(t); finish((out.match(/Python\s+([0-9][^\s]*)/) ?? [])[1] ?? ''); });
+  });
+}
+
+function pyDisplay(abs, workspaceAbs) {
+  if (abs.startsWith(workspaceAbs + path.sep)) return './' + path.relative(workspaceAbs, abs).split(path.sep).join('/');
+  const home = os.homedir();
+  if (home && abs.startsWith(home + path.sep)) return '~/' + path.relative(home, abs).split(path.sep).join('/');
+  return abs;
+}
+
+function pyLabel(c) {
+  const v = c.version || 'Python';
+  return c.name ? `${v} ('${c.name}': ${c.kind})` : `${v} (${c.kind})`;
+}
+
+// Workspace venvs first, then globals; the same order VS Code ranks them in.
+async function pyCandidates(workspaceAbs) {
+  const home = os.homedir();
+  const env = process.env;
+  const found = []; // {path, version, name, kind}
+  const addVenv = async (dir, kind, name) => {
+    const bin = await pyVenvInterpreter(dir);
+    if (bin) found.push({ path: bin, version: await pyVenvVersion(dir), name: name ?? path.basename(dir), kind });
+  };
+
+  // Workspace: any folder with pyvenv.cfg at the top, plus .venv/venv one level down.
+  const skip = new Set(['node_modules', '.git']);
+  for (const d of await pyListDirs(workspaceAbs)) {
+    if (skip.has(path.basename(d))) continue;
+    if (await pyIsFile(path.join(d, 'pyvenv.cfg'))) { await addVenv(d, 'venv', path.basename(d)); continue; }
+    for (const sub of ['.venv', 'venv']) {
+      const inner = path.join(d, sub);
+      if (await pyIsFile(path.join(inner, 'pyvenv.cfg'))) await addVenv(inner, 'venv', path.relative(workspaceAbs, inner).split(path.sep).join('/'));
+    }
+  }
+  if (env.VIRTUAL_ENV) await addVenv(env.VIRTUAL_ENV, 'venv');
+  if (env.UV_PROJECT_ENVIRONMENT) await addVenv(path.resolve(workspaceAbs, env.UV_PROJECT_ENVIRONMENT), 'uv');
+
+  if (home) {
+    for (const d of await pyListDirs(path.join(home, '.cache', 'pypoetry', 'virtualenvs'))) await addVenv(d, 'poetry');
+    const uvPythons = env.UV_PYTHON_INSTALL_DIR || path.join(env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'uv', 'python');
+    for (const d of await pyListDirs(uvPythons)) {
+      const bin = (await pyIsFile(path.join(d, 'bin', 'python3'))) ? path.join(d, 'bin', 'python3') : await pyVenvInterpreter(d);
+      if (bin) found.push({ path: bin, version: (path.basename(d).match(/-(\d+\.\d+\.\d+[^-]*)-/) ?? [])[1] ?? '', name: '', kind: 'uv' });
+    }
+    const pyenvRoot = env.PYENV_ROOT || path.join(home, '.pyenv');
+    for (const d of await pyListDirs(path.join(pyenvRoot, 'versions'))) {
+      const bin = await pyVenvInterpreter(d);
+      if (bin) found.push({ path: bin, version: /^\d/.test(path.basename(d)) ? path.basename(d) : await pyVenvVersion(d), name: path.basename(d), kind: 'pyenv' });
+    }
+    try {
+      const list = await fs.readFile(path.join(home, '.conda', 'environments.txt'), 'utf8');
+      for (const line of list.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)) {
+        const bin = await pyVenvInterpreter(line);
+        if (bin) found.push({ path: bin, version: '', name: path.basename(line), kind: 'conda' });
+      }
+    } catch { /* no conda */ }
+    for (const root of [env.WORKON_HOME, path.join(home, '.virtualenvs'), path.join(home, '.local', 'share', 'virtualenvs')]) {
+      if (root) for (const d of await pyListDirs(root)) await addVenv(d, 'virtualenv');
+    }
+  }
+
+  // Every python3 on PATH, deduped by what the link resolves to.
+  const seenReal = new Set();
+  for (const dir of (env.PATH || '').split(path.delimiter).filter(Boolean)) {
+    for (const name of ['python3', 'python']) {
+      const p = path.join(dir, name);
+      if (!(await pyIsFile(p))) continue;
+      let real = p;
+      try { real = await fs.realpath(p); } catch { /* keep p */ }
+      if (seenReal.has(real)) continue;
+      seenReal.add(real);
+      found.push({ path: p, version: '', name: '', kind: 'global' });
+    }
+  }
+
+  // A venv's python links to its base interpreter, so the venv path itself is the identity.
+  const seen = new Set();
+  const out = [];
+  for (const c of found) {
+    if (seen.has(c.path)) continue;
+    seen.add(c.path);
+    out.push(c);
+    if (out.length >= 40) break;
+  }
+  await Promise.all(out.map(async (c) => { if (!c.version) c.version = await pyRunVersion(c.path); }));
+  return out.map((c) => ({ ...c, display: pyDisplay(c.path, workspaceAbs), label: pyLabel(c) }));
+}
+
+// pyrightconfig.json or pyproject.toml [tool.pyright]/[tool.basedpyright]
+// setting venv/venvPath wins over python.pythonPath, so the picker would do nothing.
+async function pyConfigWarning(workspaceAbs) {
+  const keys = [];
+  try {
+    const raw = await fs.readFile(path.join(workspaceAbs, 'pyrightconfig.json'), 'utf8');
+    // pyright accepts comments in this file.
+    const json = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''));
+    for (const k of ['venvPath', 'venv']) if (isPlainObj(json) && json[k] !== undefined) keys.push(`pyrightconfig.json sets ${k}`);
+  } catch { /* none or unreadable */ }
+  try {
+    const raw = await fs.readFile(path.join(workspaceAbs, 'pyproject.toml'), 'utf8');
+    let table = '';
+    for (const line of raw.split(/\r?\n/)) {
+      const h = line.match(/^\s*\[([^\]]+)\]\s*(#.*)?$/);
+      if (h) { table = h[1].trim(); continue; }
+      if (table !== 'tool.pyright' && table !== 'tool.basedpyright') continue;
+      const m = line.match(/^\s*(venvPath|venv)\s*=/);
+      if (m) keys.push(`pyproject.toml [${table}] sets ${m[1]}`);
+    }
+  } catch { /* none */ }
+  return keys.length ? `${keys.join('; ')}. That setting takes priority over the interpreter chosen here.` : null;
+}
+
+async function pyInterpreterView(workspaceAbs) {
+  const [settings, candidates, warning] = await Promise.all([
+    lspReadSettings(workspaceAbs), pyCandidates(workspaceAbs), pyConfigWarning(workspaceAbs),
+  ]);
+  const selected = typeof settings.shared?.python?.interpreter === 'string' ? settings.shared.python.interpreter : null;
+  let current = null;
+  if (selected) {
+    current = candidates.find((c) => c.path === selected) ?? null;
+    if (!current) {
+      const dir = path.dirname(path.dirname(selected));
+      const venv = await pyIsFile(path.join(dir, 'pyvenv.cfg'));
+      const c = { path: selected, version: venv ? await pyVenvVersion(dir) : '', name: venv ? path.basename(dir) : '', kind: venv ? 'venv' : 'custom' };
+      if (!c.version) c.version = await pyRunVersion(selected);
+      current = { ...c, display: pyDisplay(selected, workspaceAbs), label: pyLabel(c) };
+    }
+  } else {
+    // Nothing chosen: basedpyright uses <workspace>/.venv when present, else PATH.
+    current = candidates.find((c) => c.path.startsWith(path.join(workspaceAbs, '.venv') + path.sep))
+      ?? candidates.find((c) => c.kind === 'global') ?? null;
+  }
+  return { workspace: toClientPath(workspaceAbs), selected, auto: !selected, current, candidates, warning };
+}
+
+async function apiPyInterpreters(res, params) {
+  const workspaceAbs = lspWorkspaceAbs(params.get('workspace'));
+  if (!workspaceAbs) return sendJson(res, 400, { error: 'workspace is outside the served root' });
+  return sendJson(res, 200, await pyInterpreterView(workspaceAbs));
+}
+
+async function apiPySelect(req, res) {
+  const body = await lspReadJson(req, res);
+  if (!body) return;
+  if (!isPlainObj(body)) return sendJson(res, 400, { error: 'body must be a JSON object' });
+  const unknown = Object.keys(body).filter((k) => !['workspace', 'path'].includes(k));
+  if (unknown.length) return sendJson(res, 400, { error: `unknown field: ${unknown.join(', ')}` });
+  const workspaceAbs = lspWorkspaceAbs(body.workspace);
+  if (!workspaceAbs) return sendJson(res, 400, { error: 'workspace is outside the served root' });
+  let interpreter = null;
+  if (body.path !== null && body.path !== undefined) {
+    if (typeof body.path !== 'string' || !body.path.trim()) return sendJson(res, 400, { error: 'path must be a string or null' });
+    // pyright rejects a bare `python`, so everything is made absolute here:
+    // ~ is the home folder, a relative path is against the workspace, and a
+    // venv folder stands for its interpreter.
+    // A bare name such as python3 is looked up on PATH.
+    let p = body.path.trim();
+    if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
+    if (!/[\\/]/.test(p)) {
+      for (const dir of (process.env.PATH || '').split(path.delimiter).filter(Boolean)) {
+        if (await pyIsFile(path.join(dir, p))) { p = path.join(dir, p); break; }
+      }
+    }
+    p = path.resolve(workspaceAbs, p);
+    let st = null;
+    try { st = await fs.stat(p); } catch { /* missing */ }
+    if (st?.isDirectory()) p = await pyVenvInterpreter(p) ?? '';
+    else if (!st?.isFile()) p = '';
+    if (!p) return sendJson(res, 400, { error: `no Python interpreter at ${body.path}` });
+    interpreter = p;
+  }
+  try {
+    await lspUpdateSettings(workspaceAbs, (cur) => {
+      cur.shared = lspMergePatch(cur.shared, { python: { interpreter } });
+      return cur;
+    });
+  } catch (e) {
+    return sendJson(res, 500, { error: `could not save settings: ${e.message}` });
+  }
+  await lspApplySettings(workspaceAbs);
+  return sendJson(res, 200, await pyInterpreterView(workspaceAbs));
 }
 
 // A newer attach replaces the older socket; the server itself never notices.

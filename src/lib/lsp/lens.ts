@@ -36,7 +36,24 @@ interface Pos { line: number; character: number }
 interface RangeL { start: Pos; end: Pos }
 interface DocSymbol { name: string; kind: number; range: RangeL; selectionRange: RangeL; children?: DocSymbol[] }
 interface SymInfo { name: string; kind: number; location: { range: RangeL } }
-interface Sym { name: string; line: number; at: LspPosition }
+// `exact` is false when the server gave only a whole range (flat
+// SymbolInformation, as basedpyright sends): its start is the `def` or the
+// decorator, where asking for references finds nothing.
+interface Sym { name: string; line: number; at: LspPosition; exact: boolean }
+
+// Finds the symbol's name on or after `at`, scanning a few lines forward to
+// get past decorators. Falls back to `at` when the name is not found.
+function nameAt(doc: Text, at: LspPosition, name: string): LspPosition {
+  const word = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(^|[^\\w$])(${word})(?![\\w$])`);
+  for (let i = 0; i < 6 && at.line + 1 + i <= doc.lines; i++) {
+    const text = doc.line(at.line + 1 + i).text;
+    const from = i === 0 ? at.character : 0;
+    const m = re.exec(text.slice(from));
+    if (m) return { line: at.line + i, character: from + m.index + m[1].length };
+  }
+  return at;
+}
 
 function flatten(raw: unknown): Sym[] {
   const out: Sym[] = [];
@@ -44,12 +61,12 @@ function flatten(raw: unknown): Sym[] {
     for (const s of list) {
       if (!s || typeof s !== 'object') continue;
       if ('location' in s) {
-        if (KINDS.has(s.kind)) out.push({ name: s.name, line: s.location.range.start.line + 1, at: s.location.range.start });
+        if (KINDS.has(s.kind)) out.push({ name: s.name, line: s.location.range.start.line + 1, at: s.location.range.start, exact: false });
         continue;
       }
       // The row sits above the full range, which in Python starts at the
       // decorator, and the count is asked at the name itself.
-      if (KINDS.has(s.kind)) out.push({ name: s.name, line: s.range.start.line + 1, at: s.selectionRange.start });
+      if (KINDS.has(s.kind)) out.push({ name: s.name, line: s.range.start.line + 1, at: s.selectionRange.start, exact: true });
       if (s.children) walk(s.children);
     }
   };
@@ -154,18 +171,20 @@ export function referencesLens(opts: LensOpts): Extension {
       const vis = this.view.visibleRanges;
       const first = vis.length ? doc.lineAt(vis[0].from).number : 1;
       const last = vis.length ? doc.lineAt(vis[vis.length - 1].to).number : doc.lines;
-      let per = this.counts.get(doc);
-      if (!per) this.counts.set(doc, (per = new Map()));
+      let map = this.counts.get(doc);
+      if (!map) this.counts.set(doc, (map = new Map()));
+      const per = map;
       const seen = new Set<number>();
       const rows: Row[] = [];
       const jobs: Promise<void>[] = [];
       for (const s of syms) {
         if (s.line < first - 1 || s.line > last + 1 || seen.has(s.line)) continue;
         seen.add(s.line);
-        const key = `${s.at.line}:${s.at.character}`;
+        const at = s.exact ? s.at : nameAt(doc, s.at, s.name);
+        const key = `${at.line}:${at.character}`;
         let p = per.get(key);
         if (!p) {
-          p = lspReferencesAt(opts.conn, opts.uri, s.at, false).catch(() => null);
+          p = lspReferencesAt(opts.conn, opts.uri, at, false).catch(() => null);
           per.set(key, p);
         }
         jobs.push(p.then((locs) => {
@@ -173,7 +192,7 @@ export function referencesLens(opts: LensOpts): Extension {
             per.delete(key);
             this.sawEmpty = true;
           }
-          if (locs) rows.push({ line: s.line, title: plural(locs.length), name: s.name, at: s.at, locs });
+          if (locs) rows.push({ line: s.line, title: plural(locs.length), name: s.name, at, locs });
         }));
       }
       await Promise.all(jobs);

@@ -128,7 +128,7 @@ try {
 } catch { /* no prebuilt for this platform — fall back below */ }
 if (!rgBin && onPath('rg')) rgBin = 'rg';
 import { spawn, spawnSync } from 'node:child_process';
-import { accessSync, constants as fsConstants, createReadStream, createWriteStream, closeSync, mkdirSync, openSync, statSync, promises as fs } from 'node:fs';
+import { accessSync, constants as fsConstants, createReadStream, createWriteStream, closeSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync, promises as fs } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -3488,17 +3488,59 @@ function lspSchemaPicks(shared, lang) {
 }
 
 // dbt's profiles.yml is not in the SchemaStore catalog; dbt-jsonschema ships
-// one schema for it, only in its latest_fusion folder.
+// one schema for it, only in its latest_fusion folder. That file has no
+// properties and additionalProperties false, so it rejects every profile
+// name. A small local wrapper supplies the profiles.yml shape (profile name ->
+// target + outputs) and takes the connection fields from the upstream file
+// through a remote $ref; the language server fetches that file itself.
 const DBT_PROFILES_SCHEMA = 'https://raw.githubusercontent.com/dbt-labs/dbt-jsonschema/main/schemas/latest_fusion/profiles-latest-fusion.json';
+const DBT_PROFILES_WRAPPER = {
+  $schema: 'http://json-schema.org/draft-07/schema#',
+  title: 'dbt profiles.yml',
+  type: 'object',
+  properties: {
+    config: { type: 'object', description: 'Global dbt settings (legacy location; dbt 1.8+ reads these from dbt_project.yml flags).' },
+  },
+  additionalProperties: {
+    type: 'object',
+    description: 'A dbt profile. dbt_project.yml selects it with `profile:`.',
+    required: ['outputs'],
+    properties: {
+      target: { type: 'string', description: 'The output dbt uses when no --target is given.' },
+      outputs: {
+        type: 'object',
+        description: 'Named connection targets, such as dev and prod.',
+        additionalProperties: { $ref: `${DBT_PROFILES_SCHEMA}#/definitions/DbConfig` },
+      },
+    },
+  },
+};
+
+// Written on demand under the config home, so it needs no shipped file.
+function lspDbtProfilesSchemaUrl() {
+  const file = path.join(LSP_CONFIG_HOME, 'cache', 'dbt-profiles.schema.json');
+  const text = JSON.stringify(DBT_PROFILES_WRAPPER, null, 2);
+  try {
+    if (readFileSync(file, 'utf8') !== text) throw new Error('stale');
+  } catch {
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, text, 'utf8');
+  }
+  return pathToFileURL(file).href;
+}
 
 // yaml.schemas is {schemaUrl: [patterns]}. Several matching entries are
 // combined, so the built-in profiles.yml mapping steps aside once any
-// profiles.yml has a choice of its own.
+// profiles.yml has a choice of its own. A pick of the upstream profiles file
+// is redirected to the wrapper for the same reason the default is.
 function lspYamlSchemas(picks) {
   const out = {};
-  for (const [file, url] of Object.entries(picks)) (out[url] ??= []).push(`/${file}`);
+  for (const [file, picked] of Object.entries(picks)) {
+    const url = picked === DBT_PROFILES_SCHEMA ? lspDbtProfilesSchemaUrl() : picked;
+    (out[url] ??= []).push(`/${file}`);
+  }
   if (!Object.keys(picks).some((f) => /(^|\/)profiles\.ya?ml$/.test(f))) {
-    (out[DBT_PROFILES_SCHEMA] ??= []).push('profiles.yml', 'profiles.yaml');
+    (out[lspDbtProfilesSchemaUrl()] ??= []).push('profiles.yml', 'profiles.yaml');
   }
   return out;
 }

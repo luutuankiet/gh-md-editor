@@ -17,6 +17,7 @@ import {
 import { pathForUri, type Conn } from './client';
 import { diagnosticsFor, onDiagnostics, publish, type LspDiagnostic, type LspRange } from './diag-store.svelte';
 import { lineHasDiagnostic } from './error-lens';
+import { overviewRuler } from './overview-ruler';
 import { liveText, setTabText, tabOwns } from './doc-share';
 
 type TextEdit = { range: LspRange; newText: string };
@@ -505,6 +506,7 @@ export function lspFeatures(serverId: string): LSPClientExtension {
       storeSync(serverId),
       // Squiggles only; the hover card below replaces lint's own tooltip.
       linter(null, { tooltipFilter: () => [] }),
+      overviewRuler,
       hoverCard,
       bulbGutter,
       theme,

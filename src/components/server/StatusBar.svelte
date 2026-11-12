@@ -5,6 +5,7 @@
   // is either a fact or a button — nothing decorative.
   import { formatTokens } from '../../lib/token-estimate';
   import LspStatus from './LspStatus.svelte';
+  import PythonInterpreter from './PythonInterpreter.svelte';
 
   type Repo = {
     repo: string;
@@ -325,6 +326,7 @@
 
   <span class="gap"></span>
 
+  <PythonInterpreter path={lspPath} />
   <LspStatus path={lspPath} />
 
   {#if tokens > 0}

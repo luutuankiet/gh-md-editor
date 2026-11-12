@@ -17,7 +17,7 @@ import {
 import { pathForUri, type Conn } from './client';
 import { diagnosticsFor, onDiagnostics, publish, type LspDiagnostic, type LspRange } from './diag-store.svelte';
 import { lineHasDiagnostic } from './error-lens';
-import { tabOwns } from './doc-share';
+import { liveText, setTabText, tabOwns } from './doc-share';
 
 type TextEdit = { range: LspRange; newText: string };
 type LspCommand = { title: string; command: string; arguments?: unknown[] };
@@ -128,6 +128,18 @@ function offsetIn(doc: Text, p: { line: number; character: number }): number {
   return Math.min(line.from + p.character, line.to);
 }
 
+/** Applies LSP text edits to a whole file's text, keeping its line endings. */
+function editText(content: string, edits: TextEdit[]): string {
+  const crlf = content.includes('\r\n');
+  const doc = Text.of(content.split(/\r?\n/));
+  const changes = edits
+    .map((e) => ({ from: offsetIn(doc, e.range.start), to: offsetIn(doc, e.range.end), insert: e.newText }))
+    .sort((a, b) => b.from - a.from);
+  let text = doc.toString();
+  for (const c of changes) text = text.slice(0, c.from) + c.insert + text.slice(c.to);
+  return crlf ? text.replace(/\r?\n/g, '\r\n') : text;
+}
+
 /** Applies an edit to open editors and, through the file API, to closed files. */
 export async function applyWorkspaceEdit(client: LSPClient, edit: WorkspaceEdit): Promise<{ applied: boolean; failureReason?: string }> {
   const per: [string, TextEdit[]][] = [];
@@ -154,18 +166,17 @@ export async function applyWorkspaceEdit(client: LSPClient, edit: WorkspaceEdit)
       });
       continue;
     }
-    if (tabOwns(path)) { failed.push(`${path} (open in a tab that is not showing)`); continue; }
+    // A tab open in the background has no mounted editor: edit its buffer,
+    // which marks the tab dirty, as VS Code does for an unfocused editor.
+    if (tabOwns(path)) {
+      const buf = liveText(path);
+      if (buf == null || !setTabText(path, editText(buf, edits))) failed.push(`${path} (open in a tab that is not showing)`);
+      continue;
+    }
     try {
       const got = (await (await fetch(`/api/file?path=${encodeURIComponent(path)}`)).json()) as { content?: string; mtimeMs?: number };
       if (typeof got.content !== 'string') { failed.push(path); continue; }
-      const crlf = got.content.includes('\r\n');
-      const doc = Text.of(got.content.split(/\r?\n/));
-      const changes = edits
-        .map((e) => ({ from: offsetIn(doc, e.range.start), to: offsetIn(doc, e.range.end), insert: e.newText }))
-        .sort((a, b) => b.from - a.from);
-      let text = doc.toString();
-      for (const c of changes) text = text.slice(0, c.from) + c.insert + text.slice(c.to);
-      if (crlf) text = text.replace(/\r?\n/g, '\r\n');
+      const text = editText(got.content, edits);
       const r = await fetch('/api/file', {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },

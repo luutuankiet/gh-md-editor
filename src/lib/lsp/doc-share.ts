@@ -56,6 +56,11 @@ export function tabOwns(path: string): boolean {
   return hasMain(path) || host?.content(path) != null;
 }
 
+/** Replaces the buffer of the open tab for `path`; false when no tab has it. */
+export function setTabText(path: string, text: string): boolean {
+  return host?.setContent(path, text) ?? false;
+}
+
 export function saveViaTab(path: string): boolean {
   return host?.save(path) ?? false;
 }

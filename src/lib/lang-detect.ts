@@ -27,7 +27,18 @@ const EXT_ALIAS: Record<string, string> = {
   json5: 'json',
   // Legacy LookML dashboards are YAML documents; only `.lkml` is LookML proper.
   lookml: 'yaml',
+  // The Shell grammar lists sh, ksh and bash only.
+  zsh: 'sh',
 };
+
+// Shell startup files have no extension the grammar knows (or none at all).
+const NAME_ALIAS: Record<string, string> = Object.fromEntries(
+  [
+    '.bashrc', '.bash_profile', '.bash_login', '.bash_logout', '.bash_aliases',
+    '.profile', '.kshrc', '.envrc',
+    '.zshrc', '.zshenv', '.zprofile', '.zlogin', '.zlogout',
+  ].map((n) => [n, 'sh']),
+);
 
 // Resolve by real filename first so anything the library knows about wins, and
 // only then retry through the alias table. The retry goes back through
@@ -36,6 +47,8 @@ const EXT_ALIAS: Record<string, string> = {
 export function describeFor(name: string): LanguageDescription | null {
   const direct = LanguageDescription.matchFilename(LANGS, name);
   if (direct) return direct;
+  const base = name.slice(Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\')) + 1);
+  if (Object.hasOwn(NAME_ALIAS, base)) return LanguageDescription.matchFilename(LANGS, `f.${NAME_ALIAS[base]}`);
   const ext = /\.([^./\\]+)$/.exec(name)?.[1]?.toLowerCase();
   const alias = ext ? EXT_ALIAS[ext] : undefined;
   return alias ? LanguageDescription.matchFilename(LANGS, `f.${alias}`) : null;

@@ -847,6 +847,7 @@
   import PortsPanel from './server/PortsPanel.svelte';
   import LspPanel from './server/LspPanel.svelte';
   import { LSP_KINDS, lspLabel, startLanguageServer, type LspKind } from '../lib/lsp-control.svelte';
+  import { setShareHost } from '../lib/lsp/doc-share';
   import { fileIconUrl, folderIconUrl } from '../lib/file-icons';
   import { TAB_DND_MIME, PATH_DND_MIME } from '../lib/dnd';
   import { tabDirLabels, dropSlot } from '../lib/tab-strip';
@@ -1972,7 +1973,10 @@
         (e.metaKey || e.ctrlKey) &&
         (e.shiftKey || e.code === 'Digit1' || e.code === 'ArrowUp' || e.code === 'ArrowDown');
       if (inShell && !workbenchClaim) return;
-      if ((e.metaKey || e.ctrlKey) && e.code === 'KeyS') {
+      // A peek's editor may show another file than the active tab; it saves
+      // that file itself (lib/lsp/peek.ts).
+      const inPeek = !!(e.target as HTMLElement | null)?.closest?.('.cm-peekCode');
+      if ((e.metaKey || e.ctrlKey) && e.code === 'KeyS' && !inPeek) {
         e.preventDefault();
         if (activeTab) void saveTab(activeTab).then(() => window.dispatchEvent(new CustomEvent('gmd:git-refresh')));
       } else if (e.altKey && e.code === 'KeyW') {
@@ -2062,7 +2066,32 @@
     window.addEventListener('beforeinput', onBeforeInput, true);
     window.addEventListener('beforeunload', onBeforeUnload);
     void loadVersion();
+    // A peek editing a file whose tab is open writes into that tab's buffer,
+    // and its Mod+S is that tab's save.
+    const textTab = (path: string) => {
+      for (const g of groups) {
+        const t = g.tabs.find((x) => x.path === path);
+        if (t && (t.kind === 'code' || t.kind === 'md') && !t.ro && !t.binary && !t.error && !t.untitled) return t;
+      }
+      return null;
+    };
+    const dropShareHost = setShareHost({
+      content: (path) => textTab(path)?.content ?? null,
+      setContent: (path, text) => {
+        const t = textTab(path);
+        if (!t) return false;
+        t.content = text;
+        return true;
+      },
+      save: (path) => {
+        const t = textTab(path);
+        if (!t) return false;
+        void saveTab(t).then(() => window.dispatchEvent(new CustomEvent('gmd:git-refresh')));
+        return true;
+      },
+    });
     return () => {
+      dropShareHost();
       window.removeEventListener('keydown', onKey, true);
       window.removeEventListener('beforeinput', onBeforeInput, true);
       window.removeEventListener('beforeunload', onBeforeUnload);

@@ -18,19 +18,22 @@ interface Range { start: { line: number; character: number }; end: { line: numbe
 type Location = { uri: string; range: Range };
 type LocationLink = { targetUri: string; targetSelectionRange?: Range; targetRange: Range };
 
-function position(view: EditorView, pos: number) {
+export type LspPosition = { line: number; character: number };
+
+export function positionOf(view: EditorView, pos: number): LspPosition {
   const line = view.state.doc.lineAt(pos);
   return { line: line.number - 1, character: pos - line.from };
 }
 
-function normalize(raw: unknown): LspLoc[] {
+export function normalize(raw: unknown): LspLoc[] {
   if (!raw) return [];
   const arr = (Array.isArray(raw) ? raw : [raw]) as (Location | LocationLink)[];
   const out: LspLoc[] = [];
   for (const l of arr) {
+    if (!l || typeof l !== 'object') continue;
     const uri = 'targetUri' in l ? l.targetUri : l.uri;
     const range = 'targetUri' in l ? (l.targetSelectionRange ?? l.targetRange) : l.range;
-    const path = pathForUri(uri);
+    const path = typeof uri === 'string' ? pathForUri(uri) : null;
     // A definition outside the served root (a global typings folder, the
     // Python stdlib) has nowhere to open in this IDE.
     if (path == null || !range) continue;
@@ -46,10 +49,19 @@ function normalize(raw: unknown): LspLoc[] {
 }
 
 // A slow or wedged server must not hold up Cmd+Click or Peek: past this the
-// caller falls back to the ripgrep / in-file lookup.
+// caller reports that the server gave no answer.
 const ASK_TIMEOUT_MS = 4000;
+// A references search walks the whole project; a server still indexing a large
+// one needs longer than a definition lookup does.
+const REFS_TIMEOUT_MS = 15000;
 
-async function ask(conn: Conn, uri: string, view: EditorView, pos: number, method: string, extra: object = {}) {
+/** Thrown when the server took too long to answer; it may still be indexing. */
+export class LspTimeout extends Error {}
+
+/** One request about `uri` at an LSP position, bounded by `ms`. */
+export async function askAt(
+  conn: Conn, uri: string, at: LspPosition, method: string, extra: object = {}, ms = ASK_TIMEOUT_MS,
+): Promise<unknown> {
   // Never wait on `initializing` here: after a disconnect the client swaps in
   // a fresh promise that only resolves on the next connect, which may never
   // come. Not connected now means no answer now.
@@ -57,11 +69,11 @@ async function ask(conn: Conn, uri: string, view: EditorView, pos: number, metho
   conn.client.sync();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${method} timed out`)), ASK_TIMEOUT_MS);
+    timer = setTimeout(() => reject(new LspTimeout(`${method} timed out`)), ms);
   });
   try {
     return await Promise.race([
-      conn.client.request(method, { textDocument: { uri }, position: position(view, pos), ...extra }),
+      conn.client.request(method, { textDocument: { uri }, position: at, ...extra }),
       timeout,
     ]);
   } finally {
@@ -70,9 +82,23 @@ async function ask(conn: Conn, uri: string, view: EditorView, pos: number, metho
 }
 
 export async function lspDefinition(conn: Conn, uri: string, view: EditorView, pos: number): Promise<LspLoc[]> {
-  return normalize(await ask(conn, uri, view, pos, 'textDocument/definition'));
+  return normalize(await askAt(conn, uri, positionOf(view, pos), 'textDocument/definition'));
+}
+
+/**
+ * Every reference to the symbol at `at`. Find All References asks with the
+ * declaration included, as VS Code does; the references lens asks without it,
+ * as VS Code's TypeScript lens does, so the number it shows is the number of
+ * rows it opens.
+ */
+export async function lspReferencesAt(
+  conn: Conn, uri: string, at: LspPosition, includeDeclaration: boolean,
+): Promise<LspLoc[]> {
+  return normalize(await askAt(
+    conn, uri, at, 'textDocument/references', { context: { includeDeclaration } }, REFS_TIMEOUT_MS,
+  ));
 }
 
 export async function lspReferences(conn: Conn, uri: string, view: EditorView, pos: number): Promise<LspLoc[]> {
-  return normalize(await ask(conn, uri, view, pos, 'textDocument/references', { context: { includeDeclaration: true } }));
+  return lspReferencesAt(conn, uri, positionOf(view, pos), true);
 }

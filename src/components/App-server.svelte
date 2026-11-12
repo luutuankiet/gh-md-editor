@@ -58,6 +58,7 @@
 
   import OutlinePanel from './server/OutlinePanel.svelte';
   import type { OutlineNode } from '../lib/code-outline';
+  import { wrapPref } from '../lib/wrap-pref.svelte';
   import { initTabViewState, toggleWrapFor, renameTabView, tabViewOf, patchTabView, pinnedLangFor, autoLangFor } from '../lib/tab-view-state.svelte';
   import { describeFor, shebangLang, extensionFor } from '../lib/lang-detect';
   import { filterLangModes } from '../lib/lang-mode-list';
@@ -244,6 +245,9 @@
     { label: 'Toggle Hidden Values', hint: '.env files', run: () => window.dispatchEvent(new CustomEvent('gmd:toggle-cloak')) },
     { label: 'Toggle Git Blame', hint: 'code editors', run: toggleBlame },
     { label: 'Toggle Inline Blame', hint: 'current line, code editors', run: toggleInlineBlame },
+    // The app-wide default, not the active tab: Alt/Opt+Z stays per tab, and a
+    // tab that already has its own override keeps it.
+    { label: 'Toggle Word Wrap Default', hint: 'all editors', run: () => wrapPref.toggle() },
     { label: 'Upgrade Server', hint: 'restarts — kills terminal sessions', run: () => void upgradeServer() },
   ];
   let qoCommands = $derived(

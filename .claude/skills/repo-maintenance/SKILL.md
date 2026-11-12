@@ -54,6 +54,8 @@ it with a new one rather than editing it.
 - [A broken worktree link is detected and blocked, never repaired](../../../docs/adr/0002-worktree-links-are-detected-never-repaired.md)
 - [One git repository anchor, chosen once, shared by every panel](../../../docs/adr/0003-one-git-anchor-shared-by-every-git-panel.md)
 - [A published documentation catalogue replaces the private journal](../../../docs/adr/0004-a-published-docs-catalogue-replaces-the-private-journal.md)
+- [References come only from the language server](../../../docs/adr/0005-references-come-only-from-the-language-server.md)
+- [Language server settings live outside the project](../../../docs/adr/0006-language-server-settings-live-outside-the-project.md)
 
 <!-- END GENERATED INDEX -->
 

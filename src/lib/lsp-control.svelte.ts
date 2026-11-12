@@ -30,6 +30,15 @@ const FALLBACK: LspKindSpec[] = [
   },
   { kind: 'ty', label: 'Python (ty)', extensions: { py: 'python', pyi: 'python' }, filenames: {}, globs: {} },
   { kind: 'basedpyright', label: 'Python (basedpyright)', extensions: { py: 'python', pyi: 'python' }, filenames: {}, globs: {} },
+  { kind: 'yaml', label: 'YAML (yaml-language-server)', extensions: { yml: 'yaml', yaml: 'yaml' }, filenames: {}, globs: {} },
+  { kind: 'json', label: 'JSON (vscode-json-language-server)', extensions: { json: 'json', jsonc: 'jsonc' }, filenames: {}, globs: {} },
+  {
+    kind: 'dockerfile',
+    label: 'Dockerfile (docker-langserver)',
+    extensions: { dockerfile: 'dockerfile', containerfile: 'dockerfile' },
+    filenames: { Dockerfile: 'dockerfile', Containerfile: 'dockerfile' },
+    globs: { 'Dockerfile.*': 'dockerfile', 'Containerfile.*': 'dockerfile' },
+  },
 ];
 
 // Mutated in place so every reader (components and plain modules) sees updates.

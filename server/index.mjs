@@ -1464,6 +1464,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/lsp/log' && req.method === 'GET') return await apiLspLog(res, url.searchParams.get('id'));
     if (url.pathname === '/api/lsp/settings' && req.method === 'GET') return await apiLspSettingsGet(res, url.searchParams);
     if (url.pathname === '/api/lsp/settings' && req.method === 'PATCH') return await apiLspSettingsPatch(req, res);
+    if (url.pathname === '/api/lsp/schema-catalog' && req.method === 'GET') return await apiSchemaCatalog(res);
     if (url.pathname === '/api/python/interpreters' && req.method === 'GET') return await apiPyInterpreters(res, url.searchParams);
     if (url.pathname === '/api/python/interpreter' && req.method === 'POST') return await apiPySelect(req, res);
     if (url.pathname === '/api/version' && req.method === 'GET') return await apiVersion(res);
@@ -3308,6 +3309,7 @@ wss.on('connection', (ws, req) => {
 //   POST   /api/lsp/restart      {id} → entry of the new process
 //   POST   /api/lsp/autostart    {workspace, path} → {started:[entry]}
 //   GET    /api/lsp/log?id=x     → text: stderr, window/logMessage, bridge events
+//   GET    /api/lsp/schema-catalog → the SchemaStore catalog, cached on disk
 //   GET    /api/lsp/settings?workspace=  → stored settings plus the effective tree
 //   PATCH  /api/lsp/settings     {workspace, shared?, servers?, autoStart?}
 //                                (JSON merge patch; null deletes a key)
@@ -3331,6 +3333,8 @@ wss.on('connection', (ws, req) => {
 //   pushOnInit   also send workspace/didChangeConfiguration right after the
 //                editor's `initialized`, for servers that never pull
 //   initOptions(settings)  initializationOptions merged into initialize
+//   onSettings(s)  runs after initialized and after every settings push, for
+//                what a server takes besides settings (JSON schema associations)
 const LSP_KINDS = {
   tsgo: {
     label: 'TypeScript 7 (tsgo)',
@@ -3400,7 +3404,162 @@ const LSP_KINDS = {
       return tree;
     },
   },
+  yaml: {
+    label: 'YAML (yaml-language-server)',
+    language: 'yaml',
+    languages: ['yaml'],
+    extensions: { yml: 'yaml', yaml: 'yaml' },
+    filenames: {},
+    globs: {},
+    bin: 'yaml-language-server',
+    args: ['--stdio'],
+    lookup: ['node_modules', 'path'],
+    download: { via: 'npx', bin: 'npx', args: ['-y', '-p', 'yaml-language-server', 'yaml-language-server', '--stdio'], package: 'yaml-language-server' },
+    sections: ['yaml'],
+    // SchemaStore matching is built in: Compose, GitHub workflows and dbt
+    // project and properties files get their schema by file name.
+    defaults: {
+      yaml: { validate: true, hover: true, completion: true, format: { enable: true }, schemaStore: { enable: true } },
+    },
+    derive({ shared }) {
+      return { yaml: { schemas: lspYamlSchemas(lspSchemaPicks(shared, 'yaml')) } };
+    },
+  },
+  json: {
+    label: 'JSON (vscode-json-language-server)',
+    language: 'json',
+    languages: ['json', 'jsonc'],
+    extensions: { json: 'json', jsonc: 'jsonc' },
+    filenames: {},
+    globs: {},
+    bin: 'vscode-json-language-server',
+    args: ['--stdio'],
+    lookup: ['node_modules', 'path'],
+    download: { via: 'npx', bin: 'npx', args: ['-y', '-p', 'vscode-langservers-extracted', 'vscode-json-language-server', '--stdio'], package: 'vscode-langservers-extracted' },
+    sections: ['json'],
+    // This server never pulls settings, and validation turns off on the
+    // first push that lacks json.validate.enable, so it is always sent.
+    defaults: {
+      json: { validate: { enable: true }, format: { enable: true }, schemaDownload: { enable: true } },
+    },
+    derive({ shared }) {
+      const picks = lspSchemaPicks(shared, 'json');
+      return { json: { schemas: Object.entries(picks).map(([file, url]) => ({ fileMatch: [file], url })) } };
+    },
+    pushOnInit: true,
+    initOptions: () => ({ provideFormatter: true }),
+    // SchemaStore is not built into this server; the bridge pushes the
+    // catalog's file name associations itself.
+    onSettings: (s) => lspPushJsonAssociations(s),
+  },
+  dockerfile: {
+    label: 'Dockerfile (docker-langserver)',
+    language: 'dockerfile',
+    languages: ['dockerfile'],
+    extensions: { dockerfile: 'dockerfile', containerfile: 'dockerfile' },
+    filenames: { Dockerfile: 'dockerfile', Containerfile: 'dockerfile' },
+    globs: { 'Dockerfile.*': 'dockerfile', 'Containerfile.*': 'dockerfile' },
+    bin: 'docker-langserver',
+    args: ['--stdio'],
+    lookup: ['node_modules', 'path'],
+    download: { via: 'npx', bin: 'npx', args: ['-y', '-p', 'dockerfile-language-server-nodejs', 'docker-langserver', '--stdio'], package: 'dockerfile-language-server-nodejs' },
+    sections: ['docker'],
+    defaults: {},
+    pushOnInit: true,
+  },
 };
+
+// --- JSON and YAML schemas -----------------------------------------------------
+// The schema picker saves one choice per file in shared.schemas, keyed by the
+// file's path relative to the served root: {"<path>": {url, name}}. Each
+// server matches a pattern against the end of the document's URI, so the
+// relative path selects exactly that file whatever folder the server runs in.
+
+const LSP_SCHEMA_EXT = { yaml: /\.ya?ml$/i, json: /\.jsonc?$/i };
+
+function lspSchemaPicks(shared, lang) {
+  const out = {};
+  const all = isPlainObj(shared?.schemas) ? shared.schemas : {};
+  for (const [file, pick] of Object.entries(all)) {
+    const url = typeof pick === 'string' ? pick : pick?.url;
+    if (typeof url === 'string' && url && LSP_SCHEMA_EXT[lang].test(file)) out[file] = url;
+  }
+  return out;
+}
+
+// dbt's profiles.yml is not in the SchemaStore catalog; dbt-jsonschema ships
+// one schema for it, only in its latest_fusion folder.
+const DBT_PROFILES_SCHEMA = 'https://raw.githubusercontent.com/dbt-labs/dbt-jsonschema/main/schemas/latest_fusion/profiles-latest-fusion.json';
+
+// yaml.schemas is {schemaUrl: [patterns]}. Several matching entries are
+// combined, so the built-in profiles.yml mapping steps aside once any
+// profiles.yml has a choice of its own.
+function lspYamlSchemas(picks) {
+  const out = {};
+  for (const [file, url] of Object.entries(picks)) (out[url] ??= []).push(`/${file}`);
+  if (!Object.keys(picks).some((f) => /(^|\/)profiles\.ya?ml$/.test(f))) {
+    (out[DBT_PROFILES_SCHEMA] ??= []).push('profiles.yml', 'profiles.yaml');
+  }
+  return out;
+}
+
+const SCHEMA_CATALOG_URL = 'https://www.schemastore.org/api/json/catalog.json';
+const SCHEMA_CATALOG_MAX_AGE = 7 * 24 * 3600 * 1000;
+let schemaCatalogMem = null; // {at, data}
+let schemaCatalogFetch = null;
+
+// The SchemaStore catalog, cached on disk under the config home and refreshed
+// after a week; a stale copy is used when the network is down.
+async function lspSchemaCatalog() {
+  if (schemaCatalogMem && Date.now() - schemaCatalogMem.at < SCHEMA_CATALOG_MAX_AGE) return schemaCatalogMem.data;
+  const file = path.join(LSP_CONFIG_HOME, 'cache', 'schemastore-catalog.json');
+  if (!schemaCatalogMem) {
+    try {
+      const st = await fs.stat(file);
+      schemaCatalogMem = { at: st.mtimeMs, data: JSON.parse(await fs.readFile(file, 'utf8')) };
+      if (Date.now() - schemaCatalogMem.at < SCHEMA_CATALOG_MAX_AGE) return schemaCatalogMem.data;
+    } catch { /* no cache yet */ }
+  }
+  schemaCatalogFetch ??= (async () => {
+    try {
+      const r = await fetch(SCHEMA_CATALOG_URL, { signal: AbortSignal.timeout(20_000) });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      if (!Array.isArray(data?.schemas)) throw new Error('no schemas array');
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, JSON.stringify(data), 'utf8');
+      schemaCatalogMem = { at: Date.now(), data };
+      return data;
+    } catch (e) {
+      if (schemaCatalogMem) return schemaCatalogMem.data;
+      throw new Error(`could not fetch the SchemaStore catalog: ${e.message}`);
+    } finally {
+      schemaCatalogFetch = null;
+    }
+  })();
+  return schemaCatalogFetch;
+}
+
+// json/schemaAssociations replaces the previous set on every send. The JSON
+// server combines every association that matches a file, so a file with a
+// picked schema is excluded from the catalog's patterns.
+async function lspPushJsonAssociations(s) {
+  if (!s.initResult || s.state !== 'running') return;
+  let catalog;
+  try {
+    catalog = await lspSchemaCatalog();
+  } catch (e) {
+    return lspLog(s, 'bridge', e.message);
+  }
+  const picked = Object.keys(lspSchemaPicks(s.sharedSettings, 'json')).map((f) => `!${f}`);
+  const assoc = [];
+  for (const e of catalog.schemas) {
+    const globs = (e.fileMatch ?? []).filter((g) => typeof g === 'string' && /\.json[c5]?$|\*$/i.test(g) && !/\.ya?ml$/i.test(g));
+    if (globs.length && typeof e.url === 'string') assoc.push({ fileMatch: [...globs, ...picked], uri: e.url });
+  }
+  lspLog(s, 'config', `push json/schemaAssociations (${assoc.length} SchemaStore entries)`);
+  lspSendServer(s, { jsonrpc: '2.0', method: 'json/schemaAssociations', params: [assoc] });
+}
 
 // What the browser may see of the registry: no functions, no local paths.
 function lspKindsPublic() {
@@ -3820,6 +3979,7 @@ function lspPushSettings(s, why) {
   if (!s.initResult || s.state !== 'running') return;
   lspLog(s, 'config', `push (${why}) workspace/didChangeConfiguration ${lspShort(s.settings)}`);
   lspSendServer(s, { jsonrpc: '2.0', method: 'workspace/didChangeConfiguration', params: { settings: s.settings } });
+  if (why !== 'after initialized') void LSP_KINDS[s.kind].onSettings?.(s);
 }
 
 function lspFromServer(s, msg) {
@@ -3925,6 +4085,7 @@ function lspFromBrowser(s, sock, msg) {
   if (msg.id !== undefined && m) s.browserPending.set(msg.id, m);
   lspSendServer(s, msg);
   if (m === 'initialized' && LSP_KINDS[s.kind].pushOnInit) lspPushSettings(s, 'after initialized');
+  if (m === 'initialized') void LSP_KINDS[s.kind].onSettings?.(s);
   if ((m === 'textDocument/didOpen' || m === 'textDocument/didChange') && uri) lspSchedulePull(s, uri);
 }
 
@@ -3955,7 +4116,8 @@ async function lspStart(kind, folderAbs, allowDownload, workspaceAbs) {
     resolved = { cmd: runner, args: spec.download.args, via: spec.download.via };
   }
   const ignored = await lspIgnoredDirs(folderAbs);
-  const settings = lspEffectiveSettings(kind, await lspReadSettings(workspaceAbs), folderAbs, ignored);
+  const stored = await lspReadSettings(workspaceAbs);
+  const settings = lspEffectiveSettings(kind, stored, folderAbs, ignored);
   // Its own process group, so npx/uvx and whatever they start die together.
   const child = spawn(resolved.cmd, resolved.args, {
     cwd: folderAbs,
@@ -3979,6 +4141,8 @@ async function lspStart(kind, folderAbs, allowDownload, workspaceAbs) {
     state: 'starting',
     ignored,
     settings,
+    // shared.schemas feeds what the JSON server is sent besides settings.
+    sharedSettings: stored.shared,
     initSent: false,
     initResult: null,
     pullDiagnostics: false,
@@ -4314,6 +4478,16 @@ async function lspSettingsView(workspaceAbs) {
   };
 }
 
+// The SchemaStore catalog for the schema picker, from the same cache the JSON
+// server's associations come from.
+async function apiSchemaCatalog(res) {
+  try {
+    return sendJson(res, 200, await lspSchemaCatalog());
+  } catch (e) {
+    return sendJson(res, 502, { error: e.message });
+  }
+}
+
 async function apiLspSettingsGet(res, params) {
   const workspaceAbs = lspWorkspaceAbs(params.get('workspace'));
   if (!workspaceAbs) return sendJson(res, 400, { error: 'workspace is outside the served root' });
@@ -4367,6 +4541,7 @@ async function lspApplySettings(workspaceAbs) {
   for (const s of lspServers.values()) {
     if (s.workspaceAbs !== workspaceAbs || s.state === 'exited' || s.state === 'stopping') continue;
     s.settings = lspEffectiveSettings(s.kind, settings, s.folderAbs, s.ignored);
+    s.sharedSettings = settings.shared;
     lspPushSettings(s, 'settings changed');
   }
 }

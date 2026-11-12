@@ -24,8 +24,9 @@
     getState: <T = unknown>() => T | undefined;
     setState: <T = unknown>(state: T) => void;
   };
-  declare const acquireVsCodeApi: () => VsCodeApi;
-  const vscodeApi: VsCodeApi = (globalThis as any).__vscodeApi ?? acquireVsCodeApi();
+  // acquireVsCodeApi is a global the webview host injects; a `declare const`
+  // here is rejected by the Svelte compiler, so read it off globalThis.
+  const vscodeApi: VsCodeApi = (globalThis as any).__vscodeApi ?? (globalThis as any).acquireVsCodeApi();
 
   let { initial }: {
     initial: {

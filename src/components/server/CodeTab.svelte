@@ -45,6 +45,11 @@
   import { readScrollAnchor, applyScrollAnchor } from '../../lib/cm-scroll-anchor';
   import { highlightToLines, scopeForFilename } from '../../lib/diff-highlight';
   import type { Tok } from '../../lib/diff-highlight';
+  import { setDiagnostics, setDiagnosticsEffect } from '@codemirror/lint';
+  import { lspFor, onLspChange, type Conn } from '../../lib/lsp/client';
+  import { lspDefinition, lspReferences, type LspLoc } from '../../lib/lsp/actions';
+  import { lineHasDiagnostic } from '../../lib/lsp/error-lens';
+  import { defPeek, showDefPeek } from '../../lib/lsp/peek-def';
 
 
   // --- inline change gutter ---------------------------------------------------
@@ -418,6 +423,9 @@
       // A selection, rather than a cursor, means the user is working with a
       // range; an annotation pinned to one end of it is just noise.
       if (!sel.empty) return Decoration.none;
+      // A diagnostic owns the end of its line (Error Lens message); blame is
+      // ambient and still in the gutter and the hover card.
+      if (lineHasDiagnostic(vw.state, sel.head)) return Decoration.none;
       const line = vw.state.doc.lineAt(sel.head);
       const c = data.commits[data.lines[line.number - 1]];
       if (!c) return Decoration.none;
@@ -432,7 +440,10 @@
           this.decorations = build(vw);
         }
         update(u: ViewUpdate) {
-          if (u.docChanged || u.selectionSet || u.viewportChanged) this.decorations = build(u.view);
+          if (
+            u.docChanged || u.selectionSet || u.viewportChanged ||
+            u.transactions.some((tr) => tr.effects.some((e) => e.is(setDiagnosticsEffect)))
+          ) this.decorations = build(u.view);
         }
         destroy() {
           closeBlameCards();
@@ -744,15 +755,21 @@
     node.focus();
   }
 
-  async function openPeek(name: string) {
+  // `load` replaces the ripgrep lookup with another source of hits — the
+  // language server, when one covers this file.
+  async function openPeek(
+    name: string,
+    load?: () => Promise<{ hits?: PeekHit[]; truncated?: boolean; error?: string }>,
+  ) {
     if (!gitPath) return;
     peekFolded = [];
     peek = { name, loading: true, hits: [], truncated: false, sel: 0, preview: null };
     try {
-      const r = await fetch(
-        `/api/refs?name=${encodeURIComponent(name)}&path=${encodeURIComponent(searchScope())}`,
-      );
-      const j = (await r.json()) as { hits?: PeekHit[]; truncated?: boolean; error?: string };
+      const j = load
+        ? await load()
+        : ((await (await fetch(
+          `/api/refs?name=${encodeURIComponent(name)}&path=${encodeURIComponent(searchScope())}`,
+        )).json()) as { hits?: PeekHit[]; truncated?: boolean; error?: string });
       if (peek?.name !== name) return;
       if (j.error) { peek = null; showNotice(`References: ${j.error}`); return; }
       const hits = (j.hits ?? []).sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
@@ -1033,6 +1050,29 @@
     if (!w) return;
     const word = vw.state.sliceDoc(w.from, w.to);
     if (!/^[A-Za-z_$][\w$]*$/.test(word)) return;
+
+    // A running language server knows; everything below is a guess. Any
+    // failure or empty answer falls through to the guesses.
+    const ls = lsp;
+    if (ls) {
+      try {
+        const hit = (await lspDefinition(ls.conn, ls.uri, vw, pos))[0];
+        if (hit) {
+          if (hit.path === gitPath) {
+            const ln = vw.state.doc.line(Math.min(hit.line, vw.state.doc.lines));
+            const from = Math.min(ln.from + hit.col, ln.to);
+            const to = hit.endLine === hit.line ? Math.min(ln.from + hit.endCol, ln.to) : from;
+            landOn(vw, { from, to });
+          } else {
+            window.dispatchEvent(new CustomEvent('gmd:open-request', {
+              detail: { kind: 'file', path: hit.path, line: hit.line, word },
+            }));
+          }
+          return;
+        }
+      } catch { /* fall back to the heuristics */ }
+    }
+
     const here = localDef(outlineNodes, word, vw.state, pos);
     if (here) {
       const at = findSymbol(vw.state, word, vw.state.doc.lineAt(here.from).number);
@@ -1083,6 +1123,153 @@
       showNotice('Definition lookup failed');
     }
   }
+
+  // --- language server ---------------------------------------------------------
+  // Opt-in: a tab only gets a client when a server the user started covers its
+  // file. Hover, completion and diagnostics ride in through the compartment;
+  // definition, peek and references are asked for explicitly below.
+  const lspCompartment = new Compartment();
+  let lsp: { conn: Conn; uri: string } | null = null;
+  let lspKey = '';
+  let lspView: EditorView | null = null;
+  let lspSeq = 0;
+
+  async function syncLsp() {
+    const vw = untrack(() => view);
+    const p = untrack(() => gitPath);
+    if (!vw) return;
+    if (vw !== lspView) { lspView = vw; lspKey = ''; lsp = null; }
+    const seq = ++lspSeq;
+    // Read-only and untitled tabs have nothing a server should be told about.
+    const got = untrack(() => readOnly) || !p ? null : await lspFor(p).catch(() => null);
+    if (seq !== lspSeq || untrack(() => view) !== vw) return;
+    const key = got ? `${got.conn.entry.id}\u0000${got.uri}` : '';
+    if (key === lspKey) return;
+    lspKey = key;
+    const dropped = lsp !== null;
+    lsp = got ? { conn: got.conn, uri: got.uri } : null;
+    vw.dispatch({ effects: lspCompartment.reconfigure(got ? got.extension : []) });
+    // The lint state lives outside the compartment, so emptying it leaves the
+    // last squiggles behind, and inline blame keeps hiding on their lines.
+    if (dropped) vw.dispatch(setDiagnostics(vw.state, []));
+  }
+
+  $effect(() => {
+    void gitPath;
+    if (!view) return;
+    void syncLsp();
+  });
+  $effect(() => onLspChange(() => void syncLsp()));
+
+  // Where the symbol at `pos` is defined: the server first, then a declaration
+  // in this file, then the first workspace-wide guess.
+  async function definitionTarget(vw: EditorView, pos: number): Promise<{ path: string; line: number } | null> {
+    const ls = lsp;
+    if (ls) {
+      try {
+        const hit = (await lspDefinition(ls.conn, ls.uri, vw, pos))[0];
+        if (hit) return { path: hit.path, line: hit.line };
+      } catch { /* fall back */ }
+    }
+    const w = vw.state.wordAt(pos);
+    if (!w) return null;
+    const word = vw.state.sliceDoc(w.from, w.to);
+    const here = localDef(outlineNodes, word, vw.state, pos);
+    if (here) return { path: gitPath, line: vw.state.doc.lineAt(here.from).number };
+    if (!gitPath) return null;
+    try {
+      const r = await fetch(
+        `/api/defs?name=${encodeURIComponent(word)}&path=${encodeURIComponent(searchScope())}`,
+      );
+      const j = (await r.json()) as { hits?: { path: string; line: number }[] };
+      const h = j.hits?.[0];
+      return h ? { path: h.path, line: h.line } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // True when `pos` sits on, or right after, a run of identifier characters.
+  function identifierAt(vw: EditorView, pos: number): boolean {
+    const isId = (c: string) => /[\w$]/.test(c);
+    return isId(vw.state.sliceDoc(pos, pos + 1)) || (pos > 0 && isId(vw.state.sliceDoc(pos - 1, pos)));
+  }
+
+  async function peekDefinition(vw: EditorView, pos: number) {
+    const t = await definitionTarget(vw, pos);
+    if (!t) { showNotice('No definition found'); return; }
+    if (!(await showDefPeek(vw, gitPath, t.path, t.line))) showNotice('Could not load the definition');
+  }
+
+  // Server hits become the same rows ripgrep produces, so the existing
+  // references overlay renders them unchanged. Each file is fetched once.
+  async function lspRefHits(ls: { conn: Conn; uri: string }, vw: EditorView, pos: number) {
+    const locs: LspLoc[] = await lspReferences(ls.conn, ls.uri, vw, pos);
+    const texts = new Map<string, string[]>();
+    for (const path of new Set(locs.map((l) => l.path))) {
+      if (path === gitPath) { texts.set(path, vw.state.doc.toString().split('\n')); continue; }
+      try {
+        const j = (await (await fetch(`/api/file?path=${encodeURIComponent(path)}`)).json()) as { content?: string };
+        texts.set(path, (j.content ?? '').split('\n'));
+      } catch { texts.set(path, []); }
+    }
+    const hits: PeekHit[] = locs.map((l) => {
+      const text = texts.get(l.path)?.[l.line - 1] ?? '';
+      const end = l.endLine === l.line ? l.endCol : text.length;
+      return { path: l.path, line: l.line, text, cols: [[l.col, end]] };
+    });
+    return { hits };
+  }
+
+  function findReferences(vw: EditorView, pos: number) {
+    const w = vw.state.wordAt(pos);
+    if (!w) return;
+    const name = vw.state.sliceDoc(w.from, w.to);
+    const ls = lsp;
+    if (!ls) { void openPeek(name); return; }
+    // An empty or failed server answer still deserves the ripgrep result.
+    void openPeek(name, async () => {
+      try {
+        const r = await lspRefHits(ls, vw, pos);
+        if (r.hits.length) return r;
+      } catch { /* fall back */ }
+      return (await (await fetch(
+        `/api/refs?name=${encodeURIComponent(name)}&path=${encodeURIComponent(searchScope())}`,
+      )).json()) as { hits?: PeekHit[]; truncated?: boolean; error?: string };
+    });
+  }
+
+  // Right-click menu. Positioned in viewport coordinates, so it sits wherever
+  // the click was regardless of how the tab is laid out.
+  let ctxMenu = $state<{ x: number; y: number; pos: number } | null>(null);
+
+  function ctxRun(act: 'def' | 'peek' | 'refs') {
+    const m = ctxMenu;
+    const vw = view;
+    ctxMenu = null;
+    if (!m || !vw) return;
+    if (act === 'def') void goToDefinition(vw, m.pos);
+    else if (act === 'peek') void peekDefinition(vw, m.pos);
+    else findReferences(vw, m.pos);
+    vw.focus();
+  }
+
+  $effect(() => {
+    if (!ctxMenu) return;
+    const close = (e: Event) => {
+      if (e instanceof KeyboardEvent && e.key !== 'Escape') return;
+      if (e.type === 'mousedown' && (e.target as Element | null)?.closest?.('.ctx-menu')) return;
+      ctxMenu = null;
+    };
+    window.addEventListener('mousedown', close, true);
+    window.addEventListener('keydown', close, true);
+    window.addEventListener('blur', close);
+    return () => {
+      window.removeEventListener('mousedown', close, true);
+      window.removeEventListener('keydown', close, true);
+      window.removeEventListener('blur', close);
+    };
+  });
 
   // --- sticky scroll ---------------------------------------------------------
   // The enclosing declarations, pinned over the top of the viewport once their
@@ -1484,6 +1671,9 @@
         wrapCompartment.of(untrack(() => wrapFor(viewKey)) ? EditorView.lineWrapping : []),
         markCompartment.of([]),
         languageCompartment.of([]),
+        // Empty until a running language server covers this file.
+        lspCompartment.of([]),
+        defPeek,
         themeCompartment.of(untrack(() => isDark) ? darkBundle : lightBundle),
         // After the theme compartment on purpose: the syntax bundles ship their
         // own faint .cm-matchingBracket rule, and later extensions win. Click a
@@ -1550,7 +1740,31 @@
               toggleWrap(vw);
               return true;
             }
+            // Alt/Opt+X peeks the definition inline. Matched on event.code for
+            // the same reason as KeyZ: macOS Option turns event.key into `≈`.
+            // Only taken when the caret is on or just after an identifier, so
+            // Opt+X still types `≈` in prose, strings and blank space.
+            if (event.altKey && !event.metaKey && !event.ctrlKey && !event.shiftKey && event.code === 'KeyX'
+              && identifierAt(vw, vw.state.selection.main.head)) {
+              event.preventDefault();
+              void peekDefinition(vw, vw.state.selection.main.head);
+              return true;
+            }
             return false;
+          },
+          contextmenu: (event, vw) => {
+            // Without a language server on this file the browser's own menu
+            // (copy, paste, spellcheck) is the more useful one.
+            if (!lsp) return false;
+            const pos = vw.posAtCoords({ x: event.clientX, y: event.clientY });
+            if (pos == null) return false;
+            event.preventDefault();
+            // A right-click inside the selection keeps it; elsewhere it moves
+            // the caret, so the menu acts on the word that was clicked.
+            const inSel = vw.state.selection.ranges.some((r) => !r.empty && pos >= r.from && pos <= r.to);
+            if (!inSel) vw.dispatch({ selection: EditorSelection.cursor(pos) });
+            ctxMenu = { x: event.clientX, y: event.clientY, pos: inSel ? vw.state.selection.main.head : pos };
+            return true;
           },
           dragover: (event) => {
             const ty = event.dataTransfer?.types;
@@ -1615,8 +1829,7 @@
             key: 'Shift-Alt-F12',
             preventDefault: true,
             run: (vw) => {
-              const w = vw.state.wordAt(vw.state.selection.main.head);
-              if (w) void openPeek(vw.state.sliceDoc(w.from, w.to));
+              findReferences(vw, vw.state.selection.main.head);
               return true;
             },
           },
@@ -2134,6 +2347,13 @@
         <span class="tick current" style="top: {currentTickY}px"></span>
       {/if}
     </div>
+    {#if ctxMenu}
+      <div class="ctx-menu" role="menu" style="left: {ctxMenu.x}px; top: {ctxMenu.y}px">
+        <button role="menuitem" onclick={() => ctxRun('def')}>Go to Definition</button>
+        <button role="menuitem" onclick={() => ctxRun('peek')}>Peek Definition <kbd>Alt+X</kbd></button>
+        <button role="menuitem" onclick={() => ctxRun('refs')}>Find All References <kbd>Shift+Alt+F12</kbd></button>
+      </div>
+    {/if}
     {#if peek}
       <!-- Over the editor rather than beside it: the point of a peek is that
            the file being read stays where it was, so closing the panel returns
@@ -2211,6 +2431,34 @@
 {/if}
 
 <style>
+  .ctx-menu {
+    position: fixed;
+    z-index: 1000;
+    min-width: 220px;
+    padding: 4px 0;
+    display: flex;
+    flex-direction: column;
+    background: #252526;
+    color: #ccc;
+    border: 1px solid #454545;
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+    font: 13px system-ui, sans-serif;
+  }
+  .ctx-menu button {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 4px 14px;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .ctx-menu button:hover { background: rgba(77, 170, 252, 0.25); }
+  .ctx-menu kbd { opacity: 0.6; font: inherit; }
   .code-container {
     position: relative;
     height: 100%;

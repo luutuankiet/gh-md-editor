@@ -28,6 +28,9 @@ interface Row {
 // Module, Namespace, Class, Method, Constructor, Enum, Interface, Function.
 const KINDS = new Set([2, 3, 5, 6, 9, 10, 11, 12]);
 const DEBOUNCE_MS = 300;
+const RETRY_MS = 1000;
+const EMPTY_RETRY_MS = 2000;
+const EMPTY_RETRIES = 4;
 
 interface Pos { line: number; character: number }
 interface RangeL { start: Pos; end: Pos }
@@ -97,12 +100,15 @@ export function referencesLens(opts: LensOpts): Extension {
     syms = new WeakMap<Text, Promise<Sym[]>>();
     counts = new WeakMap<Text, Map<string, Promise<LspLoc[] | null>>>();
     lenses = new WeakMap<Text, Promise<Row[] | null>>();
+    // A server still indexing answers "no references"; re-ask a few times.
+    emptyTries = 0;
+    sawEmpty = false;
     constructor(readonly view: EditorView) { this.schedule(); }
     update(u: ViewUpdate) { if (u.docChanged || u.viewportChanged) this.schedule(); }
     destroy() { clearTimeout(this.timer); this.seq++; }
-    schedule() {
+    schedule(ms = DEBOUNCE_MS) {
       clearTimeout(this.timer);
-      this.timer = setTimeout(() => void this.refresh(), DEBOUNCE_MS);
+      this.timer = setTimeout(() => void this.refresh(), ms);
     }
 
     async refresh() {
@@ -111,7 +117,9 @@ export function referencesLens(opts: LensOpts): Extension {
       const seq = ++this.seq;
       const client = opts.conn.client;
       const caps = client.serverCapabilities;
-      if (!client.connected || !caps) return;
+      // A server started while this tab is open is mounted before its
+      // handshake ends; nothing else would ask again until an edit or scroll.
+      if (!client.connected || !caps) { this.schedule(RETRY_MS); return; }
       let rows: Row[] | null = null;
       try {
         if (caps.codeLensProvider) rows = await this.serverLenses(doc);
@@ -119,6 +127,10 @@ export function referencesLens(opts: LensOpts): Extension {
       } catch { return; /* keep the last rows; the next settle asks again */ }
       if (seq !== this.seq || view.state.doc !== doc || !rows) return;
       view.dispatch({ effects: setRows.of({ rows, view }) });
+      if (this.sawEmpty) {
+        this.sawEmpty = false;
+        this.schedule(EMPTY_RETRY_MS * 2 ** this.emptyTries++);
+      }
     }
 
     symbols(doc: Text): Promise<Sym[]> {
@@ -157,6 +169,10 @@ export function referencesLens(opts: LensOpts): Extension {
           per.set(key, p);
         }
         jobs.push(p.then((locs) => {
+          if (locs && !locs.length && this.emptyTries < EMPTY_RETRIES) {
+            per.delete(key);
+            this.sawEmpty = true;
+          }
           if (locs) rows.push({ line: s.line, title: plural(locs.length), name: s.name, at: s.at, locs });
         }));
       }

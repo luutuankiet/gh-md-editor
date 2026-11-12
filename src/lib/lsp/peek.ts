@@ -175,18 +175,29 @@ class Peek {
     const move = (m: PointerEvent) => {
       body = Math.min(maxBody(), Math.max(MIN_BODY, Math.round(h0 + m.clientY - y0)));
       this.dom.style.height = `${CHROME + body}px`;
+      this.remeasure();
     };
     const up = () => {
       grip.removeEventListener('pointermove', move);
       grip.removeEventListener('pointerup', up);
       grip.removeEventListener('pointercancel', up);
       try { localStorage.setItem(HEIGHT_KEY, String(body)); } catch { /* quota */ }
-      this.outer.requestMeasure();
+      this.remeasure();
       this.inner?.requestMeasure();
     };
     grip.addEventListener('pointermove', move);
     grip.addEventListener('pointerup', up);
     grip.addEventListener('pointercancel', up);
+  }
+
+  // requestMeasure alone re-reads line heights only when the content's own
+  // height changed, and a short file is held at the editor's min-height, so
+  // a resized peek left the gutter and every click below it off by the
+  // difference. The flag is CodeMirror's own "content was redrawn" marker.
+  private remeasure() {
+    const vs = (this.outer as unknown as { viewState?: { mustMeasureContent?: boolean | string } }).viewState;
+    if (vs && !vs.mustMeasureContent) vs.mustMeasureContent = true;
+    this.outer.requestMeasure();
   }
 
   close() {
@@ -591,7 +602,8 @@ const theme = EditorView.baseTheme({
     left: 'var(--gmd-peek-left, 0)',
     width: 'var(--gmd-peek-w, 100%)',
     boxSizing: 'border-box',
-    margin: '2px 0',
+    // No vertical margin: CodeMirror measures a block widget by its border
+    // box, so a margin pushes every line below off its gutter number.
     borderTop: `2px solid ${accent}`,
     borderBottom: `2px solid ${accent}`,
     display: 'flex',

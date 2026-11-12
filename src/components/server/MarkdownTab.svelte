@@ -87,6 +87,18 @@
   $effect(() => { savePct('mdSplit', splitPct); });
   $effect(() => { savePct('mdOutlineSplit', outlineSplitterPct); });
   let editorView: EditorView | null = $state(null);
+
+  // Markdown has no language server, so the reference chords that open the
+  // peek in code tabs only say why nothing happens here.
+  let notice = $state('');
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+  function onPaneKey(e: KeyboardEvent) {
+    if (e.key !== 'F12' || !e.shiftKey || e.ctrlKey || e.metaKey) return;
+    e.preventDefault();
+    notice = 'Find All References needs a language server for this file';
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => { notice = ''; }, 3000);
+  }
   let previewHost: HTMLElement | null = $state(null);
   let showShortcuts = $state(false);
 
@@ -328,6 +340,7 @@
       class="pane editor-pane theme-{editorEffective}"
       style="flex-basis: {splitPct}%;"
       oncontextmenu={(e) => e.preventDefault()}
+      onkeydown={onPaneKey}
       role="presentation"
     >
       {#if editorBreadcrumb.length > 0}
@@ -385,7 +398,25 @@
 
 <ShortcutsDialog bind:open={showShortcuts} />
 
+{#if notice}
+  <div class="notice">{notice}</div>
+{/if}
+
 <style>
+  .notice {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    background: #272727;
+    border: 1px solid #505050;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: #c5c8c6;
+    z-index: 120;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
   .shell {
     display: flex;
     flex-direction: row;

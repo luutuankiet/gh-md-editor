@@ -128,7 +128,7 @@ try {
 } catch { /* no prebuilt for this platform — fall back below */ }
 if (!rgBin && onPath('rg')) rgBin = 'rg';
 import { spawn, spawnSync } from 'node:child_process';
-import { createReadStream, createWriteStream, closeSync, mkdirSync, openSync, statSync, promises as fs } from 'node:fs';
+import { accessSync, constants as fsConstants, createReadStream, createWriteStream, closeSync, mkdirSync, openSync, statSync, promises as fs } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -137,7 +137,7 @@ import zlib from 'node:zlib';
 import https from 'node:https';
 import dns from 'node:dns';
 import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(__dirname, 'dist', 'web');
@@ -1458,6 +1458,9 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/entry' && req.method === 'PATCH') return await apiMoveEntry(req, res);
     if (url.pathname === '/api/entry/copy' && req.method === 'POST') return await apiCopyEntry(req, res);
     if (url.pathname === '/api/ports' && req.method === 'GET') return await apiPorts(res);
+    if (url.pathname === '/api/lsp' && req.method === 'GET') return await apiLspList(res);
+    if (url.pathname === '/api/lsp' && req.method === 'POST') return await apiLspStart(req, res);
+    if (url.pathname === '/api/lsp' && req.method === 'DELETE') return await apiLspStop(res, url.searchParams.get('id'));
     if (url.pathname === '/api/version' && req.method === 'GET') return await apiVersion(res);
     if (url.pathname === '/api/upgrade' && req.method === 'POST') return apiUpgrade(res);
     if (url.pathname.startsWith('/api/')) return sendJson(res, 404, { error: 'unknown endpoint' });
@@ -3415,6 +3418,577 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+// --- language servers (opt-in) ----------------------------------------------
+// The browser speaks LSP to a server process running here, through a bridge
+// that owns everything the stock @codemirror/lsp-client cannot do: answering
+// the server's own requests, turning TypeScript 7's pull diagnostics into the
+// push notifications the client renders, and keeping gitignored folders out
+// of navigation results. Never started on its own; one process per
+// (kind, folder) lives until Stop or this process exits.
+//
+// Control plane (HTTP):
+//   GET    /api/lsp        → {servers:[entry]}
+//   POST   /api/lsp        {kind, folder, allowDownload?} → entry, or
+//                          409 {needsDownload, command} when nothing local
+//   DELETE /api/lsp?id=x   → 204 after shutdown/exit, SIGTERM, SIGKILL
+// Data plane (WS): /api/lsp?id=<id>; one WS text message = one JSON-RPC body.
+
+const LSP_KINDS = {
+  tsgo: {
+    language: 'typescript',
+    languages: ['typescript', 'javascript'],
+    bin: 'tsc',
+    args: ['--lsp', '--stdio'],
+    // Older `tsc` binaries are everywhere and have no --lsp; only 7+ counts.
+    minMajor: 7,
+    download: { via: 'npx', bin: 'npx', args: ['-y', '-p', 'typescript@7', 'tsc', '--lsp', '--stdio'] },
+  },
+  ty: {
+    language: 'python',
+    languages: ['python'],
+    bin: 'ty',
+    args: ['server'],
+    download: { via: 'uvx', bin: 'uvx', args: ['ty', 'server'] },
+  },
+  basedpyright: {
+    language: 'python',
+    languages: ['python'],
+    bin: 'basedpyright-langserver',
+    args: ['--stdio'],
+    download: { via: 'uvx', bin: 'uvx', args: ['--from', 'basedpyright', 'basedpyright-langserver', '--stdio'] },
+  },
+};
+
+// Responses to these get locations inside gitignored folders removed.
+const LSP_LOCATION_METHODS = new Set([
+  'textDocument/definition',
+  'textDocument/declaration',
+  'textDocument/typeDefinition',
+  'textDocument/implementation',
+  'textDocument/references',
+  'workspace/symbol',
+]);
+// A definition that filters down to nothing keeps its original answer.
+const LSP_KEEP_IF_EMPTY = new Set([
+  'textDocument/definition',
+  'textDocument/declaration',
+  'textDocument/typeDefinition',
+  'textDocument/implementation',
+]);
+
+const lspServers = new Map();
+let lspSeq = 0;
+const lspWss = new WebSocketServer({ noServer: true });
+
+function findOnPath(bin) {
+  const exts = process.platform === 'win32' ? ['.exe', '.cmd', ''] : [''];
+  for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const p = path.join(dir, bin + ext);
+      try {
+        accessSync(p, fsConstants.X_OK);
+        if (statSync(p).isFile()) return p;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function binMajorVersion(bin) {
+  return new Promise((resolve) => {
+    let out = '';
+    let child;
+    try {
+      child = spawn(bin, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      return resolve(0);
+    }
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 10_000);
+    child.stdout.on('data', (d) => { out += d; });
+    child.on('error', () => { clearTimeout(timer); resolve(0); });
+    child.on('close', () => {
+      clearTimeout(timer);
+      const m = /(\d+)\.\d+/.exec(out);
+      resolve(m ? Number(m[1]) : 0);
+    });
+  });
+}
+
+// <folder>/node_modules/.bin first, then PATH. null when neither qualifies.
+async function lspResolveLocal(spec, folderAbs) {
+  const candidates = [];
+  const local = path.join(folderAbs, 'node_modules', '.bin', spec.bin);
+  try {
+    accessSync(local, fsConstants.X_OK);
+    candidates.push({ path: local, via: 'node_modules' });
+  } catch {}
+  const onPathBin = findOnPath(spec.bin);
+  if (onPathBin) candidates.push({ path: onPathBin, via: 'path' });
+  for (const c of candidates) {
+    if (spec.minMajor && (await binMajorVersion(c.path)) < spec.minMajor) continue;
+    return { cmd: c.path, args: spec.args, via: c.via };
+  }
+  return null;
+}
+
+function lspCommandLine(cmd, args) {
+  return [cmd, ...args].map((a) => (/[\s"']/.test(a) ? JSON.stringify(a) : a)).join(' ');
+}
+
+// Directories git ignores under the folder, as absolute paths. Empty when the
+// folder is not inside a work tree. `--directory` collapses a wholly ignored
+// directory to one entry, so node_modules costs one line, not thousands.
+function lspIgnoredDirs(folderAbs) {
+  return new Promise((resolve) => {
+    let out = '';
+    let child;
+    try {
+      child = spawn('git', ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], {
+        cwd: folderAbs,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      return resolve([]);
+    }
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 20_000);
+    child.stdout.on('data', (d) => { out += d; });
+    child.on('error', () => { clearTimeout(timer); resolve([]); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return resolve([]);
+      const dirs = out.split('\0').filter((p) => p.endsWith('/')).map((p) => path.join(folderAbs, p.slice(0, -1)));
+      resolve(dirs);
+    });
+  });
+}
+
+function lspUriIgnored(s, uri) {
+  if (!s.ignored.length || typeof uri !== 'string' || !uri.startsWith('file:')) return false;
+  let p;
+  try { p = fileURLToPath(uri); } catch { return false; }
+  return s.ignored.some((d) => p === d || p.startsWith(d + path.sep));
+}
+
+function lspFilterLocations(s, method, result) {
+  if (!result || !s.ignored.length) return result;
+  const uriOf = (x) => x?.targetUri ?? x?.uri ?? x?.location?.uri;
+  if (!Array.isArray(result)) {
+    // A lone Location or LocationLink, even inside an ignored dir, stays as is:
+    // dropping it would empty the result, and a definition is never emptied.
+    return result;
+  }
+  const kept = result.filter((x) => !lspUriIgnored(s, uriOf(x)));
+  if (!kept.length && LSP_KEEP_IF_EMPTY.has(method)) return result;
+  return kept;
+}
+
+function lspEntry(s) {
+  const rel = s.folderAbs === ROOT ? '' : path.relative(ROOT, s.folderAbs);
+  return {
+    id: s.id,
+    kind: s.kind,
+    language: LSP_KINDS[s.kind].language,
+    languages: LSP_KINDS[s.kind].languages,
+    folder: rel.startsWith('..') ? s.folderAbs : rel,
+    rootUri: s.rootUri,
+    pid: s.pid,
+    rssMB: s.rssMB ?? null,
+    state: s.state,
+    resolvedVia: s.via,
+    command: s.command,
+    startedAt: s.startedAt,
+    ...(s.exitCode !== undefined ? { exitCode: s.exitCode } : {}),
+  };
+}
+
+function lspSendServer(s, msg) {
+  if (!s.child.stdin.writable) return;
+  const body = Buffer.from(JSON.stringify(msg), 'utf8');
+  s.child.stdin.write(`Content-Length: ${body.length}\r\n\r\n`);
+  s.child.stdin.write(body);
+}
+
+function lspSendBrowser(s, msg) {
+  const ws = s.socket?.ws;
+  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
+}
+
+// What the server asks of its client is answered here, because the stock
+// browser client refuses every server request — and the answers are where
+// the gitignore exclusion reaches basedpyright.
+function lspAnswerServerRequest(s, msg) {
+  let result = null;
+  if (msg.method === 'workspace/configuration') {
+    result = (msg.params?.items ?? []).map((it) => {
+      if (s.kind === 'basedpyright' && (it.section === 'python.analysis' || it.section === 'basedpyright.analysis')) {
+        // Setting exclude replaces basedpyright's defaults, so they come back.
+        const rel = s.ignored.map((d) => path.relative(s.folderAbs, d).split(path.sep).join('/'));
+        return { exclude: ['**/node_modules', '**/__pycache__', '**/.*', ...rel] };
+      }
+      return null;
+    });
+  } else if (msg.method === 'workspace/workspaceFolders') {
+    result = [{ uri: s.rootUri, name: path.basename(s.folderAbs) }];
+  } else if (msg.method === 'workspace/diagnostic/refresh') {
+    for (const uri of s.openDocs()) lspSchedulePull(s, uri);
+  } else if (
+    msg.method !== 'client/registerCapability' &&
+    msg.method !== 'client/unregisterCapability' &&
+    msg.method !== 'window/workDoneProgress/create' &&
+    msg.method !== 'workspace/semanticTokens/refresh' &&
+    msg.method !== 'workspace/inlayHint/refresh' &&
+    msg.method !== 'workspace/codeLens/refresh'
+  ) {
+    // Anything else (applyEdit, showMessageRequest) is the browser's call.
+    if (s.socket) return lspSendBrowser(s, msg);
+    return lspSendServer(s, { jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no client attached' } });
+  }
+  lspSendServer(s, { jsonrpc: '2.0', id: msg.id, result });
+}
+
+// TypeScript 7 only answers textDocument/diagnostic; the stock client only
+// renders publishDiagnostics. The bridge pulls after each edit settles.
+function lspSchedulePull(s, uri) {
+  if (!s.pullDiagnostics) return;
+  clearTimeout(s.pullTimers.get(uri));
+  s.pullTimers.set(uri, setTimeout(() => lspPull(s, uri, 1), 400));
+}
+
+function lspPull(s, uri, retries) {
+  s.pullTimers.delete(uri);
+  if (!s.openDocs().has(uri)) return;
+  const id = `bridge-${++s.bridgeSeq}`;
+  s.bridgePending.set(id, (msg) => {
+    if (msg.error) {
+      // ContentModified / ServerCancelled: the document moved on, ask again.
+      if (retries > 0 && (msg.error.code === -32801 || msg.error.code === -32802)) {
+        s.pullTimers.set(uri, setTimeout(() => lspPull(s, uri, retries - 1), 400));
+      }
+      return;
+    }
+    const r = msg.result;
+    if (!r || r.kind !== 'full' || lspUriIgnored(s, uri)) return;
+    lspSendBrowser(s, { jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: r.items ?? [] } });
+  });
+  lspSendServer(s, { jsonrpc: '2.0', id, method: 'textDocument/diagnostic', params: { textDocument: { uri } } });
+}
+
+function lspFromServer(s, msg) {
+  // Server → client request.
+  if (msg.id !== undefined && msg.method) return lspAnswerServerRequest(s, msg);
+  // Response.
+  if (msg.id !== undefined) {
+    const own = s.bridgePending.get(msg.id);
+    if (own) {
+      s.bridgePending.delete(msg.id);
+      return own(msg);
+    }
+    const method = s.browserPending.get(msg.id);
+    s.browserPending.delete(msg.id);
+    if (method === 'initialize' && msg.result) {
+      s.initResult = msg.result;
+      // Only TypeScript 7 needs pulling. ty and basedpyright advertise
+      // diagnosticProvider too but also push; pulling for them doubles every
+      // diagnostic in the editor.
+      s.pullDiagnostics = s.kind === 'tsgo' && !!msg.result.capabilities?.diagnosticProvider;
+      s.state = 'running';
+    }
+    if (method && LSP_LOCATION_METHODS.has(method) && msg.result) {
+      msg = { ...msg, result: lspFilterLocations(s, method, msg.result) };
+    }
+    return lspSendBrowser(s, msg);
+  }
+  // Notification.
+  if (msg.method === 'textDocument/publishDiagnostics' && lspUriIgnored(s, msg.params?.uri)) return;
+  lspSendBrowser(s, msg);
+}
+
+function lspFromBrowser(s, sock, msg) {
+  const m = msg.method;
+  if (m === 'initialize' && msg.id !== undefined) {
+    if (s.initResult) {
+      // The server only accepts one initialize; later attaches reuse it.
+      sock.swallowInitialized = true;
+      return lspSendBrowser(s, { jsonrpc: '2.0', id: msg.id, result: s.initResult });
+    }
+    const params = { ...(msg.params ?? {}) };
+    const caps = { ...(params.capabilities ?? {}) };
+    caps.workspace = { ...(caps.workspace ?? {}), configuration: true, workspaceFolders: true };
+    if (caps.textDocument) {
+      caps.textDocument = { ...caps.textDocument };
+      // Advertised pull support makes ty and basedpyright stop pushing.
+      delete caps.textDocument.diagnostic;
+    }
+    params.capabilities = caps;
+    params.workspaceFolders = [{ uri: s.rootUri, name: path.basename(s.folderAbs) }];
+    if (!params.rootUri) params.rootUri = s.rootUri;
+    s.browserPending.set(msg.id, m);
+    return lspSendServer(s, { ...msg, params });
+  }
+  if (m === 'initialized' && sock.swallowInitialized) {
+    sock.swallowInitialized = false;
+    return;
+  }
+  // A closing editor must not take the shared server down with it.
+  if (m === 'shutdown' && msg.id !== undefined) return lspSendBrowser(s, { jsonrpc: '2.0', id: msg.id, result: null });
+  if (m === 'exit') return;
+  const uri = msg.params?.textDocument?.uri;
+  if (m === 'textDocument/didOpen' && uri) sock.docs.add(uri);
+  if (m === 'textDocument/didClose' && uri) {
+    sock.docs.delete(uri);
+    clearTimeout(s.pullTimers.get(uri));
+    s.pullTimers.delete(uri);
+  }
+  if (msg.id !== undefined && m) s.browserPending.set(msg.id, m);
+  lspSendServer(s, msg);
+  if ((m === 'textDocument/didOpen' || m === 'textDocument/didChange') && uri) lspSchedulePull(s, uri);
+}
+
+// The previous socket's documents are closed on the server so the next
+// attach can open them again from a clean slate.
+function lspDetach(s, sock, code, reason) {
+  if (s.socket !== sock) return;
+  for (const uri of sock.docs) {
+    lspSendServer(s, { jsonrpc: '2.0', method: 'textDocument/didClose', params: { textDocument: { uri } } });
+    clearTimeout(s.pullTimers.get(uri));
+    s.pullTimers.delete(uri);
+  }
+  sock.docs.clear();
+  s.socket = null;
+  if (code && sock.ws.readyState === sock.ws.OPEN) sock.ws.close(code, reason);
+}
+
+async function lspStart(kind, folderAbs, allowDownload) {
+  const spec = LSP_KINDS[kind];
+  let resolved = await lspResolveLocal(spec, folderAbs);
+  if (!resolved) {
+    const command = lspCommandLine(spec.download.bin, spec.download.args);
+    if (!allowDownload) return { needsDownload: true, command };
+    const runner = findOnPath(spec.download.bin);
+    if (!runner) return { error: `${spec.download.bin} is not on PATH; cannot run: ${command}` };
+    resolved = { cmd: runner, args: spec.download.args, via: spec.download.via };
+  }
+  const ignored = await lspIgnoredDirs(folderAbs);
+  // Its own process group, so npx/uvx and whatever they start die together.
+  const child = spawn(resolved.cmd, resolved.args, {
+    cwd: folderAbs,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
+  });
+  const s = {
+    id: `lsp${++lspSeq}`,
+    kind,
+    folderAbs,
+    rootUri: pathToFileURL(folderAbs).href,
+    child,
+    pid: child.pid,
+    via: resolved.via,
+    // Basename only: the entry goes to the browser, and a resolved binary's
+    // full path would expose the host's home directory layout.
+    command: lspCommandLine(path.basename(resolved.cmd), resolved.args),
+    startedAt: new Date().toISOString(),
+    state: 'starting',
+    ignored,
+    initResult: null,
+    pullDiagnostics: false,
+    socket: null,
+    browserPending: new Map(),
+    bridgePending: new Map(),
+    bridgeSeq: 0,
+    pullTimers: new Map(),
+    stderrTail: '',
+    openDocs() { return this.socket?.docs ?? new Set(); },
+  };
+  child.on('spawn', () => { if (s.state === 'starting') s.state = 'running'; });
+  child.on('error', (e) => {
+    s.stderrTail = (s.stderrTail + String(e?.message ?? e)).slice(-4000);
+    s.state = 'exited';
+  });
+  child.stderr.on('data', (d) => { s.stderrTail = (s.stderrTail + d).slice(-4000); });
+  child.stdin.on('error', () => {});
+  let buf = Buffer.alloc(0);
+  child.stdout.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    for (;;) {
+      const sep = buf.indexOf('\r\n\r\n');
+      if (sep < 0) return;
+      const m = /Content-Length: *(\d+)/i.exec(buf.subarray(0, sep).toString('ascii'));
+      if (!m) { buf = buf.subarray(sep + 4); continue; }
+      const len = Number(m[1]);
+      if (buf.length < sep + 4 + len) return;
+      const body = buf.subarray(sep + 4, sep + 4 + len).toString('utf8');
+      buf = buf.subarray(sep + 4 + len);
+      let msg;
+      try { msg = JSON.parse(body); } catch { continue; }
+      try { lspFromServer(s, msg); } catch (e) { console.error('lsp bridge:', e); }
+    }
+  });
+  child.on('exit', (code, signal) => {
+    s.state = 'exited';
+    s.exitCode = code ?? (signal ? 128 : 0);
+    for (const t of s.pullTimers.values()) clearTimeout(t);
+    s.pullTimers.clear();
+    if (s.socket) lspDetach(s, s.socket, 4001, 'language server exited');
+    s.onExit?.();
+  });
+  lspServers.set(s.id, s);
+  return { server: s };
+}
+
+function lspKillGroup(s, sig) {
+  try { process.kill(-s.pid, sig); } catch {}
+  try { s.child.kill(sig); } catch {}
+}
+
+// shutdown → exit → SIGTERM → SIGKILL, each step only if the last one did
+// not end the process. Resolves once it is gone.
+function lspStop(s) {
+  return new Promise((resolve) => {
+    lspServers.delete(s.id);
+    if (s.socket) lspDetach(s, s.socket, 1000, 'stopped');
+    if (s.state === 'exited' || s.child.exitCode !== null || s.child.signalCode !== null) {
+      lspKillGroup(s, 'SIGKILL');
+      return resolve();
+    }
+    const timers = [];
+    s.onExit = () => {
+      timers.forEach(clearTimeout);
+      // Stragglers in the group (npx's child) go with it.
+      lspKillGroup(s, 'SIGKILL');
+      resolve();
+    };
+    if (s.initResult) {
+      const id = `bridge-${++s.bridgeSeq}`;
+      s.bridgePending.set(id, () => lspSendServer(s, { jsonrpc: '2.0', method: 'exit' }));
+      lspSendServer(s, { jsonrpc: '2.0', id, method: 'shutdown' });
+    }
+    timers.push(setTimeout(() => lspKillGroup(s, 'SIGTERM'), 1500));
+    timers.push(setTimeout(() => { lspKillGroup(s, 'SIGKILL'); resolve(); }, 4000));
+  });
+}
+
+// Resident memory of the server and everything under it (npx → node → tsc).
+async function lspRssTree(pids) {
+  const wanted = new Set(pids);
+  const out = new Map(pids.map((p) => [p, 0]));
+  let rows = [];
+  if (process.platform === 'linux') {
+    const pageKB = (lspRssTree.pageKB ??= (() => {
+      const r = spawnSync('getconf', ['PAGESIZE'], { encoding: 'utf8' });
+      return Number(r.stdout) / 1024 || 4;
+    })());
+    let names = [];
+    try { names = await fs.readdir('/proc'); } catch {}
+    await Promise.all(names.filter((n) => /^\d+$/.test(n)).map(async (n) => {
+      try {
+        const st = await fs.readFile(`/proc/${n}/stat`, 'utf8');
+        const f = st.slice(st.lastIndexOf(')') + 2).split(' ');
+        rows.push([Number(n), Number(f[1]), Number(f[21]) * pageKB]);
+      } catch {}
+    }));
+  } else {
+    const r = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,rss='], { encoding: 'utf8' });
+    rows = (r.stdout ?? '').trim().split('\n').map((l) => l.trim().split(/\s+/).map(Number));
+  }
+  const kids = new Map();
+  const rss = new Map();
+  for (const [p, pp, kb] of rows) {
+    rss.set(p, kb);
+    if (!kids.has(pp)) kids.set(pp, []);
+    kids.get(pp).push(p);
+  }
+  for (const root of wanted) {
+    let total = 0;
+    const stack = [root];
+    const seen = new Set();
+    while (stack.length) {
+      const p = stack.pop();
+      if (seen.has(p)) continue;
+      seen.add(p);
+      total += rss.get(p) || 0;
+      stack.push(...(kids.get(p) ?? []));
+    }
+    out.set(root, total);
+  }
+  return out;
+}
+
+async function apiLspList(res) {
+  const all = [...lspServers.values()];
+  const live = all.filter((s) => s.state !== 'exited' && s.pid);
+  const rss = live.length ? await lspRssTree(live.map((s) => s.pid)) : new Map();
+  for (const s of all) s.rssMB = s.state === 'exited' ? null : Math.round((rss.get(s.pid) ?? 0) / 102.4) / 10;
+  return sendJson(res, 200, { servers: all.map(lspEntry) });
+}
+
+async function apiLspStart(req, res) {
+  let body;
+  try {
+    body = JSON.parse(String(await readBody(req)) || '{}');
+  } catch {
+    return sendJson(res, 400, { error: 'invalid JSON body' });
+  }
+  const kind = String(body.kind ?? '');
+  if (!LSP_KINDS[kind]) return sendJson(res, 400, { error: `unknown kind: ${kind}; expected one of ${Object.keys(LSP_KINDS).join(', ')}` });
+  const rel = typeof body.folder === 'string' && body.folder ? body.folder : '.';
+  const folderAbs = resolveSafe(rel);
+  if (!folderAbs) return sendJson(res, 400, { error: `path is outside the served root: ${rel}` });
+  try {
+    if (!(await fs.stat(folderAbs)).isDirectory()) throw new Error();
+  } catch {
+    return sendJson(res, 404, { error: `no such folder: ${rel}` });
+  }
+  for (const s of lspServers.values()) {
+    if (s.kind !== kind || s.folderAbs !== folderAbs) continue;
+    if (s.state !== 'exited') return sendJson(res, 200, lspEntry(s));
+    lspServers.delete(s.id);
+  }
+  let r;
+  try {
+    r = await lspStart(kind, folderAbs, !!body.allowDownload);
+  } catch (e) {
+    return sendJson(res, 500, { error: `failed to start ${kind}: ${String(e?.message ?? e)}` });
+  }
+  if (r.needsDownload) return sendJson(res, 409, { needsDownload: true, command: r.command });
+  if (r.error) return sendJson(res, 500, { error: r.error });
+  return sendJson(res, 200, lspEntry(r.server));
+}
+
+async function apiLspStop(res, id) {
+  const s = lspServers.get(id ?? '');
+  if (!s) return sendJson(res, 404, { error: 'no such language server' });
+  await lspStop(s);
+  res.writeHead(204);
+  return res.end();
+}
+
+// A newer attach replaces the older socket; the server itself never notices.
+lspWss.on('connection', (ws, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const s = lspServers.get(url.searchParams.get('id') ?? '');
+  if (!s || s.state === 'exited') {
+    ws.close(4004, 'no such language server');
+    return;
+  }
+  if (s.socket) lspDetach(s, s.socket, 4000, 'replaced by a newer attach');
+  const sock = { ws, docs: new Set(), swallowInitialized: false };
+  s.socket = sock;
+  ws.on('message', (raw) => {
+    if (s.socket !== sock) return;
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    try { lspFromBrowser(s, sock, msg); } catch (e) { console.error('lsp bridge:', e); }
+  });
+  ws.on('close', () => lspDetach(s, sock));
+});
+
+// Never outlive the server: same hooks as the terminals. SIGKILL to the
+// whole group, because an exit hook cannot wait for a polite shutdown.
+process.on('exit', () => {
+  for (const s of lspServers.values()) lspKillGroup(s, 'SIGKILL');
+});
+
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (!authorized(req, url)) {
@@ -3423,6 +3997,7 @@ server.on('upgrade', (req, socket, head) => {
   }
   const px = parseProxyPath(url.pathname);
   if (px && px.rest !== null) return proxyUpgrade(req, socket, head, px, url);
+  if (url.pathname === '/api/lsp') return lspWss.handleUpgrade(req, socket, head, (ws) => lspWss.emit('connection', ws, req));
   if (url.pathname !== '/api/pty') return socket.destroy();
   if (!pty) {
     socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');

@@ -94,7 +94,7 @@
   let revealSeq = 0;
 
   // Which view the bottom panel shows; the terminal keeps running when hidden.
-  let bottomView = $state<'terminal' | 'ports'>('terminal');
+  let bottomView = $state<'terminal' | 'ports' | 'lsp'>('terminal');
 
   // ---- Quick open: centred modal, Ctrl/Cmd+Shift+F files, Ctrl/Cmd+Shift+X commands ----
   let qoQuery = $state('');
@@ -249,6 +249,14 @@
     // tab that already has its own override keeps it.
     { label: 'Toggle Word Wrap Default', hint: 'all editors', run: () => wrapPref.toggle() },
     { label: 'Upgrade Server', hint: 'restarts — kills terminal sessions', run: () => void upgradeServer() },
+    // The palette has no sub-list, so the bare command narrows the palette to
+    // the per-kind entries below; each of those then asks for the folder.
+    { label: 'Start Language Server…', hint: 'TypeScript or Python', run: () => qoShow('>Start Language Server: ') },
+    ...LSP_KINDS.map((k) => ({
+      label: `Start Language Server: ${k.label}`,
+      hint: 'pick a folder',
+      run: () => { browse = { mode: 'lsp' as const, action: 'same' as const, kind: k.kind }; },
+    })),
   ];
   let qoCommands = $derived(
     qoTerm ? COMMANDS.filter((c) => c.label.toLowerCase().includes(qoTerm.toLowerCase())) : COMMANDS
@@ -685,7 +693,7 @@
 
   // VS Code-style workspace browser: absolute-path navigation that can leave
   // the served root (that is the point — /api/browse exists for it).
-  let browse = $state<{ mode: 'workspace' | 'file' | 'compare'; action: 'same' | 'tab' | 'window' } | null>(null);
+  let browse = $state<{ mode: 'workspace' | 'file' | 'compare' | 'lsp'; action: 'same' | 'tab' | 'window'; kind?: LspKind } | null>(null);
 
   function browseStartPath(): string {
     if (folder.startsWith('/')) return folder; // already an absolute anchor
@@ -724,10 +732,19 @@
     if (!b) return;
     const p = toWorkspacePath(abs);
     if (b.mode === 'workspace') openWorkspaceIn(p, b.action);
+    else if (b.mode === 'lsp') void startLspFrom(b.kind ?? 'tsgo', p);
     else if (b.mode === 'compare') {
       const t = compareSource();
       if (t) openCompare(compareAgainst(t, { path: p, label: baseName(p) }));
     } else void openFile(p, { pinned: true });
+  }
+
+  // Palette path: start, then show the panel so the new row is visible.
+  async function startLspFrom(kind: LspKind, p: string) {
+    const err = await startLanguageServer(kind, p);
+    bottomView = 'lsp';
+    layout.showBottom = true;
+    if (err) alert(err);
   }
 
   // ---- Sidebar outline ----
@@ -824,6 +841,8 @@
   import TerminalPanel from './server/TerminalPanel.svelte';
   import SearchPanel from './server/SearchPanel.svelte';
   import PortsPanel from './server/PortsPanel.svelte';
+  import LspPanel from './server/LspPanel.svelte';
+  import { LSP_KINDS, startLanguageServer, type LspKind } from '../lib/lsp-control';
   import { fileIconUrl, folderIconUrl } from '../lib/file-icons';
   import { TAB_DND_MIME, PATH_DND_MIME } from '../lib/dnd';
   import { tabDirLabels, dropSlot } from '../lib/tab-strip';
@@ -1087,7 +1106,7 @@
       activeGroupId = restored.some((g) => g.id === snap.activeGroupId) ? snap.activeGroupId : restored[0].id;
     }
     if (snap.sideView === 'explorer' || snap.sideView === 'search' || snap.sideView === 'compare') sideView = snap.sideView;
-    if (snap.bottomView === 'terminal' || snap.bottomView === 'ports') bottomView = snap.bottomView;
+    if (snap.bottomView === 'terminal' || snap.bottomView === 'ports' || snap.bottomView === 'lsp') bottomView = snap.bottomView;
     sessionRestored = true;
   }
   void restoreSession();
@@ -2400,6 +2419,7 @@
         <div class="panel-tabs">
           <button type="button" class:on={bottomView === 'terminal'} onclick={() => { bottomView = 'terminal'; }}>Terminal</button>
           <button type="button" class:on={bottomView === 'ports'} onclick={() => { bottomView = 'ports'; }}>Ports</button>
+          <button type="button" class:on={bottomView === 'lsp'} onclick={() => { bottomView = 'lsp'; }}>Language Servers</button>
         </div>
         <!-- Both stay mounted: hiding the terminal must not kill the shell. -->
         <div class="panel-view" class:hidden={bottomView !== 'terminal'}>
@@ -2407,6 +2427,9 @@
         </div>
         <div class="panel-view" class:hidden={bottomView !== 'ports'}>
           <PortsPanel visible={layout.showBottom && bottomView === 'ports'} />
+        </div>
+        <div class="panel-view" class:hidden={bottomView !== 'lsp'}>
+          <LspPanel visible={layout.showBottom && bottomView === 'lsp'} folder={folder} />
         </div>
       </section>
     </main>
@@ -2450,8 +2473,9 @@
 {/if}
 {#if browse}
   <WorkspaceBrowser
-    mode={browse.mode === 'workspace' ? 'workspace' : 'file'}
+    mode={browse.mode === 'workspace' || browse.mode === 'lsp' ? 'workspace' : 'file'}
     title={browse.mode === 'compare' ? 'Compare With File'
+      : browse.mode === 'lsp' ? `Start ${LSP_KINDS.find((k) => k.kind === browse?.kind)?.label ?? 'Language Server'} in Folder`
       : browse.mode === 'file' ? 'Open File'
       : browse.action === 'tab' ? 'Open Workspace in New Tab'
       : browse.action === 'window' ? 'Open Workspace in New Window'

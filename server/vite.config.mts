@@ -32,6 +32,8 @@ function languageDetectionChunkLoader(): Plugin {
 // Third app shell (server mode). Same pattern as vscode/vite.config.mts:
 // own root + entry, shared components via the @gmd alias, so everything in
 // src/components (minus App shells) + src/lib flows to all deliverables.
+const API_PORT = Number(process.env.IDE_API_PORT) || 8790;
+
 export default defineConfig({
   root: path.join(__dirname, 'web'),
   plugins: [
@@ -76,9 +78,11 @@ export default defineConfig({
     },
     proxy: {
       // Dev loop: vite serves the client with HMR, node server owns the API.
-      // The pty rule must come first — key order is match order.
-      '/api/pty': { target: 'ws://127.0.0.1:8790', ws: true },
-      '/api': 'http://127.0.0.1:8790',
+      // The WebSocket rules must come first — key order is match order.
+      // IDE_API_PORT points a second dev loop at its own node server.
+      '/api/pty': { target: `ws://127.0.0.1:${API_PORT}`, ws: true },
+      '/api/lsp': { target: `http://127.0.0.1:${API_PORT}`, ws: true },
+      '/api': `http://127.0.0.1:${API_PORT}`,
     },
   },
   build: {

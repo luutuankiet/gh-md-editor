@@ -45,9 +45,11 @@
   import { readScrollAnchor, applyScrollAnchor } from '../../lib/cm-scroll-anchor';
   import { setDiagnostics, setDiagnosticsEffect } from '@codemirror/lint';
   import { lspFor, onLspChange, type Conn } from '../../lib/lsp/client';
-  import { lspDefinition, lspReferences, type LspLoc } from '../../lib/lsp/actions';
+  import { lspDefinition, lspReferences, LspTimeout, type LspLoc } from '../../lib/lsp/actions';
+  import { referencesLens } from '../../lib/lsp/lens';
+  import { shareDoc } from '../../lib/lsp/doc-share';
   import { lineHasDiagnostic } from '../../lib/lsp/error-lens';
-  import { peekInline, showPeek, type PeekHit } from '../../lib/lsp/peek';
+  import { peekInline, showPeek, hitsFromLocs } from '../../lib/lsp/peek';
 
 
   // --- inline change gutter ---------------------------------------------------
@@ -502,169 +504,14 @@
         detail: { name: filename, nodes },
       }));
       syncCrumbs(vw);
-      void refreshLens(vw, nodes);
     }, 200);
   }
 
-  // --- reference lens --------------------------------------------------------
-  // The `N references` row above every declaration. Counts come from a single
-  // ripgrep over the workspace per outline settle rather than one per symbol —
-  // the endpoint takes every name in one alternation, which is the only reason
-  // this is affordable without a language server.
-  interface Lens { line: number; name: string; n: number }
-
-  class LensWidget extends WidgetType {
-    name: string;
-    n: number;
-    indent: number;
-    constructor(name: string, n: number, indent: number) {
-      super();
-      this.name = name;
-      this.n = n;
-      this.indent = indent;
-    }
-    // Equality keeps an unchanged row's DOM alive across recomputes, so a click
-    // landing while the outline re-settles is not thrown away mid-gesture.
-    eq(o: LensWidget) { return o.name === this.name && o.n === this.n && o.indent === this.indent; }
-    toDOM() {
-      const wrap = document.createElement('div');
-      wrap.className = this.n ? 'cm-refLens' : 'cm-refLens empty';
-      // Aligned with the declaration it belongs to, not with the left margin —
-      // a nested method's lens hanging at column zero reads as belonging to the
-      // class above it.
-      wrap.style.paddingLeft = `${this.indent}ch`;
-      const link = document.createElement('span');
-      link.className = 'cm-refLensLink';
-      link.textContent = this.n === 1 ? '1 reference' : `${this.n} references`;
-      if (this.n) {
-        link.setAttribute('role', 'button');
-        link.dataset.name = this.name;
-      }
-      wrap.appendChild(link);
-      return wrap;
-    }
-    // The lens is interactive; letting CodeMirror ignore its events would eat
-    // the click.
-    ignoreEvent() { return false; }
-  }
-
-  const setLens = StateEffect.define<Lens[]>();
-  const refLensField = StateField.define<DecorationSet>({
-    create: () => Decoration.none,
-    update(set, tr) {
-      let next = set.map(tr.changes);
-      for (const e of tr.effects) {
-        if (!e.is(setLens)) continue;
-        const doc = tr.state.doc;
-        const b = new RangeSetBuilder<Decoration>();
-        for (const l of e.value) {
-          if (l.line < 1 || l.line > doc.lines) continue;
-          const ln = doc.line(l.line);
-          const indent = /^[ \t]*/.exec(ln.text)?.[0].length ?? 0;
-          b.add(ln.from, ln.from, Decoration.widget({
-            widget: new LensWidget(l.name, l.n, indent),
-            block: true,
-            side: -1,
-          }));
-        }
-        next = b.finish();
-      }
-      return next;
-    },
-    provide: (f) => EditorView.decorations.from(f),
-  });
-
-  const refLensClicks = EditorView.domEventHandlers({
-    mousedown(e, vw) {
-      const link = (e.target as HTMLElement | null)?.closest('.cm-refLensLink') as HTMLElement | null;
-      const name = link?.dataset.name;
-      if (!name) return false;
-      // Without this the click also places the caret, which scrolls the buffer
-      // away from the declaration the peek is about to open under.
-      e.preventDefault();
-      // The lens sits above its declaration, so its own position is the start
-      // of that line; the peek hangs under it, as VS Code's does.
-      let pos: number;
-      try { pos = vw.posAtDOM(link!); } catch { pos = vw.state.selection.main.head; }
-      void openPeek(name, pos);
-      return true;
-    },
-  });
-
-  // What the definition and reference endpoints search. The anchored workspace
-  // rather than the whole server root: a root holding a dozen sibling checkouts
-  // would report matches from projects the reader never opened.
-  //
-  // This used to guess the workspace from the first path segment of the open
-  // file, which is only right when the workspace sits exactly one level below
-  // the server root — too wide for a nested workspace, and too narrow when the
-  // root IS the workspace. The host knows the real answer and now passes it.
+  // What the definition fallback endpoint searches: the anchored workspace
+  // rather than the whole server root, which can hold sibling checkouts the
+  // reader never opened.
   function searchScope(): string {
     return folder || '.';
-  }
-
-  const LENS_NAME_CAP = 120;
-  let lensCounts = new Map<string, number>();
-  let lensKey = '';
-
-  // Only declarations that create something callable or nameable from another
-  // file. A word count for a variable is a fiction whatever its scope: `const
-  // n` reported four hundred hits from every unrelated `n` in the workspace,
-  // and a top-level `let error` in a component reported four hundred more. A
-  // CSS rule has the same problem for the opposite reason — the selector is
-  // not an identifier anyone refers to by name.
-  const LENS_KINDS: ReadonlySet<string> = new Set(['function', 'class', 'interface', 'enum', 'module']);
-
-  function lensTargets(nodes: OutlineNode[], out: OutlineNode[] = []): OutlineNode[] {
-    for (const n of nodes) {
-      if (n.name && LENS_KINDS.has(n.kind ?? '') && /^[A-Za-z_$][\w$]{0,127}$/.test(n.name)) out.push(n);
-      lensTargets(n.children, out);
-    }
-    return out;
-  }
-
-  function paintLens(vw: EditorView, targets: OutlineNode[]) {
-    const seen = new Set<number>();
-    const rows: Lens[] = [];
-    for (const t of targets) {
-      const total = lensCounts.get(t.name as string);
-      if (total === undefined || seen.has(t.line)) continue;
-      seen.add(t.line);
-      // The declaration is itself one of the matches ripgrep counted, and a
-      // symbol that is only declared has zero references, not one.
-      rows.push({ line: t.line, name: t.name as string, n: Math.max(0, total - 1) });
-    }
-    rows.sort((a, b) => a.line - b.line);
-    vw.dispatch({ effects: setLens.of(rows) });
-  }
-
-  async function refreshLens(vw: EditorView, nodes: OutlineNode[]) {
-    // An unsaved buffer has no path to search from, and nothing on disk refers
-    // to it yet anyway.
-    if (!gitPath) return;
-    const targets = lensTargets(nodes).slice(0, LENS_NAME_CAP);
-    const names = [...new Set(targets.map((t) => t.name as string))];
-    const key = `${gitPath}\u0000${names.join(',')}`;
-    if (!names.length) {
-      lensKey = key;
-      lensCounts = new Map();
-      vw.dispatch({ effects: setLens.of([]) });
-      return;
-    }
-    // Typing inside a body moves the rows without changing the symbol set, so
-    // the counts are refetched only when that set actually changes. Repainting
-    // is cheap; a workspace-wide ripgrep per keystroke-settle is not.
-    if (key === lensKey) { paintLens(vw, targets); return; }
-    lensKey = key;
-    try {
-      const r = await fetch(
-        `/api/refcounts?names=${encodeURIComponent(names.join(','))}&path=${encodeURIComponent(searchScope())}`,
-      );
-      const j = (await r.json()) as { counts?: Record<string, number> };
-      if (untrack(() => view) !== vw || lensKey !== key) return;
-      lensCounts = new Map(Object.entries(j.counts ?? {}));
-      paintLens(vw, targets);
-    } catch { /* an unreachable counter just leaves the rows off */ }
   }
 
   // --- peek references -------------------------------------------------------
@@ -673,32 +520,24 @@
   // the locations grouped by file on its right. Escape closes it.
   let peekSeq = 0;
 
-  // `load` replaces the ripgrep lookup with another source of hits — the
-  // language server, when one covers this file. `pos` is where the peek hangs.
-  async function openPeek(
-    name: string,
-    pos: number,
-    load?: () => Promise<{ hits?: PeekHit[]; truncated?: boolean; error?: string }>,
-  ) {
-    const vw = view;
+  // `load` asks the language server for the locations; `pos` is where the
+  // peek hangs. The peek opens even for a single hit.
+  async function openPeek(name: string, pos: number, load: () => Promise<LspLoc[]>, on?: EditorView) {
+    const vw = on ?? view;
     if (!gitPath || !vw) return;
     const seq = ++peekSeq;
     try {
-      const j = load
-        ? await load()
-        : ((await (await fetch(
-          `/api/refs?name=${encodeURIComponent(name)}&path=${encodeURIComponent(searchScope())}`,
-        )).json()) as { hits?: PeekHit[]; truncated?: boolean; error?: string });
+      const hits = (await hitsFromLocs(await load()))
+        .sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
       if (seq !== peekSeq || view !== vw) return;
-      if (j.error) { showNotice(`References: ${j.error}`); return; }
-      const hits = (j.hits ?? []).sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
-      if (!hits.length) { showNotice(`No references to “${name}”`); return; }
+      if (!hits.length) { showNotice('No references found'); return; }
       showPeek(vw, pos, {
-        kind: 'refs', name, hits, truncated: !!j.truncated, here: gitPath,
+        kind: 'refs', name, hits, here: gitPath,
         theme: isDark ? darkBundle : lightBundle,
       });
-    } catch {
-      showNotice('Reference lookup failed');
+    } catch (e) {
+      if (seq !== peekSeq) return;
+      showNotice(e instanceof LspTimeout ? 'Server still indexing, try again in a moment' : 'Reference lookup failed');
     }
   }
 
@@ -995,7 +834,14 @@
     lspKey = key;
     const dropped = lsp !== null;
     lsp = got ? { conn: got.conn, uri: got.uri } : null;
-    vw.dispatch({ effects: lspCompartment.reconfigure(got ? got.extension : []) });
+    const conn = got?.conn;
+    vw.dispatch({
+      effects: lspCompartment.reconfigure(got && conn ? [
+        got.extension,
+        // The lens opens exactly the entries it counted.
+        referencesLens({ conn, uri: got.uri, open: (v, at, name, locs) => void openPeek(name, at, async () => locs, v) }),
+      ] : []),
+    });
     // The lint state lives outside the compartment, so emptying it leaves the
     // last squiggles behind, and inline blame keeps hiding on their lines.
     if (dropped) vw.dispatch(setDiagnostics(vw.state, []));
@@ -1007,6 +853,16 @@
     void syncLsp();
   });
   $effect(() => onLspChange(() => void syncLsp()));
+
+  // An editable file tab shares its text with any peek showing the same file.
+  const shareCompartment = new Compartment();
+  $effect(() => {
+    const p = gitPath;
+    const ro = readOnly;
+    const vw = view;
+    if (!vw) return;
+    vw.dispatch({ effects: shareCompartment.reconfigure(p && !ro ? shareDoc(p, 'main') : []) });
+  });
 
   // Where the symbol at `pos` is defined: the server first, then a declaration
   // in this file, then the first workspace-wide guess.
@@ -1055,42 +911,16 @@
     });
   }
 
-  // Server hits become the same rows ripgrep produces, so the existing
-  // references peek renders them unchanged. Each file is fetched once.
-  async function lspRefHits(ls: { conn: Conn; uri: string }, vw: EditorView, pos: number) {
-    const locs: LspLoc[] = await lspReferences(ls.conn, ls.uri, vw, pos);
-    const texts = new Map<string, string[]>();
-    for (const path of new Set(locs.map((l) => l.path))) {
-      if (path === gitPath) { texts.set(path, vw.state.doc.toString().split('\n')); continue; }
-      try {
-        const j = (await (await fetch(`/api/file?path=${encodeURIComponent(path)}`)).json()) as { content?: string };
-        texts.set(path, (j.content ?? '').split('\n'));
-      } catch { texts.set(path, []); }
-    }
-    const hits: PeekHit[] = locs.map((l) => {
-      const text = texts.get(l.path)?.[l.line - 1] ?? '';
-      const end = l.endLine === l.line ? l.endCol : text.length;
-      return { path: l.path, line: l.line, text, cols: [[l.col, end]] };
-    });
-    return { hits };
-  }
-
+  // Find All References, Peek References: the language server only, with the
+  // declaration included. A name match is not a reference, so there is no
+  // text-search fallback; without a server the user is told why.
   function findReferences(vw: EditorView, pos: number) {
     const w = vw.state.wordAt(pos);
     if (!w) return;
     const name = vw.state.sliceDoc(w.from, w.to);
     const ls = lsp;
-    if (!ls) { void openPeek(name, pos); return; }
-    // An empty or failed server answer still deserves the ripgrep result.
-    void openPeek(name, pos, async () => {
-      try {
-        const r = await lspRefHits(ls, vw, pos);
-        if (r.hits.length) return r;
-      } catch { /* fall back */ }
-      return (await (await fetch(
-        `/api/refs?name=${encodeURIComponent(name)}&path=${encodeURIComponent(searchScope())}`,
-      )).json()) as { hits?: PeekHit[]; truncated?: boolean; error?: string };
-    });
+    if (!ls) { showNotice('Find All References needs a language server for this file'); return; }
+    void openPeek(name, pos, () => lspReferences(ls.conn, ls.uri, vw, pos));
   }
 
   // Right-click menu. Positioned in viewport coordinates, so it sits wherever
@@ -1526,8 +1356,9 @@
         changePeeks,
         changePeekDecorations,
         navFlashField,
-        refLensField,
-        refLensClicks,
+        // Registers this view as the file's main buffer so a peek showing the
+        // same file edits the same text.
+        shareCompartment.of([]),
         wrapCompartment.of(untrack(() => wrapFor(viewKey)) ? EditorView.lineWrapping : []),
         markCompartment.of([]),
         languageCompartment.of([]),
@@ -1558,19 +1389,6 @@
             outline: '1px solid rgba(229, 192, 32, 0.55)',
             borderRadius: '2px',
           },
-          // The reference lens. Deliberately quiet — it sits above every
-          // declaration in the file, so anything louder would out-shout the
-          // code it annotates.
-          '.cm-refLens': {
-            paddingTop: '2px',
-            fontSize: '11px',
-            lineHeight: '1.3',
-            color: '#7a7a7a',
-            userSelect: 'none',
-          },
-          '.cm-refLensLink': { cursor: 'pointer' },
-          '.cm-refLensLink:hover': { color: '#4daafc', textDecoration: 'underline' },
-          '.cm-refLens.empty .cm-refLensLink': { cursor: 'default', opacity: '0.65' },
           '.cm-conflictBlock': { backgroundColor: 'rgba(229, 133, 32, 0.07)' },
           '.cm-conflictBlockActive': {
             backgroundColor: 'rgba(229, 133, 32, 0.13)',
@@ -1600,14 +1418,15 @@
               toggleWrap(vw);
               return true;
             }
-            // Alt/Opt+X peeks the definition inline. Matched on event.code for
-            // the same reason as KeyZ: macOS Option turns event.key into `≈`.
-            // Only taken when the caret is on or just after an identifier, so
-            // Opt+X still types `≈` in prose, strings and blank space.
+            // Alt/Opt+X peeks the references inline (Shift+F12 does the same).
+            // Matched on event.code for the same reason as KeyZ: macOS Option
+            // turns event.key into `≈`. Only taken when the caret is on or just
+            // after an identifier, so Opt+X still types `≈` in prose, strings
+            // and blank space.
             if (event.altKey && !event.metaKey && !event.ctrlKey && !event.shiftKey && event.code === 'KeyX'
               && identifierAt(vw, vw.state.selection.main.head)) {
               event.preventDefault();
-              void peekDefinition(vw, vw.state.selection.main.head);
+              findReferences(vw, vw.state.selection.main.head);
               return true;
             }
             return false;
@@ -1684,14 +1503,22 @@
           { key: 'Alt-z', preventDefault: true, run: (vw) => { toggleWrap(vw); return true; } },
           // VS Code's Format Document chord, same on every platform.
           { key: 'Shift-Alt-f', preventDefault: true, run: formatDocument },
-          // VS Code's Find All References chord.
-          {
-            key: 'Shift-Alt-F12',
+          // VS Code's chords: Find All References, Peek References, Peek
+          // Definition, Go to Definition.
+          ...['Shift-Alt-F12', 'Shift-F12'].map((key) => ({
+            key,
             preventDefault: true,
-            run: (vw) => {
-              findReferences(vw, vw.state.selection.main.head);
-              return true;
-            },
+            run: (vw: EditorView) => { findReferences(vw, vw.state.selection.main.head); return true; },
+          })),
+          {
+            key: 'Alt-F12',
+            preventDefault: true,
+            run: (vw) => { void peekDefinition(vw, vw.state.selection.main.head); return true; },
+          },
+          {
+            key: 'F12',
+            preventDefault: true,
+            run: (vw) => { void goToDefinition(vw, vw.state.selection.main.head); return true; },
           },
         ]),
         EditorView.updateListener.of((u) => {
@@ -2209,9 +2036,9 @@
     </div>
     {#if ctxMenu}
       <div class="ctx-menu" role="menu" style="left: {ctxMenu.x}px; top: {ctxMenu.y}px">
-        <button role="menuitem" onclick={() => ctxRun('def')}>Go to Definition</button>
-        <button role="menuitem" onclick={() => ctxRun('peek')}>Peek Definition <kbd>Alt+X</kbd></button>
-        <button role="menuitem" onclick={() => ctxRun('refs')}>Find All References <kbd>Shift+Alt+F12</kbd></button>
+        <button role="menuitem" onclick={() => ctxRun('def')}>Go to Definition <kbd>F12</kbd></button>
+        <button role="menuitem" onclick={() => ctxRun('peek')}>Peek Definition <kbd>Alt+F12</kbd></button>
+        <button role="menuitem" onclick={() => ctxRun('refs')}>Find All References <kbd>Shift+F12</kbd></button>
       </div>
     {/if}
   </div>

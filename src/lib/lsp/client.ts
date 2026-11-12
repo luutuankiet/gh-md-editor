@@ -174,7 +174,13 @@ class GmdWorkspace extends Workspace {
   closeFile(uri: string, view: EditorView) {
     const file = this.files.find((f) => f.uri === uri);
     if (!file) return;
+    // Unsent changes are tracked on the first view. When that one goes while a
+    // peek on the same file stays, flush them first and start the survivor
+    // from a clean slate, or its next sync resends edits the server has.
+    const wasFirst = file.views[0] === view && file.views.length > 1;
+    if (wasFirst) this.client.sync();
     file.views = file.views.filter((v) => v !== view);
+    if (wasFirst) LSPPlugin.get(file.views[0])?.clear();
     if (file.views.length) return;
     this.files = this.files.filter((f) => f !== file);
     if (this.client.connected) this.client.didClose(uri);

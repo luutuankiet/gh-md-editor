@@ -1,17 +1,24 @@
 // The inline peek: Peek Definition and Find All References shown in a block
 // under the line that asked, the way VS Code does it. The left pane is a real
-// read-only CodeMirror view carrying the main editor's theme and the file's
-// language, so the code reads in the same colours as the code around it. The
+// CodeMirror view carrying the main editor's theme and the file's language, so
+// the code reads in the same colours as the code around it. It is editable:
+// it shares its text with the file's tab when one is open (./doc-share), gets
+// the language server's hover and lens, and Mod+S saves that file. The
 // right pane lists every location grouped by file; picking a row swaps the
 // left pane to that file and line. Not the git change peek (`gmd-peek`), which
 // is a different widget entirely.
 
-import { StateField, StateEffect, Prec, EditorState, Text, type Extension } from '@codemirror/state';
+import { StateField, StateEffect, Prec, EditorState, Text, Compartment, type Extension } from '@codemirror/state';
 import {
   EditorView, Decoration, WidgetType, keymap, lineNumbers, ViewPlugin,
   type DecorationSet, type ViewUpdate,
 } from '@codemirror/view';
+import { history, historyKeymap, defaultKeymap } from '@codemirror/commands';
 import { describeFor } from '../lang-detect';
+import { shareDoc, liveText, tabOwns, saveViaTab, fromShare } from './doc-share';
+import { lspFor, type Conn } from './client';
+import { referencesLens } from './lens';
+import { lspDefinition, type LspLoc } from './actions';
 
 export interface PeekHit { path: string; line: number; text: string; cols?: [number, number][] }
 
@@ -63,6 +70,7 @@ const setMark = StateEffect.define<{ line: number; cols: [number, number] | null
 const markField = StateField.define<DecorationSet>({
   create: () => Decoration.none,
   update(v, tr) {
+    v = v.map(tr.changes);
     for (const e of tr.effects) {
       if (!e.is(setMark)) continue;
       const { line, cols } = e.value;
@@ -140,8 +148,86 @@ class Peek {
   }
 
   close() {
+    if (!confirmDiscard(this.st)) return;
     this.outer.dispatch({ effects: setPeek.of(null) });
     this.outer.focus();
+  }
+
+  // Replaces this peek with another one hanging at the same line.
+  private move(next: Omit<PeekSpec, 'at'>) {
+    const at = this.outer.state.field(field, false)?.at ?? this.spec.at;
+    const spec = { ...next, at };
+    // Unsaved edits to files with no tab travel with the peek.
+    ui.set(spec, { sel: 0, folded: new Set(), cache: this.st.cache, mtime: this.st.mtime, dirty: this.st.dirty });
+    this.outer.dispatch({ effects: setPeek.of(spec) });
+  }
+
+  private ls: { conn: Conn; uri: string } | null = null;
+  private lspSlot = new Compartment();
+  private lspSeq = 0;
+
+  // Hover, completion and the references lens for the file in the left pane,
+  // when a running server covers it.
+  private async attachLsp(path: string) {
+    const seq = ++this.lspSeq;
+    this.ls = null;
+    const got = await lspFor(path).catch(() => null);
+    if (seq !== this.lspSeq || !got || !this.inner || this.innerPath !== path) return;
+    this.ls = { conn: got.conn, uri: got.uri };
+    const open = (_v: EditorView, _pos: number, name: string, locs: LspLoc[]) => {
+      void hitsFromLocs(locs).then((hits) => {
+        if (hits.length) this.move({ ...this.spec, kind: 'refs', name, hits, truncated: false });
+      });
+    };
+    this.inner.dispatch({
+      effects: this.lspSlot.reconfigure([got.extension, referencesLens({ conn: got.conn, uri: got.uri, open })]),
+    });
+  }
+
+  // Mod+click on a symbol in the left pane: the peek moves to its definition.
+  private async gotoDef(v: EditorView, pos: number) {
+    const ls = this.ls;
+    if (!ls) return;
+    const hit = (await lspDefinition(ls.conn, ls.uri, v, pos).catch(() => []))[0];
+    if (!hit) return;
+    const w = v.state.wordAt(pos);
+    const end = hit.endLine === hit.line ? hit.endCol : hit.col;
+    this.move({
+      ...this.spec,
+      kind: 'def',
+      name: w ? v.state.sliceDoc(w.from, w.to) : '',
+      hits: [{ path: hit.path, line: hit.line, text: '', cols: [[hit.col, end]] }],
+      truncated: false,
+    });
+  }
+
+  // Mod+S: through the file's tab when one is open (that is what clears its
+  // dirty dot), else straight to disk with the same conflict check the tab uses.
+  private async save(path: string) {
+    if (tabOwns(path)) { saveViaTab(path); return; }
+    const inner = this.inner;
+    if (!inner || this.innerPath !== path) return;
+    const content = inner.state.doc.toString();
+    const put = (baseMtimeMs?: number) => fetch('/api/file', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path, content, baseMtimeMs }),
+    });
+    try {
+      let r = await put(this.st.mtime.get(path));
+      if (r.status === 409) {
+        const j = (await r.json()) as { mtimeMs?: number };
+        if (!confirm(`${path} changed on disk since the peek loaded it. Overwrite it?`)) return;
+        r = await put(j.mtimeMs);
+      }
+      if (!r.ok) { alert(`Could not save ${path}`); return; }
+      const j = (await r.json()) as { mtimeMs?: number };
+      if (typeof j.mtimeMs === 'number') this.st.mtime.set(path, j.mtimeMs);
+      this.st.dirty.delete(path);
+      window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
+    } catch {
+      alert(`Could not save ${path}`);
+    }
   }
 
   focus() {
@@ -262,35 +348,59 @@ class Peek {
     void this.select(vis[next]);
   }
 
+  // An open editor's live text first, then this peek's own edited copy, then disk.
   private async text(path: string): Promise<string | null> {
+    const live = liveText(path);
+    if (live != null) return live;
     if (path === this.spec.here) return this.outer.state.doc.toString();
     const hit = this.st.cache.get(path);
     if (hit !== undefined) return hit;
     try {
-      const j = (await (await fetch(`/api/file?path=${encodeURIComponent(path)}`)).json()) as { content?: string };
+      const j = (await (await fetch(`/api/file?path=${encodeURIComponent(path)}`)).json()) as {
+        content?: string; mtimeMs?: number;
+      };
       if (typeof j.content !== 'string') return null;
       this.st.cache.set(path, j.content);
+      if (typeof j.mtimeMs === 'number') this.st.mtime.set(path, j.mtimeMs);
       return j.content;
     } catch {
       return null;
     }
   }
 
-  private innerExtensions(lang: Extension): Extension {
+  private innerExtensions(lang: Extension, path: string): Extension {
     return [
-      EditorState.readOnly.of(true),
       lineNumbers(),
+      history(),
       this.spec.theme,
       innerTheme,
       lang,
       markField,
+      shareDoc(path, 'peek'),
+      this.lspSlot.of([]),
       Prec.highest(keymap.of([
         { key: 'Escape', run: () => { this.close(); return true; } },
+        { key: 'Mod-s', preventDefault: true, run: () => { void this.save(path); return true; } },
       ])),
+      keymap.of([...defaultKeymap, ...historyKeymap]),
+      // A file with no open tab keeps its edits here until saved or discarded.
+      EditorView.updateListener.of((u) => {
+        if (!u.docChanged || tabOwns(path)) return;
+        this.st.cache.set(path, u.state.doc.toString());
+        if (!u.transactions.some((tr) => tr.annotation(fromShare))) this.st.dirty.add(path);
+      }),
       // Escape is handled above; stopping it here keeps the same keystroke from
       // also reaching a panel listener further up the page.
       EditorView.domEventHandlers({
         keydown: (e) => { if (e.key === 'Escape') e.stopPropagation(); return false; },
+        mousedown: (e, v) => {
+          if (e.button !== 0 || !(e.metaKey || e.ctrlKey) || !this.ls) return false;
+          const pos = v.posAtCoords({ x: e.clientX, y: e.clientY });
+          if (pos == null) return false;
+          e.preventDefault();
+          void this.gotoDef(v, pos);
+          return true;
+        },
       }),
     ];
   }
@@ -315,9 +425,10 @@ class Peek {
       if (seq !== this.seq || !this.inner) return;
       inner.setState(EditorState.create({
         doc: Text.of((content ?? `Could not load ${hit.path}`).split('\n')),
-        extensions: this.innerExtensions(lang),
+        extensions: this.innerExtensions(lang, hit.path),
       }));
       this.innerPath = hit.path;
+      void this.attachLsp(hit.path);
     }
     const doc = inner.state.doc;
     const n = Math.max(1, Math.min(hit.line, doc.lines));
@@ -335,6 +446,7 @@ class Peek {
 
   destroy() {
     this.seq++;
+    this.lspSeq++;
     this.inner?.destroy();
     this.inner = null;
   }
@@ -342,8 +454,23 @@ class Peek {
 
 // What survives the widget being torn down and rebuilt, which CodeMirror does
 // whenever the line it hangs under scrolls out of the viewport and back.
-interface UiState { sel: number; folded: Set<string>; cache: Map<string, string> }
+// `cache` doubles as the edited copy of a file with no open tab; `dirty` names
+// the ones not yet saved.
+interface UiState {
+  sel: number;
+  folded: Set<string>;
+  cache: Map<string, string>;
+  mtime: Map<string, number>;
+  dirty: Set<string>;
+}
 const ui = new WeakMap<PeekSpec, UiState>();
+
+function confirmDiscard(st: UiState | undefined): boolean {
+  if (!st?.dirty.size) return true;
+  if (!confirm(`Discard unsaved peek edits to ${[...st.dirty].join(', ')}?`)) return false;
+  st.dirty.clear();
+  return true;
+}
 
 class PeekWidget extends WidgetType {
   private peek: Peek | null = null;
@@ -361,7 +488,7 @@ class PeekWidget extends WidgetType {
       const hits = this.spec.hits;
       let sel = hits.findIndex((h) => h.path === this.spec.here && h.line === line);
       if (sel < 0) sel = hits.findIndex((h) => h.path === this.spec.here);
-      st = { sel: Math.max(0, sel), folded: new Set(), cache: new Map() };
+      st = { sel: Math.max(0, sel), folded: new Set(), cache: new Map(), mtime: new Map(), dirty: new Set() };
       ui.set(this.spec, st);
     }
     this.peek = new Peek(this.spec, st, view);
@@ -374,17 +501,21 @@ class PeekWidget extends WidgetType {
   ignoreEvent() { return true; }
 }
 
-const field = StateField.define<PeekSpec | null>({
+// Edits keep the peek open (the peek itself edits the same text): the line it
+// hangs under is mapped through them and snapped back to that line's end, while
+// the widget stays the same object so its pane and caret survive.
+const field = StateField.define<{ spec: PeekSpec; at: number } | null>({
   create: () => null,
   update(v, tr) {
-    // Any edit closes it: the widget hangs at a fixed offset and the lines it
-    // shows may be the ones just edited.
-    if (tr.docChanged) v = null;
-    for (const e of tr.effects) if (e.is(setPeek)) v = e.value;
+    if (v && tr.docChanged) {
+      const at = tr.state.doc.lineAt(tr.changes.mapPos(v.at, 1)).to;
+      v = { spec: v.spec, at };
+    }
+    for (const e of tr.effects) if (e.is(setPeek)) v = e.value ? { spec: e.value, at: e.value.at } : null;
     return v;
   },
   provide: (f) => EditorView.decorations.from(f, (v) =>
-    v ? Decoration.set([Decoration.widget({ widget: new PeekWidget(v), block: true, side: 1 }).range(v.at)]) : Decoration.none),
+    v ? Decoration.set([Decoration.widget({ widget: new PeekWidget(v.spec), block: true, side: 1 }).range(v.at)]) : Decoration.none),
 });
 
 // The peek spans the visible width rather than the content's, which on a file
@@ -512,7 +643,9 @@ const theme = EditorView.baseTheme({
 const escape = Prec.high(keymap.of([{
   key: 'Escape',
   run: (v) => {
-    if (!v.state.field(field, false)) return false;
+    const open = v.state.field(field, false);
+    if (!open) return false;
+    if (!confirmDiscard(ui.get(open.spec))) return true;
     v.dispatch({ effects: setPeek.of(null) });
     return true;
   },
@@ -524,4 +657,23 @@ export const peekInline: Extension = [field, theme, escape, widthSync];
 export function showPeek(view: EditorView, pos: number, spec: Omit<PeekSpec, 'at'>) {
   const at = view.state.doc.lineAt(Math.min(pos, view.state.doc.length)).to;
   view.dispatch({ effects: setPeek.of({ ...spec, at }) });
+}
+
+/** Server locations as peek rows, each line read from an open editor or disk. */
+export async function hitsFromLocs(locs: LspLoc[]): Promise<PeekHit[]> {
+  const texts = new Map<string, string[]>();
+  for (const path of new Set(locs.map((l) => l.path))) {
+    let t = liveText(path);
+    if (t == null) {
+      try {
+        t = ((await (await fetch(`/api/file?path=${encodeURIComponent(path)}`)).json()) as { content?: string }).content ?? '';
+      } catch { t = ''; }
+    }
+    texts.set(path, t.split('\n'));
+  }
+  return locs.map((l) => {
+    const text = texts.get(l.path)?.[l.line - 1] ?? '';
+    const end = l.endLine === l.line ? l.endCol : text.length;
+    return { path: l.path, line: l.line, text, cols: [[l.col, end]] };
+  });
 }

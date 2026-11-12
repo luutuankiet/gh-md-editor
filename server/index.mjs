@@ -4117,6 +4117,9 @@ function lspFromBrowser(s, sock, msg) {
   }
   if (m === 'initialized' && sock.swallowInitialized) {
     sock.swallowInitialized = false;
+    // A reattaching editor (page reload) gets every file's last diagnostics,
+    // open or not, so the explorer and Problems panel come back populated.
+    for (const cached of s.diagCache.values()) lspSendBrowser(s, cached);
     return;
   }
   // A closing editor must not take the shared server down with it.

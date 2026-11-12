@@ -7,6 +7,7 @@
   import LspStatus from './LspStatus.svelte';
   import PythonInterpreter from './PythonInterpreter.svelte';
   import SchemaPicker from './SchemaPicker.svelte';
+  import { totals } from '../../lib/lsp/diag-store.svelte';
 
   type Repo = {
     repo: string;
@@ -119,6 +120,8 @@
   // Confirmation that the repair command reached the clipboard. That command
   // is the entire point of the broken-worktree row, and a copy button that
   // gives no sign of having worked gets pressed three times and trusted none.
+  // Problem counts across every file a language server reported on.
+  let diag = $derived(totals());
   let toast = $state('');
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
   function showToast(msg: string) {
@@ -325,6 +328,16 @@
     <span class="caret">▴</span>
   </button>
 
+  <button
+    type="button"
+    class="seg problems"
+    title="{diag.errors} error{diag.errors === 1 ? '' : 's'}, {diag.warnings} warning{diag.warnings === 1 ? '' : 's'}: show the Problems panel"
+    onclick={() => window.dispatchEvent(new CustomEvent('gmd:show-problems'))}
+  >
+    <span class="pe" class:none={!diag.errors}>✕ {diag.errors}</span>
+    <span class="pw" class:none={!diag.warnings}>⚠ {diag.warnings}</span>
+  </button>
+
   <span class="gap"></span>
 
   <PythonInterpreter path={lspPath} />
@@ -464,6 +477,10 @@
   button.seg:hover { background: #3a3a3a; }
   .seg.flat { color: #949494; }
   .seg.err { color: #e58520; }
+  .seg.problems { gap: 8px; }
+  .seg.problems .pe { color: #f14c4c; }
+  .seg.problems .pw { color: #cca700; }
+  .seg.problems .none { color: #949494; }
   .ico {
     width: 12px;
     height: 12px;

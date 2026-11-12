@@ -21,6 +21,7 @@ something is implemented.
 
 | page | covers | verified |
 |---|---|---|
+| [Language servers (LSP bridge and client)](../../../docs/architecture/language-servers.md) | where hover, completion, diagnostics, go-to-definition and references from a real language server come from, what the node bridge does to the messages, and how a code tab attaches | 2026-11-12 |
 | [Release and delivery](../../../docs/architecture/release-and-delivery.md) | which manifest publishes what, what a v* tag triggers, and how a running server upgrades itself | 2026-08-20 |
 | [The server HTTP surface](../../../docs/architecture/server-http-surface.md) | where an API handler lives in server/index.mjs, how paths are made safe, and how symlinks are classified | 2026-08-20 |
 | [Source-line mapping and reveal-counterpart](../../../docs/architecture/source-line-mapping.md) | how a preview element knows which markdown line produced it, and why the panes do not scroll together | 2026-08-20 |

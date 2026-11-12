@@ -33,6 +33,7 @@ crashing.
 | a search under src/ returned an enormous unreadable blob and I have no idea what matched | [GREP_ON_SRC_DUMPS_MEGABYTES_OF_ONE_LINE_SVG](../../../docs/traps/GREP_ON_SRC_DUMPS_MEGABYTES_OF_ONE_LINE_SVG.md) | repository layout / searching | 2026-08-20 |
 | I saved a file, the editor reported success, and the change is not on disk | [SAVING_A_FILE_THROUGH_A_SYMLINK_SILENTLY_LOSES_THE_EDIT](../../../docs/traps/SAVING_A_FILE_THROUGH_A_SYMLINK_SILENTLY_LOSES_THE_EDIT.md) | server save path | 2026-08-20 |
 | the scroll position drifts a little further down the file each time I reopen the tab | [SCROLL_POSITION_WALKS_FURTHER_DOWN_THE_FILE_EVERY_TIME_YOU_REOPEN_A_TAB](../../../docs/traps/SCROLL_POSITION_WALKS_FURTHER_DOWN_THE_FILE_EVERY_TIME_YOU_REOPEN_A_TAB.md) | tab view state / CodeMirror | 2026-08-20 |
+| after git pull the dev server page never gets past its loading skeleton, and the network tab shows a 500 for a src/lib file | [THE_DEV_APP_HANGS_ON_ITS_SKELETON_AFTER_PULLING](../../../docs/traps/THE_DEV_APP_HANGS_ON_ITS_SKELETON_AFTER_PULLING.md) | dev environment / Vite | 2026-11-12 |
 
 ## Reference
 

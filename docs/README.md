@@ -15,6 +15,7 @@ something is implemented.
 
 | page | covers | verified |
 |---|---|---|
+| [Language servers (LSP bridge and client)](architecture/language-servers.md) | where hover, completion, diagnostics, go-to-definition and references from a real language server come from, what the node bridge does to the messages, and how a code tab attaches | 2026-11-12 |
 | [Release and delivery](architecture/release-and-delivery.md) | which manifest publishes what, what a v* tag triggers, and how a running server upgrades itself | 2026-08-20 |
 | [The server HTTP surface](architecture/server-http-surface.md) | where an API handler lives in server/index.mjs, how paths are made safe, and how symlinks are classified | 2026-08-20 |
 | [Source-line mapping and reveal-counterpart](architecture/source-line-mapping.md) | how a preview element knows which markdown line produced it, and why the panes do not scroll together | 2026-08-20 |
@@ -39,6 +40,7 @@ crashing.
 | a search under src/ returned an enormous unreadable blob and I have no idea what matched | [GREP_ON_SRC_DUMPS_MEGABYTES_OF_ONE_LINE_SVG](traps/GREP_ON_SRC_DUMPS_MEGABYTES_OF_ONE_LINE_SVG.md) | repository layout / searching | 2026-08-20 |
 | I saved a file, the editor reported success, and the change is not on disk | [SAVING_A_FILE_THROUGH_A_SYMLINK_SILENTLY_LOSES_THE_EDIT](traps/SAVING_A_FILE_THROUGH_A_SYMLINK_SILENTLY_LOSES_THE_EDIT.md) | server save path | 2026-08-20 |
 | the scroll position drifts a little further down the file each time I reopen the tab | [SCROLL_POSITION_WALKS_FURTHER_DOWN_THE_FILE_EVERY_TIME_YOU_REOPEN_A_TAB](traps/SCROLL_POSITION_WALKS_FURTHER_DOWN_THE_FILE_EVERY_TIME_YOU_REOPEN_A_TAB.md) | tab view state / CodeMirror | 2026-08-20 |
+| after git pull the dev server page never gets past its loading skeleton, and the network tab shows a 500 for a src/lib file | [THE_DEV_APP_HANGS_ON_ITS_SKELETON_AFTER_PULLING](traps/THE_DEV_APP_HANGS_ON_ITS_SKELETON_AFTER_PULLING.md) | dev environment / Vite | 2026-11-12 |
 
 ## Reference
 

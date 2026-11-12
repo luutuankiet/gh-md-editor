@@ -3573,6 +3573,9 @@ function lspUriIgnored(s, uri) {
   return s.ignored.some((d) => p === d || p.startsWith(d + path.sep));
 }
 
+// The only thing keeping gitignored folders out of navigation results:
+// basedpyright ignores the exclude sent through workspace/configuration, and
+// the bridge sends tsc none.
 function lspFilterLocations(s, method, result) {
   if (!result || !s.ignored.length) return result;
   const uriOf = (x) => x?.targetUri ?? x?.uri ?? x?.location?.uri;
@@ -3618,14 +3621,16 @@ function lspSendBrowser(s, msg) {
 }
 
 // What the server asks of its client is answered here, because the stock
-// browser client refuses every server request — and the answers are where
-// the gitignore exclusion reaches basedpyright.
+// browser client refuses every server request.
 function lspAnswerServerRequest(s, msg) {
   let result = null;
   if (msg.method === 'workspace/configuration') {
     result = (msg.params?.items ?? []).map((it) => {
       if (s.kind === 'basedpyright' && (it.section === 'python.analysis' || it.section === 'basedpyright.analysis')) {
         // Setting exclude replaces basedpyright's defaults, so they come back.
+        // Measured: this reply does not stop basedpyright indexing ignored
+        // folders (it still logs every file under them). lspFilterLocations
+        // is what keeps them out of results; never remove it on this account.
         const rel = s.ignored.map((d) => path.relative(s.folderAbs, d).split(path.sep).join('/'));
         return { exclude: ['**/node_modules', '**/__pycache__', '**/.*', ...rel] };
       }

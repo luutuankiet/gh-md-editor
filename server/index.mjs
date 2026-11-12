@@ -1460,7 +1460,12 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/ports' && req.method === 'GET') return await apiPorts(res);
     if (url.pathname === '/api/lsp' && req.method === 'GET') return await apiLspList(res);
     if (url.pathname === '/api/lsp' && req.method === 'POST') return await apiLspStart(req, res);
-    if (url.pathname === '/api/lsp' && req.method === 'DELETE') return await apiLspStop(res, url.searchParams.get('id'));
+    if (url.pathname === '/api/lsp' && req.method === 'DELETE') return await apiLspStop(res, url.searchParams);
+    if (url.pathname === '/api/lsp/restart' && req.method === 'POST') return await apiLspRestart(req, res);
+    if (url.pathname === '/api/lsp/autostart' && req.method === 'POST') return await apiLspAutostart(req, res);
+    if (url.pathname === '/api/lsp/log' && req.method === 'GET') return await apiLspLog(res, url.searchParams.get('id'));
+    if (url.pathname === '/api/lsp/settings' && req.method === 'GET') return await apiLspSettingsGet(res, url.searchParams);
+    if (url.pathname === '/api/lsp/settings' && req.method === 'PATCH') return await apiLspSettingsPatch(req, res);
     if (url.pathname === '/api/version' && req.method === 'GET') return await apiVersion(res);
     if (url.pathname === '/api/upgrade' && req.method === 'POST') return apiUpgrade(res);
     if (url.pathname.startsWith('/api/')) return sendJson(res, 404, { error: 'unknown endpoint' });
@@ -3424,43 +3429,146 @@ wss.on('connection', (ws, req) => {
 // --- language servers (opt-in) ----------------------------------------------
 // The browser speaks LSP to a server process running here, through a bridge
 // that owns everything the stock @codemirror/lsp-client cannot do: answering
-// the server's own requests, turning TypeScript 7's pull diagnostics into the
-// push notifications the client renders, and keeping gitignored folders out
-// of navigation results. Never started on its own; one process per
+// the server's own requests (settings included), turning TypeScript 7's pull
+// diagnostics into the push notifications the client renders, keeping
+// gitignored folders out of navigation results, and tracking progress so the
+// status bar can say "indexing". Never started on its own: only on a user
+// action, or on opening a file in a workspace where the user started that
+// server before (the remembered autoStart list). One process per
 // (kind, folder) lives until Stop or this process exits.
 //
 // Control plane (HTTP):
-//   GET    /api/lsp        → {servers:[entry]}
-//   POST   /api/lsp        {kind, folder, allowDownload?} → entry, or
-//                          409 {needsDownload, command} when nothing local
-//   DELETE /api/lsp?id=x   → 204 after shutdown/exit, SIGTERM, SIGKILL
+//   GET    /api/lsp              → {servers:[entry], kinds:{kind: public spec}}
+//   POST   /api/lsp              {kind, folder, allowDownload?, workspace?} → entry,
+//                                or 409 {needsDownload, command} when nothing local;
+//                                a start with a workspace is remembered for autostart
+//   DELETE /api/lsp?id=x[&forget=1] → 204 once the process is gone; forget drops
+//                                it from the workspace's autostart list
+//   POST   /api/lsp/restart      {id} → entry of the new process
+//   POST   /api/lsp/autostart    {workspace, path} → {started:[entry]}
+//   GET    /api/lsp/log?id=x     → text: stderr, window/logMessage, bridge events
+//   GET    /api/lsp/settings?workspace=  → stored settings plus the effective tree
+//   PATCH  /api/lsp/settings     {workspace, shared?, servers?, autoStart?}
+//                                (JSON merge patch; null deletes a key)
 // Data plane (WS): /api/lsp?id=<id>; one WS text message = one JSON-RPC body.
 
+// One entry per server the IDE knows how to run. Fields:
+//   label        shown in the palette, the panel and the status bar
+//   extensions   file extension → LSP language id the editor announces
+//   filenames    exact basename → language id (Dockerfile, .bashrc)
+//   globs        basename glob with * → language id (*.dockerfile)
+//   bin, args    the local command; minMajor rejects older binaries
+//   lookup       where the local command is looked for, in order:
+//                'node_modules' (<folder>/node_modules/.bin) and 'path'
+//   download     what runs when nothing is local, only after the user agrees
+//   sections     the settings sections the server reads, for the settings UI
+//   defaults     settings tree merged under the user's own
+//   derive(ctx)  settings computed per start: ctx = {shared, folderAbs,
+//                ignoredRel}; shared holds cross-server choices such as the
+//                Python interpreter (shared.python.interpreter) and JSON/YAML
+//                schema maps (shared.schemas)
+//   pushOnInit   also send workspace/didChangeConfiguration right after the
+//                editor's `initialized`, for servers that never pull
+//   initOptions(settings)  initializationOptions merged into initialize
 const LSP_KINDS = {
   tsgo: {
+    label: 'TypeScript 7 (tsgo)',
     language: 'typescript',
     languages: ['typescript', 'javascript'],
+    // TS 7 needs the *react ids to parse JSX.
+    extensions: {
+      ts: 'typescript', mts: 'typescript', cts: 'typescript', tsx: 'typescriptreact',
+      js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascriptreact',
+    },
+    filenames: {},
+    globs: {},
     bin: 'tsc',
     args: ['--lsp', '--stdio'],
     // Older `tsc` binaries are everywhere and have no --lsp; only 7+ counts.
     minMajor: 7,
-    download: { via: 'npx', bin: 'npx', args: ['-y', '-p', 'typescript@7', 'tsc', '--lsp', '--stdio'] },
+    lookup: ['node_modules', 'path'],
+    download: { via: 'npx', bin: 'npx', args: ['-y', '-p', 'typescript@7', 'tsc', '--lsp', '--stdio'], package: 'typescript@7' },
+    sections: ['typescript', 'javascript'],
+    defaults: {},
   },
   ty: {
+    label: 'Python (ty)',
     language: 'python',
     languages: ['python'],
+    extensions: { py: 'python', pyi: 'python' },
+    filenames: {},
+    globs: {},
     bin: 'ty',
     args: ['server'],
-    download: { via: 'uvx', bin: 'uvx', args: ['ty', 'server'] },
+    lookup: ['node_modules', 'path'],
+    download: { via: 'uvx', bin: 'uvx', args: ['ty', 'server'], package: 'ty' },
+    sections: ['ty'],
+    defaults: {},
   },
   basedpyright: {
+    label: 'Python (basedpyright)',
     language: 'python',
     languages: ['python'],
+    extensions: { py: 'python', pyi: 'python' },
+    filenames: {},
+    globs: {},
     bin: 'basedpyright-langserver',
     args: ['--stdio'],
-    download: { via: 'uvx', bin: 'uvx', args: ['--from', 'basedpyright', 'basedpyright-langserver', '--stdio'] },
+    lookup: ['node_modules', 'path'],
+    download: { via: 'uvx', bin: 'uvx', args: ['--from', 'basedpyright', 'basedpyright-langserver', '--stdio'], package: 'basedpyright' },
+    sections: ['python', 'basedpyright'],
+    defaults: {},
+    derive({ shared, ignoredRel }) {
+      // Setting exclude replaces basedpyright's defaults, so they come back.
+      // Measured: this does not stop basedpyright indexing ignored folders
+      // (it still logs every file under them). lspFilterLocations is what
+      // keeps them out of results; never remove it on this account.
+      const exclude = ['**/node_modules', '**/__pycache__', '**/.*', ...ignoredRel];
+      const tree = {
+        python: { analysis: { exclude } },
+        basedpyright: { analysis: { exclude } },
+      };
+      const interpreter = shared?.python?.interpreter;
+      if (typeof interpreter === 'string' && interpreter) tree.python.pythonPath = interpreter;
+      return tree;
+    },
   },
 };
+
+// What the browser may see of the registry: no functions, no local paths.
+function lspKindsPublic() {
+  const out = {};
+  for (const [kind, k] of Object.entries(LSP_KINDS)) {
+    out[kind] = {
+      label: k.label,
+      language: k.language,
+      languages: k.languages,
+      extensions: k.extensions,
+      filenames: k.filenames,
+      globs: k.globs,
+      sections: k.sections,
+      download: k.download ? { via: k.download.via, command: lspCommandLine(k.download.bin, k.download.args) } : null,
+    };
+  }
+  return out;
+}
+
+// The language id `spec` announces for a file, or null when it does not
+// serve that file.
+function lspLanguageIdFor(spec, filePath) {
+  const base = path.basename(filePath);
+  if (Object.hasOwn(spec.filenames, base)) return spec.filenames[base];
+  const dot = base.lastIndexOf('.');
+  if (dot >= 0) {
+    const ext = base.slice(dot + 1).toLowerCase();
+    if (Object.hasOwn(spec.extensions, ext)) return spec.extensions[ext];
+  }
+  for (const [glob, id] of Object.entries(spec.globs)) {
+    const re = new RegExp('^' + glob.split('*').map((p) => p.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', 'i');
+    if (re.test(base)) return id;
+  }
+  return null;
+}
 
 // Responses to these get locations inside gitignored folders removed.
 const LSP_LOCATION_METHODS = new Set([
@@ -3482,6 +3590,118 @@ const LSP_KEEP_IF_EMPTY = new Set([
 const lspServers = new Map();
 let lspSeq = 0;
 const lspWss = new WebSocketServer({ noServer: true });
+
+// --- per-workspace settings ---------------------------------------------------
+// Stored per user, never inside the project: one JSON file per workspace,
+// keyed by a hash of the workspace's absolute path.
+
+const LSP_CONFIG_HOME = process.env.GH_MD_EDITOR_HOME
+  ? path.join(process.env.GH_MD_EDITOR_HOME, 'config')
+  : path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'gh-md-editor');
+
+function lspSettingsFile(wsAbs) {
+  const key = crypto.createHash('sha256').update(wsAbs).digest('hex').slice(0, 16);
+  return path.join(LSP_CONFIG_HOME, 'workspaces', `${key}.json`);
+}
+
+const isPlainObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+// RFC 7386 JSON merge patch: objects merge, null deletes, anything else
+// replaces. Also how the user's tree is laid over the defaults.
+function lspMergePatch(target, patch) {
+  if (!isPlainObj(patch)) return patch;
+  const out = isPlainObj(target) ? { ...target } : {};
+  for (const [k, v] of Object.entries(patch)) {
+    if (UNSAFE_KEYS.has(k)) continue;
+    if (v === null) delete out[k];
+    else out[k] = lspMergePatch(out[k], v);
+  }
+  return out;
+}
+
+function lspEmptySettings(wsAbs) {
+  return { folder: wsAbs, autoStart: [], shared: {}, servers: {} };
+}
+
+async function lspReadSettings(wsAbs) {
+  const file = lspSettingsFile(wsAbs);
+  let raw;
+  try {
+    raw = await fs.readFile(file, 'utf8');
+  } catch {
+    return lspEmptySettings(wsAbs);
+  }
+  try {
+    const d = JSON.parse(raw);
+    return {
+      folder: wsAbs,
+      autoStart: Array.isArray(d.autoStart) ? d.autoStart.filter((a) => a && Object.hasOwn(LSP_KINDS, a.kind) && typeof a.folder === 'string') : [],
+      shared: isPlainObj(d.shared) ? d.shared : {},
+      servers: isPlainObj(d.servers) ? d.servers : {},
+    };
+  } catch (e) {
+    console.error(`language server settings: ${file} is not valid JSON, ignoring it: ${e.message}`);
+    return lspEmptySettings(wsAbs);
+  }
+}
+
+// Writes for one file run one after another, each read-modify-write whole,
+// so two quick PATCHes cannot drop each other's change.
+const lspSettingsChains = new Map();
+
+function lspUpdateSettings(wsAbs, mutate) {
+  const file = lspSettingsFile(wsAbs);
+  const prev = lspSettingsChains.get(file) ?? Promise.resolve();
+  const next = prev.catch(() => {}).then(async () => {
+    const cur = await lspReadSettings(wsAbs);
+    const updated = mutate(cur) ?? cur;
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify(updated, null, 2) + '\n', 'utf8');
+    await fs.rename(tmp, file);
+    return updated;
+  });
+  lspSettingsChains.set(file, next);
+  next.finally(() => { if (lspSettingsChains.get(file) === next) lspSettingsChains.delete(file); }).catch(() => {});
+  return next;
+}
+
+// defaults, then what the bridge derives for this folder, then the user's own.
+function lspEffectiveSettings(kind, settings, folderAbs, ignored) {
+  const spec = LSP_KINDS[kind];
+  const ignoredRel = ignored.map((d) => path.relative(folderAbs, d).split(path.sep).join('/'));
+  const derived = spec.derive ? spec.derive({ shared: settings.shared, folderAbs, ignoredRel }) : {};
+  return lspMergePatch(lspMergePatch(spec.defaults ?? {}, derived), settings.servers?.[kind] ?? {});
+}
+
+// workspace/configuration: a dotted section walks the tree; no section is the
+// whole tree; a missing key answers null.
+function lspConfigSection(tree, section) {
+  if (!section) return tree;
+  let cur = tree;
+  for (const part of String(section).split('.')) {
+    if (!isPlainObj(cur) || !Object.hasOwn(cur, part)) return null;
+    cur = cur[part];
+  }
+  return cur === undefined ? null : cur;
+}
+
+// --- server log ----------------------------------------------------------------
+
+const LSP_LOG_MAX = 200_000;
+const LSP_STDERR_TAIL = 2_000;
+
+function lspLog(s, tag, text) {
+  const t = new Date().toISOString().slice(11, 23);
+  const body = String(text).replace(/\s+$/, '');
+  s.log = (s.log + `[${t}] ${tag}: ${body}\n`).slice(-LSP_LOG_MAX);
+}
+
+const lspShort = (v, n = 600) => {
+  const j = JSON.stringify(v) ?? 'undefined';
+  return j.length > n ? `${j.slice(0, n)}... (${j.length} chars)` : j;
+};
 
 function findOnPath(bin) {
   const exts = process.platform === 'win32' ? ['.exe', '.cmd', ''] : [''];
@@ -3518,16 +3738,22 @@ function binMajorVersion(bin) {
   });
 }
 
-// <folder>/node_modules/.bin first, then PATH. null when neither qualifies.
+// The spec's lookup order (default <folder>/node_modules/.bin, then PATH).
+// null when nothing qualifies.
 async function lspResolveLocal(spec, folderAbs) {
   const candidates = [];
-  const local = path.join(folderAbs, 'node_modules', '.bin', spec.bin);
-  try {
-    accessSync(local, fsConstants.X_OK);
-    candidates.push({ path: local, via: 'node_modules' });
-  } catch {}
-  const onPathBin = findOnPath(spec.bin);
-  if (onPathBin) candidates.push({ path: onPathBin, via: 'path' });
+  for (const where of spec.lookup ?? ['node_modules', 'path']) {
+    if (where === 'node_modules') {
+      const local = path.join(folderAbs, 'node_modules', '.bin', spec.bin);
+      try {
+        accessSync(local, fsConstants.X_OK);
+        candidates.push({ path: local, via: 'node_modules' });
+      } catch {}
+    } else if (where === 'path') {
+      const onPathBin = findOnPath(spec.bin);
+      if (onPathBin) candidates.push({ path: onPathBin, via: 'path' });
+    }
+  }
   for (const c of candidates) {
     if (spec.minMajor && (await binMajorVersion(c.path)) < spec.minMajor) continue;
     return { cmd: c.path, args: spec.args, via: c.via };
@@ -3589,21 +3815,38 @@ function lspFilterLocations(s, method, result) {
   return kept;
 }
 
+// What the status bar shows. `state` is the process (starting, running,
+// stopping, exited); `status` is what the user cares about.
+function lspStatus(s) {
+  if (s.state === 'exited') return s.stopRequested ? 'stopped' : 'crashed';
+  if (s.state === 'stopping') return 'stopping';
+  if (s.state === 'starting' || (s.initSent && !s.initResult)) return 'starting';
+  if (!s.initResult) return 'waiting';
+  if (s.progress.size) return 'indexing';
+  return 'ready';
+}
+
 function lspEntry(s) {
   const rel = s.folderAbs === ROOT ? '' : path.relative(ROOT, s.folderAbs);
+  const last = [...s.progress.values()].pop();
   return {
     id: s.id,
     kind: s.kind,
+    label: LSP_KINDS[s.kind].label,
     language: LSP_KINDS[s.kind].language,
     languages: LSP_KINDS[s.kind].languages,
     folder: rel.startsWith('..') ? s.folderAbs : rel,
+    workspace: toClientPath(s.workspaceAbs),
     rootUri: s.rootUri,
     pid: s.pid,
     rssMB: s.rssMB ?? null,
     state: s.state,
+    status: lspStatus(s),
+    progress: last ? { title: last.title ?? '', message: last.message ?? '', percentage: last.percentage ?? null } : null,
     resolvedVia: s.via,
     command: s.command,
     startedAt: s.startedAt,
+    stderrTail: s.stderrTail.slice(-LSP_STDERR_TAIL),
     ...(s.exitCode !== undefined ? { exitCode: s.exitCode } : {}),
   };
 }
@@ -3620,37 +3863,61 @@ function lspSendBrowser(s, msg) {
   if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
 }
 
+// The answer a server gets for a request the editor never answered: the
+// editor detached, or it took longer than 10 s.
+function lspFallbackReply(method, why) {
+  if (method === 'workspace/applyEdit') return { result: { applied: false, failureReason: why } };
+  return { error: { code: -32601, message: why } };
+}
+
+// A server request handed to the editor; answered by the fallback if the
+// editor goes away or stays silent.
+function lspForwardToBrowser(s, msg) {
+  const timer = setTimeout(() => {
+    if (!s.forwarded.delete(msg.id)) return;
+    lspLog(s, 'bridge', `${msg.method} (id ${msg.id}) got no editor answer in 10 s; answered for it`);
+    lspSendServer(s, { jsonrpc: '2.0', id: msg.id, ...lspFallbackReply(msg.method, 'the editor did not answer') });
+  }, 10_000);
+  s.forwarded.set(msg.id, { method: msg.method, timer });
+  lspSendBrowser(s, msg);
+}
+
+function lspFailForwarded(s, why) {
+  for (const [id, f] of s.forwarded) {
+    clearTimeout(f.timer);
+    lspSendServer(s, { jsonrpc: '2.0', id, ...lspFallbackReply(f.method, why) });
+  }
+  s.forwarded.clear();
+}
+
 // What the server asks of its client is answered here, because the stock
 // browser client refuses every server request.
 function lspAnswerServerRequest(s, msg) {
   let result = null;
   if (msg.method === 'workspace/configuration') {
-    result = (msg.params?.items ?? []).map((it) => {
-      if (s.kind === 'basedpyright' && (it.section === 'python.analysis' || it.section === 'basedpyright.analysis')) {
-        // Setting exclude replaces basedpyright's defaults, so they come back.
-        // Measured: this reply does not stop basedpyright indexing ignored
-        // folders (it still logs every file under them). lspFilterLocations
-        // is what keeps them out of results; never remove it on this account.
-        const rel = s.ignored.map((d) => path.relative(s.folderAbs, d).split(path.sep).join('/'));
-        return { exclude: ['**/node_modules', '**/__pycache__', '**/.*', ...rel] };
-      }
-      return null;
-    });
+    result = (msg.params?.items ?? []).map((it) => lspConfigSection(s.settings, it.section));
+    lspLog(s, 'config', `${lspShort((msg.params?.items ?? []).map((it) => it.section ?? '(all)'), 200)} -> ${lspShort(result)}`);
   } else if (msg.method === 'workspace/workspaceFolders') {
     result = [{ uri: s.rootUri, name: path.basename(s.folderAbs) }];
   } else if (msg.method === 'workspace/diagnostic/refresh') {
     for (const uri of s.openDocs()) lspSchedulePull(s, uri);
+  } else if (msg.method === 'window/workDoneProgress/create') {
+    // Progress on these tokens is the bridge's to track, not the editor's.
+    if (msg.params?.token !== undefined) s.progressTokens.add(String(msg.params.token));
+  } else if (msg.method === 'window/showMessageRequest') {
+    // The stock editor has no UI for it; dismissing is a valid answer.
+    lspLog(s, 'message', `${msg.params?.message ?? ''} (choices: ${(msg.params?.actions ?? []).map((a) => a.title).join(', ') || 'none'}; dismissed)`);
   } else if (
     msg.method !== 'client/registerCapability' &&
     msg.method !== 'client/unregisterCapability' &&
-    msg.method !== 'window/workDoneProgress/create' &&
     msg.method !== 'workspace/semanticTokens/refresh' &&
     msg.method !== 'workspace/inlayHint/refresh' &&
     msg.method !== 'workspace/codeLens/refresh'
   ) {
-    // Anything else (applyEdit, showMessageRequest) is the browser's call.
-    if (s.socket) return lspSendBrowser(s, msg);
-    return lspSendServer(s, { jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no client attached' } });
+    // Anything else (workspace/applyEdit above all) is the editor's call.
+    lspLog(s, 'bridge', `server asked ${msg.method} (id ${msg.id})${s.socket ? ', forwarded to the editor' : ', no editor attached'}`);
+    if (s.socket) return lspForwardToBrowser(s, msg);
+    return lspSendServer(s, { jsonrpc: '2.0', id: msg.id, ...lspFallbackReply(msg.method, 'no editor attached') });
   }
   lspSendServer(s, { jsonrpc: '2.0', id: msg.id, result });
 }
@@ -3682,6 +3949,12 @@ function lspPull(s, uri, retries) {
   lspSendServer(s, { jsonrpc: '2.0', id, method: 'textDocument/diagnostic', params: { textDocument: { uri } } });
 }
 
+function lspPushSettings(s, why) {
+  if (!s.initResult || s.state !== 'running') return;
+  lspLog(s, 'config', `push (${why}) workspace/didChangeConfiguration ${lspShort(s.settings)}`);
+  lspSendServer(s, { jsonrpc: '2.0', method: 'workspace/didChangeConfiguration', params: { settings: s.settings } });
+}
+
 function lspFromServer(s, msg) {
   // Server → client request.
   if (msg.id !== undefined && msg.method) return lspAnswerServerRequest(s, msg);
@@ -3701,6 +3974,9 @@ function lspFromServer(s, msg) {
       // diagnostic in the editor.
       s.pullDiagnostics = s.kind === 'tsgo' && !!msg.result.capabilities?.diagnosticProvider;
       s.state = 'running';
+      lspLog(s, 'bridge', `initialized: ${msg.result.serverInfo?.name ?? s.kind} ${msg.result.serverInfo?.version ?? ''}`);
+    } else if (method === 'initialize' && msg.error) {
+      lspLog(s, 'bridge', `initialize failed: ${lspShort(msg.error)}`);
     }
     if (method && LSP_LOCATION_METHODS.has(method) && msg.result) {
       msg = { ...msg, result: lspFilterLocations(s, method, msg.result) };
@@ -3708,6 +3984,27 @@ function lspFromServer(s, msg) {
     return lspSendBrowser(s, msg);
   }
   // Notification.
+  if (msg.method === '$/progress') {
+    const token = String(msg.params?.token);
+    if (s.progressTokens.has(token)) {
+      const v = msg.params?.value ?? {};
+      if (v.kind === 'begin') {
+        s.progress.set(token, { title: v.title, message: v.message, percentage: v.percentage });
+        lspLog(s, 'progress', `begin ${v.title ?? ''} ${v.message ?? ''}`);
+      } else if (v.kind === 'report') {
+        const p = s.progress.get(token);
+        if (p) Object.assign(p, v.message !== undefined ? { message: v.message } : {}, v.percentage !== undefined ? { percentage: v.percentage } : {});
+      } else if (v.kind === 'end') {
+        s.progress.delete(token);
+        s.progressTokens.delete(token);
+        lspLog(s, 'progress', `end ${v.message ?? ''}`);
+      }
+      return;
+    }
+  }
+  if (msg.method === 'window/logMessage' || msg.method === 'window/showMessage') {
+    lspLog(s, msg.method === 'window/logMessage' ? 'log' : 'message', msg.params?.message ?? '');
+  }
   if (msg.method === 'textDocument/publishDiagnostics' && lspUriIgnored(s, msg.params?.uri)) return;
   lspSendBrowser(s, msg);
 }
@@ -3722,7 +4019,9 @@ function lspFromBrowser(s, sock, msg) {
     }
     const params = { ...(msg.params ?? {}) };
     const caps = { ...(params.capabilities ?? {}) };
-    caps.workspace = { ...(caps.workspace ?? {}), configuration: true, workspaceFolders: true };
+    caps.workspace = { ...(caps.workspace ?? {}), configuration: true, workspaceFolders: true, didChangeConfiguration: { dynamicRegistration: false } };
+    // The bridge, not the editor, consumes progress: it drives the status bar.
+    caps.window = { ...(caps.window ?? {}), workDoneProgress: true };
     if (caps.textDocument) {
       caps.textDocument = { ...caps.textDocument };
       // Advertised pull support makes ty and basedpyright stop pushing.
@@ -3731,7 +4030,10 @@ function lspFromBrowser(s, sock, msg) {
     params.capabilities = caps;
     params.workspaceFolders = [{ uri: s.rootUri, name: path.basename(s.folderAbs) }];
     if (!params.rootUri) params.rootUri = s.rootUri;
+    const spec = LSP_KINDS[s.kind];
+    if (spec.initOptions) params.initializationOptions = lspMergePatch(params.initializationOptions ?? {}, spec.initOptions(s.settings));
     s.browserPending.set(msg.id, m);
+    s.initSent = true;
     return lspSendServer(s, { ...msg, params });
   }
   if (m === 'initialized' && sock.swallowInitialized) {
@@ -3741,6 +4043,11 @@ function lspFromBrowser(s, sock, msg) {
   // A closing editor must not take the shared server down with it.
   if (m === 'shutdown' && msg.id !== undefined) return lspSendBrowser(s, { jsonrpc: '2.0', id: msg.id, result: null });
   if (m === 'exit') return;
+  // The editor's answer to a request the bridge forwarded.
+  if (!m && msg.id !== undefined && s.forwarded.has(msg.id)) {
+    clearTimeout(s.forwarded.get(msg.id).timer);
+    s.forwarded.delete(msg.id);
+  }
   const uri = msg.params?.textDocument?.uri;
   if (m === 'textDocument/didOpen' && uri) sock.docs.add(uri);
   if (m === 'textDocument/didClose' && uri) {
@@ -3750,6 +4057,7 @@ function lspFromBrowser(s, sock, msg) {
   }
   if (msg.id !== undefined && m) s.browserPending.set(msg.id, m);
   lspSendServer(s, msg);
+  if (m === 'initialized' && LSP_KINDS[s.kind].pushOnInit) lspPushSettings(s, 'after initialized');
   if ((m === 'textDocument/didOpen' || m === 'textDocument/didChange') && uri) lspSchedulePull(s, uri);
 }
 
@@ -3764,13 +4072,15 @@ function lspDetach(s, sock, code, reason) {
   }
   sock.docs.clear();
   s.socket = null;
+  lspFailForwarded(s, 'the editor detached');
   if (code && sock.ws.readyState === sock.ws.OPEN) sock.ws.close(code, reason);
 }
 
-async function lspStart(kind, folderAbs, allowDownload) {
+async function lspStart(kind, folderAbs, allowDownload, workspaceAbs) {
   const spec = LSP_KINDS[kind];
   let resolved = await lspResolveLocal(spec, folderAbs);
   if (!resolved) {
+    if (!spec.download) return { error: `no local ${spec.bin} found and ${kind} has no download fallback` };
     const command = lspCommandLine(spec.download.bin, spec.download.args);
     if (!allowDownload) return { needsDownload: true, command };
     const runner = findOnPath(spec.download.bin);
@@ -3778,6 +4088,7 @@ async function lspStart(kind, folderAbs, allowDownload) {
     resolved = { cmd: runner, args: spec.download.args, via: spec.download.via };
   }
   const ignored = await lspIgnoredDirs(folderAbs);
+  const settings = lspEffectiveSettings(kind, await lspReadSettings(workspaceAbs), folderAbs, ignored);
   // Its own process group, so npx/uvx and whatever they start die together.
   const child = spawn(resolved.cmd, resolved.args, {
     cwd: folderAbs,
@@ -3788,16 +4099,20 @@ async function lspStart(kind, folderAbs, allowDownload) {
     id: `lsp${++lspSeq}`,
     kind,
     folderAbs,
+    workspaceAbs,
     rootUri: pathToFileURL(folderAbs).href,
     child,
     pid: child.pid,
     via: resolved.via,
+    allowDownload: !!allowDownload,
     // Basename only: the entry goes to the browser, and a resolved binary's
     // full path would expose the host's home directory layout.
     command: lspCommandLine(path.basename(resolved.cmd), resolved.args),
     startedAt: new Date().toISOString(),
     state: 'starting',
     ignored,
+    settings,
+    initSent: false,
     initResult: null,
     pullDiagnostics: false,
     socket: null,
@@ -3805,15 +4120,27 @@ async function lspStart(kind, folderAbs, allowDownload) {
     bridgePending: new Map(),
     bridgeSeq: 0,
     pullTimers: new Map(),
+    forwarded: new Map(),
+    progressTokens: new Set(),
+    progress: new Map(),
     stderrTail: '',
+    log: '',
+    stopRequested: false,
+    groupGone: false,
     openDocs() { return this.socket?.docs ?? new Set(); },
   };
+  lspLog(s, 'bridge', `start ${s.command} (via ${s.via}) in ${path.basename(folderAbs) || folderAbs}`);
   child.on('spawn', () => { if (s.state === 'starting') s.state = 'running'; });
   child.on('error', (e) => {
-    s.stderrTail = (s.stderrTail + String(e?.message ?? e)).slice(-4000);
+    const m = String(e?.message ?? e);
+    s.stderrTail = (s.stderrTail + m).slice(-LSP_STDERR_TAIL);
+    lspLog(s, 'bridge', `process error: ${m}`);
     s.state = 'exited';
   });
-  child.stderr.on('data', (d) => { s.stderrTail = (s.stderrTail + d).slice(-4000); });
+  child.stderr.on('data', (d) => {
+    s.stderrTail = (s.stderrTail + d).slice(-LSP_STDERR_TAIL);
+    lspLog(s, 'stderr', d);
+  });
   child.stdin.on('error', () => {});
   let buf = Buffer.alloc(0);
   child.stdout.on('data', (chunk) => {
@@ -3833,10 +4160,17 @@ async function lspStart(kind, folderAbs, allowDownload) {
     }
   });
   child.on('exit', (code, signal) => {
+    // Stragglers in the group (npx's child) go with the leader, once. After
+    // this the group id may be reused, so nothing signals -pid again.
+    try { process.kill(-s.pid, 'SIGKILL'); } catch {}
+    s.groupGone = true;
     s.state = 'exited';
     s.exitCode = code ?? (signal ? 128 : 0);
+    s.progress.clear();
+    lspLog(s, 'bridge', `exited with ${signal ?? `code ${code}`}${s.stopRequested ? ' (stopped)' : ''}`);
     for (const t of s.pullTimers.values()) clearTimeout(t);
     s.pullTimers.clear();
+    lspFailForwarded(s, 'language server exited');
     if (s.socket) lspDetach(s, s.socket, 4001, 'language server exited');
     s.onExit?.();
   });
@@ -3845,26 +4179,37 @@ async function lspStart(kind, folderAbs, allowDownload) {
 }
 
 function lspKillGroup(s, sig) {
-  try { process.kill(-s.pid, sig); } catch {}
-  try { s.child.kill(sig); } catch {}
+  if (!s.groupGone) {
+    try { process.kill(-s.pid, sig); } catch {}
+  }
+  if (s.child.exitCode === null && s.child.signalCode === null) {
+    try { s.child.kill(sig); } catch {}
+  }
 }
 
 // shutdown → exit → SIGTERM → SIGKILL, each step only if the last one did
-// not end the process. Resolves once it is gone.
+// not end the process. Resolves once it is gone; until then the entry stays
+// registered as 'stopping', so a start for the same kind and folder spawns a
+// fresh process instead of handing back the dying one.
 function lspStop(s) {
-  return new Promise((resolve) => {
-    lspServers.delete(s.id);
+  if (s.stopping) return s.stopping;
+  s.stopRequested = true;
+  s.stopping = new Promise((resolve) => {
+    const done = () => {
+      if (lspServers.get(s.id) === s) lspServers.delete(s.id);
+      resolve();
+    };
     if (s.socket) lspDetach(s, s.socket, 1000, 'stopped');
     if (s.state === 'exited' || s.child.exitCode !== null || s.child.signalCode !== null) {
       lspKillGroup(s, 'SIGKILL');
-      return resolve();
+      return done();
     }
+    s.state = 'stopping';
+    lspLog(s, 'bridge', 'stop requested');
     const timers = [];
     s.onExit = () => {
       timers.forEach(clearTimeout);
-      // Stragglers in the group (npx's child) go with it.
-      lspKillGroup(s, 'SIGKILL');
-      resolve();
+      done();
     };
     if (s.initResult) {
       const id = `bridge-${++s.bridgeSeq}`;
@@ -3872,8 +4217,12 @@ function lspStop(s) {
       lspSendServer(s, { jsonrpc: '2.0', id, method: 'shutdown' });
     }
     timers.push(setTimeout(() => lspKillGroup(s, 'SIGTERM'), 1500));
-    timers.push(setTimeout(() => { lspKillGroup(s, 'SIGKILL'); resolve(); }, 4000));
+    timers.push(setTimeout(() => lspKillGroup(s, 'SIGKILL'), 4000));
+    // SIGKILL ends it within moments; this only guards a process the kernel
+    // will not reap, so the HTTP caller is never left hanging.
+    timers.push(setTimeout(done, 8000));
   });
+  return s.stopping;
 }
 
 // Resident memory of the server and everything under it (npx → node → tsc).
@@ -3923,22 +4272,77 @@ async function lspRssTree(pids) {
 }
 
 async function apiLspList(res) {
-  const all = [...lspServers.values()];
+  // A stopping server is already gone as far as the editor is concerned.
+  const all = [...lspServers.values()].filter((s) => s.state !== 'stopping');
   const live = all.filter((s) => s.state !== 'exited' && s.pid);
   const rss = live.length ? await lspRssTree(live.map((s) => s.pid)) : new Map();
   for (const s of all) s.rssMB = s.state === 'exited' ? null : Math.round((rss.get(s.pid) ?? 0) / 102.4) / 10;
-  return sendJson(res, 200, { servers: all.map(lspEntry) });
+  return sendJson(res, 200, { servers: all.map(lspEntry), kinds: lspKindsPublic() });
+}
+
+async function lspReadJson(req, res) {
+  try {
+    const body = JSON.parse(String(await readBody(req)) || '{}');
+    if (!isPlainObj(body)) throw new Error();
+    return body;
+  } catch {
+    sendJson(res, 400, { error: 'invalid JSON body' });
+    return null;
+  }
+}
+
+// The workspace a request names (the browser's ?folder=), as an absolute
+// path; the served root when it names none.
+function lspWorkspaceAbs(ws) {
+  return resolveSafe(typeof ws === 'string' && ws ? ws : '.');
 }
 
 const lspStarting = new Map(); // `${kind}\0${folderAbs}` -> lspStart promise
 
-async function apiLspStart(req, res) {
-  let body;
-  try {
-    body = JSON.parse(String(await readBody(req)) || '{}');
-  } catch {
-    return sendJson(res, 400, { error: 'invalid JSON body' });
+// Starts or reuses one server. Resolves to {server} | {needsDownload, command}
+// | {error, code}.
+async function lspEnsure(kind, folderAbs, allowDownload, workspaceAbs) {
+  for (const s of lspServers.values()) {
+    if (s.kind !== kind || s.folderAbs !== folderAbs) continue;
+    if (s.state === 'stopping') continue;
+    if (s.state !== 'exited') return { server: s };
+    lspServers.delete(s.id);
   }
+  // Claim kind+folder in the same tick as the check above: lspStart awaits
+  // before it registers the server, and a second POST landing in that gap
+  // would otherwise spawn a duplicate. It shares the first start instead.
+  const key = `${kind}\0${folderAbs}`;
+  let pending = lspStarting.get(key);
+  if (!pending) {
+    pending = lspStart(kind, folderAbs, allowDownload, workspaceAbs);
+    lspStarting.set(key, pending);
+    pending.finally(() => lspStarting.delete(key)).catch(() => {});
+  }
+  try {
+    return await pending;
+  } catch (e) {
+    return { error: `failed to start ${kind}: ${String(e?.message ?? e)}` };
+  }
+}
+
+function lspRemember(workspaceAbs, kind, folderAbs, allowDownload) {
+  return lspUpdateSettings(workspaceAbs, (cur) => {
+    const rest = cur.autoStart.filter((a) => !(a.kind === kind && a.folder === folderAbs));
+    cur.autoStart = [...rest, { kind, folder: folderAbs, allowDownload: !!allowDownload }];
+    return cur;
+  });
+}
+
+function lspForget(workspaceAbs, kind, folderAbs) {
+  return lspUpdateSettings(workspaceAbs, (cur) => {
+    cur.autoStart = cur.autoStart.filter((a) => !(a.kind === kind && a.folder === folderAbs));
+    return cur;
+  });
+}
+
+async function apiLspStart(req, res) {
+  const body = await lspReadJson(req, res);
+  if (!body) return;
   const kind = String(body.kind ?? '');
   if (!Object.hasOwn(LSP_KINDS, kind)) return sendJson(res, 400, { error: `unknown kind: ${kind}; expected one of ${Object.keys(LSP_KINDS).join(', ')}` });
   const rel = typeof body.folder === 'string' && body.folder ? body.folder : '.';
@@ -3949,38 +4353,146 @@ async function apiLspStart(req, res) {
   } catch {
     return sendJson(res, 404, { error: `no such folder: ${rel}` });
   }
-  for (const s of lspServers.values()) {
-    if (s.kind !== kind || s.folderAbs !== folderAbs) continue;
-    if (s.state !== 'exited') return sendJson(res, 200, lspEntry(s));
-    lspServers.delete(s.id);
-  }
-  // Claim kind+folder in the same tick as the check above: lspStart awaits
-  // before it registers the server, and a second POST landing in that gap
-  // would otherwise spawn a duplicate. It shares the first start instead.
-  const key = `${kind}\0${folderAbs}`;
-  let pending = lspStarting.get(key);
-  if (!pending) {
-    pending = lspStart(kind, folderAbs, !!body.allowDownload);
-    lspStarting.set(key, pending);
-    pending.finally(() => lspStarting.delete(key)).catch(() => {});
-  }
-  let r;
-  try {
-    r = await pending;
-  } catch (e) {
-    return sendJson(res, 500, { error: `failed to start ${kind}: ${String(e?.message ?? e)}` });
-  }
+  const workspaceAbs = lspWorkspaceAbs(body.workspace);
+  if (!workspaceAbs) return sendJson(res, 400, { error: `workspace is outside the served root: ${body.workspace}` });
+  const r = await lspEnsure(kind, folderAbs, !!body.allowDownload, workspaceAbs);
   if (r.needsDownload) return sendJson(res, 409, { needsDownload: true, command: r.command });
   if (r.error) return sendJson(res, 500, { error: r.error });
+  // Remembered only when the caller says which workspace it is in, so a bare
+  // API call never turns into a server that starts on its own later.
+  if (typeof body.workspace === 'string') {
+    try {
+      await lspRemember(workspaceAbs, kind, folderAbs, r.server.allowDownload || r.server.via === 'npx' || r.server.via === 'uvx');
+    } catch (e) {
+      lspLog(r.server, 'bridge', `could not remember this server for the workspace: ${e.message}`);
+    }
+  }
   return sendJson(res, 200, lspEntry(r.server));
 }
 
-async function apiLspStop(res, id) {
-  const s = lspServers.get(id ?? '');
+async function apiLspStop(res, params) {
+  const s = lspServers.get(params.get('id') ?? '');
   if (!s) return sendJson(res, 404, { error: 'no such language server' });
   await lspStop(s);
+  if (params.get('forget') === '1') {
+    try { await lspForget(s.workspaceAbs, s.kind, s.folderAbs); } catch {}
+  }
   res.writeHead(204);
   return res.end();
+}
+
+async function apiLspRestart(req, res) {
+  const body = await lspReadJson(req, res);
+  if (!body) return;
+  const s = lspServers.get(String(body.id ?? ''));
+  if (!s) return sendJson(res, 404, { error: 'no such language server' });
+  await lspStop(s);
+  // It ran before, so whatever it ran with (a download included) is agreed to.
+  const r = await lspEnsure(s.kind, s.folderAbs, s.allowDownload || s.via === 'npx' || s.via === 'uvx', s.workspaceAbs);
+  if (r.needsDownload) return sendJson(res, 409, { needsDownload: true, command: r.command });
+  if (r.error) return sendJson(res, 500, { error: r.error });
+  lspLog(r.server, 'bridge', `restarted (replaces ${s.id})`);
+  return sendJson(res, 200, lspEntry(r.server));
+}
+
+// Opening a file starts the servers remembered for this workspace that serve
+// it: the folder holds the file and the kind knows its language.
+async function apiLspAutostart(req, res) {
+  const body = await lspReadJson(req, res);
+  if (!body) return;
+  const workspaceAbs = lspWorkspaceAbs(body.workspace);
+  const fileAbs = typeof body.path === 'string' && body.path ? resolveSafe(body.path) : null;
+  if (!workspaceAbs || !fileAbs) return sendJson(res, 400, { error: 'workspace and path are required' });
+  const settings = await lspReadSettings(workspaceAbs);
+  const started = [];
+  const errors = [];
+  for (const a of settings.autoStart) {
+    const spec = LSP_KINDS[a.kind];
+    if (!lspLanguageIdFor(spec, fileAbs)) continue;
+    if (fileAbs !== a.folder && !fileAbs.startsWith(a.folder + path.sep)) continue;
+    try {
+      if (!(await fs.stat(a.folder)).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const r = await lspEnsure(a.kind, a.folder, !!a.allowDownload, workspaceAbs);
+    if (r.server) started.push(lspEntry(r.server));
+    else errors.push({ kind: a.kind, error: r.error ?? (r.needsDownload ? `needs download: ${r.command}` : 'unknown') });
+  }
+  return sendJson(res, 200, { started, errors });
+}
+
+async function apiLspLog(res, id) {
+  const s = lspServers.get(id ?? '');
+  if (!s) return sendJson(res, 404, { error: 'no such language server' });
+  res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+  return res.end(s.log);
+}
+
+async function lspSettingsView(workspaceAbs) {
+  const settings = await lspReadSettings(workspaceAbs);
+  const effective = {};
+  for (const kind of Object.keys(LSP_KINDS)) {
+    const live = [...lspServers.values()].find((s) => s.kind === kind && s.workspaceAbs === workspaceAbs && s.state !== 'exited');
+    effective[kind] = live ? live.settings : lspEffectiveSettings(kind, settings, workspaceAbs, []);
+  }
+  return {
+    workspace: toClientPath(workspaceAbs),
+    file: lspSettingsFile(workspaceAbs),
+    autoStart: settings.autoStart.map((a) => ({ ...a, folder: toClientPath(a.folder) })),
+    shared: settings.shared,
+    servers: settings.servers,
+    effective,
+  };
+}
+
+async function apiLspSettingsGet(res, params) {
+  const workspaceAbs = lspWorkspaceAbs(params.get('workspace'));
+  if (!workspaceAbs) return sendJson(res, 400, { error: 'workspace is outside the served root' });
+  return sendJson(res, 200, await lspSettingsView(workspaceAbs));
+}
+
+async function apiLspSettingsPatch(req, res) {
+  const body = await lspReadJson(req, res);
+  if (!body) return;
+  const workspaceAbs = lspWorkspaceAbs(body.workspace);
+  if (!workspaceAbs) return sendJson(res, 400, { error: 'workspace is outside the served root' });
+  if (body.servers !== undefined && body.servers !== null) {
+    if (!isPlainObj(body.servers)) return sendJson(res, 400, { error: 'servers must be an object keyed by server kind' });
+    const bad = Object.keys(body.servers).filter((k) => !Object.hasOwn(LSP_KINDS, k));
+    if (bad.length) return sendJson(res, 400, { error: `unknown kind: ${bad.join(', ')}` });
+  }
+  if (body.shared !== undefined && body.shared !== null && !isPlainObj(body.shared)) return sendJson(res, 400, { error: 'shared must be an object' });
+  let autoStart;
+  if (body.autoStart !== undefined) {
+    if (!Array.isArray(body.autoStart)) return sendJson(res, 400, { error: 'autoStart must be an array' });
+    autoStart = [];
+    for (const a of body.autoStart) {
+      if (!a || !Object.hasOwn(LSP_KINDS, a.kind)) return sendJson(res, 400, { error: `unknown kind in autoStart: ${a?.kind}` });
+      const folderAbs = resolveSafe(typeof a.folder === 'string' && a.folder ? a.folder : '.');
+      if (!folderAbs) return sendJson(res, 400, { error: `autoStart folder is outside the served root: ${a.folder}` });
+      autoStart.push({ kind: a.kind, folder: folderAbs, allowDownload: !!a.allowDownload });
+    }
+  }
+  try {
+    await lspUpdateSettings(workspaceAbs, (cur) => {
+      if (body.shared !== undefined) cur.shared = body.shared === null ? {} : lspMergePatch(cur.shared, body.shared);
+      if (body.servers !== undefined) cur.servers = body.servers === null ? {} : lspMergePatch(cur.servers, body.servers);
+      if (autoStart) cur.autoStart = autoStart;
+      return cur;
+    });
+  } catch (e) {
+    return sendJson(res, 500, { error: `could not save settings: ${e.message}` });
+  }
+  // Every live server of this workspace gets the new tree: pushed for those
+  // that read the push (JSON), and a nudge to pull again for the rest.
+  const settings = await lspReadSettings(workspaceAbs);
+  for (const s of lspServers.values()) {
+    if (s.workspaceAbs !== workspaceAbs || s.state === 'exited' || s.state === 'stopping') continue;
+    s.settings = lspEffectiveSettings(s.kind, settings, s.folderAbs, s.ignored);
+    lspPushSettings(s, 'settings changed');
+  }
+  return sendJson(res, 200, await lspSettingsView(workspaceAbs));
 }
 
 // A newer attach replaces the older socket; the server itself never notices.
@@ -3989,7 +4501,7 @@ lspWss.on('connection', (ws, req) => {
   ws.on('error', () => {});
   const url = new URL(req.url, `http://${req.headers.host}`);
   const s = lspServers.get(url.searchParams.get('id') ?? '');
-  if (!s || s.state === 'exited') {
+  if (!s || s.state === 'exited' || s.state === 'stopping') {
     ws.close(4004, 'no such language server');
     return;
   }

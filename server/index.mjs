@@ -1461,6 +1461,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/lsp' && req.method === 'DELETE') return await apiLspStop(res, url.searchParams);
     if (url.pathname === '/api/lsp/restart' && req.method === 'POST') return await apiLspRestart(req, res);
     if (url.pathname === '/api/lsp/autostart' && req.method === 'POST') return await apiLspAutostart(req, res);
+    if (url.pathname === '/api/lsp/offer' && req.method === 'GET') return await apiLspOffer(res, url.searchParams.get('path'));
     if (url.pathname === '/api/lsp/log' && req.method === 'GET') return await apiLspLog(res, url.searchParams.get('id'));
     if (url.pathname === '/api/lsp/settings' && req.method === 'GET') return await apiLspSettingsGet(res, url.searchParams);
     if (url.pathname === '/api/lsp/settings' && req.method === 'PATCH') return await apiLspSettingsPatch(req, res);
@@ -3308,6 +3309,7 @@ wss.on('connection', (ws, req) => {
 //                                it from the workspace's autostart list
 //   POST   /api/lsp/restart      {id} → entry of the new process
 //   POST   /api/lsp/autostart    {workspace, path} → {started:[entry]}
+//   GET    /api/lsp/offer?path=  → {offers:[{kind, label, folder, available, install}]}
 //   GET    /api/lsp/log?id=x     → text: stderr, window/logMessage, bridge events
 //   GET    /api/lsp/schema-catalog → the SchemaStore catalog, cached on disk
 //   GET    /api/lsp/settings?workspace=  → stored settings plus the effective tree
@@ -3335,6 +3337,14 @@ wss.on('connection', (ws, req) => {
 //   initOptions(settings)  initializationOptions merged into initialize
 //   onSettings(s)  runs after initialized and after every settings push, for
 //                what a server takes besides settings (JSON schema associations)
+//   install      how to install a server that is never downloaded; shown in
+//                the start menus and in the start error
+//   marker       a file (go.mod) that must exist in the file's folder or above
+//                for the editor to offer the server; it starts in that folder
+//   explicitOnly never offered for an open file; started from the palette or
+//                the panel only
+//   tools        [{bin, gives, install}] helpers the server runs from PATH;
+//                the status bar says which are missing
 const LSP_KINDS = {
   tsgo: {
     label: 'TypeScript 7 (tsgo)',
@@ -3466,6 +3476,64 @@ const LSP_KINDS = {
     sections: ['docker'],
     defaults: {},
     pushOnInit: true,
+  },
+  bash: {
+    label: 'Bash (bash-language-server)',
+    language: 'shellscript',
+    languages: ['shellscript'],
+    extensions: { sh: 'shellscript', bash: 'shellscript', zsh: 'shellscript', ksh: 'shellscript' },
+    filenames: Object.fromEntries([
+      '.bashrc', '.bash_profile', '.bash_login', '.bash_logout', '.bash_aliases',
+      '.profile', '.kshrc', '.envrc', '.zshrc', '.zshenv', '.zprofile', '.zlogin', '.zlogout',
+    ].map((n) => [n, 'shellscript'])),
+    globs: {},
+    bin: 'bash-language-server',
+    args: ['start'],
+    lookup: ['node_modules', 'path'],
+    download: { via: 'npx', bin: 'npx', args: ['-y', '-p', 'bash-language-server', 'bash-language-server', 'start'], package: 'bash-language-server' },
+    sections: ['bashIde'],
+    defaults: {},
+    // The server runs these itself, from PATH; without them it still serves
+    // hover, completion and symbols.
+    tools: [
+      { bin: 'shellcheck', gives: 'diagnostics', install: 'apt install shellcheck, brew install shellcheck' },
+      { bin: 'shfmt', gives: 'formatting', install: 'apt install shfmt, brew install shfmt' },
+    ],
+  },
+  // Go and Rust servers are system binaries tied to a toolchain: found on
+  // PATH or not offered, never downloaded.
+  gopls: {
+    label: 'Go (gopls)',
+    language: 'go',
+    languages: ['go', 'go.mod', 'go.sum', 'go.work'],
+    extensions: { go: 'go' },
+    filenames: { 'go.mod': 'go.mod', 'go.sum': 'go.sum', 'go.work': 'go.work' },
+    globs: {},
+    bin: 'gopls',
+    args: [],
+    lookup: ['path'],
+    install: 'go install golang.org/x/tools/gopls@latest',
+    // Offered for a file only inside a module; started in that module.
+    marker: 'go.mod',
+    sections: ['gopls'],
+    defaults: {},
+  },
+  'rust-analyzer': {
+    label: 'Rust (rust-analyzer)',
+    language: 'rust',
+    languages: ['rust'],
+    extensions: { rs: 'rust' },
+    filenames: {},
+    globs: {},
+    bin: 'rust-analyzer',
+    args: [],
+    lookup: ['path'],
+    install: 'rustup component add rust-analyzer rust-src',
+    // Needs cargo and rust-src and can use several GB: never offered, only
+    // started from the palette or the panel.
+    explicitOnly: true,
+    sections: ['rust-analyzer'],
+    defaults: {},
   },
 };
 
@@ -3616,6 +3684,12 @@ function lspKindsPublic() {
       globs: k.globs,
       sections: k.sections,
       download: k.download ? { via: k.download.via, command: lspCommandLine(k.download.bin, k.download.args) } : null,
+      // PATH only; a project's node_modules copy is found at start.
+      onPath: !!findOnPath(k.bin),
+      install: k.install ?? null,
+      explicitOnly: !!k.explicitOnly,
+      marker: k.marker ?? null,
+      tools: (k.tools ?? []).map((t) => ({ ...t, found: !!findOnPath(t.bin) })),
     };
   }
   return out;
@@ -4165,7 +4239,13 @@ async function lspStart(kind, folderAbs, allowDownload, workspaceAbs) {
   const spec = LSP_KINDS[kind];
   let resolved = await lspResolveLocal(spec, folderAbs);
   if (!resolved) {
-    if (!spec.download) return { error: `no local ${spec.bin} found and ${kind} has no download fallback` };
+    if (!spec.download) {
+      return {
+        error: spec.install
+          ? `${spec.bin} is not on PATH. Install it with: ${spec.install}`
+          : `no local ${spec.bin} found and ${kind} has no download fallback`,
+      };
+    }
     const command = lspCommandLine(spec.download.bin, spec.download.args);
     if (!allowDownload) return { needsDownload: true, command };
     const runner = findOnPath(spec.download.bin);
@@ -4515,6 +4595,42 @@ async function apiLspAutostart(req, res) {
     else errors.push({ kind: a.kind, error: r.error ?? (r.needsDownload ? `needs download: ${r.command}` : 'unknown') });
   }
   return sendJson(res, 200, { started, errors });
+}
+
+// The servers worth offering for a file nothing serves yet: every kind that
+// serves it except the explicit-only ones, and a marker kind only inside its
+// marker's folder (the folder it should start in). `available` is false only
+// for a never-downloaded server missing from PATH; `install` then says how.
+async function apiLspOffer(res, rel) {
+  const fileAbs = typeof rel === 'string' && rel ? resolveSafe(rel) : null;
+  if (!fileAbs) return sendJson(res, 400, { error: 'path is required' });
+  const offers = [];
+  for (const [kind, spec] of Object.entries(LSP_KINDS)) {
+    if (spec.explicitOnly || !lspLanguageIdFor(spec, fileAbs)) continue;
+    let folderAbs = ROOT;
+    if (spec.marker) {
+      folderAbs = null;
+      for (let dir = path.dirname(fileAbs); dir === ROOT || dir.startsWith(ROOT + path.sep); dir = path.dirname(dir)) {
+        try {
+          await fs.access(path.join(dir, spec.marker));
+          folderAbs = dir;
+          break;
+        } catch {}
+        if (dir === ROOT) break;
+      }
+      if (!folderAbs) continue;
+    }
+    // A downloadable server is always available; only the others need looking up.
+    const local = spec.download ? null : await lspResolveLocal(spec, folderAbs);
+    offers.push({
+      kind,
+      label: spec.label,
+      folder: path.relative(ROOT, folderAbs).split(path.sep).join('/'),
+      available: !!(local || spec.download),
+      install: spec.install ?? null,
+    });
+  }
+  return sendJson(res, 200, { offers });
 }
 
 async function apiLspLog(res, id) {

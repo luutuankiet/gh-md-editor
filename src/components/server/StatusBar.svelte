@@ -4,6 +4,7 @@
   // that actually matters when the file is headed for a model. Every segment
   // is either a fact or a button — nothing decorative.
   import { formatTokens } from '../../lib/token-estimate';
+  import LspStatus from './LspStatus.svelte';
 
   type Repo = {
     repo: string;
@@ -35,6 +36,7 @@
     blocked = $bindable(false),
     tokens = 0,
     tokenLabel = '',
+    lspPath = '',
     onPickRef,
   }: {
     host?: string;
@@ -51,6 +53,8 @@
     // Token estimate for the active editor; 0 when nothing countable is open.
     tokens?: number;
     tokenLabel?: string;
+    // Root-relative path of the active code editor, for the language server item.
+    lspPath?: string;
     onPickRef: (repo: string) => void;
   } = $props();
 
@@ -320,6 +324,8 @@
   </button>
 
   <span class="gap"></span>
+
+  <LspStatus path={lspPath} />
 
   {#if tokens > 0}
     <span class="seg flat" title="{tokenLabel || 'Active file'} — estimate, not an exact tokenizer count">

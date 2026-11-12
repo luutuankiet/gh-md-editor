@@ -20,13 +20,14 @@ import {
 import type { Extension, Text } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { errorLens } from './error-lens';
+import { autostartFor, lspLanguageFor, setLspKinds } from '../lsp-control.svelte';
 
 // Not exported by the package; recovered from the method that returns it.
 type WorkspaceFileUpdate = ReturnType<Workspace['syncFiles']>[number];
 
 export interface ServerEntry {
   id: string;
-  kind: 'tsgo' | 'ty' | 'basedpyright';
+  kind: string;
   language: string;
   folder: string;
   rootUri: string;
@@ -47,24 +48,8 @@ export interface Conn {
   evicted: boolean;
 }
 
-// Which extensions each kind of server can answer for, with the LSP language
-// id to announce. TS 7 needs the *react ids to parse JSX.
-const LANG_BY_EXT: Record<string, { kinds: ServerEntry['kind'][]; id: string }> = {
-  ts: { kinds: ['tsgo'], id: 'typescript' },
-  mts: { kinds: ['tsgo'], id: 'typescript' },
-  cts: { kinds: ['tsgo'], id: 'typescript' },
-  tsx: { kinds: ['tsgo'], id: 'typescriptreact' },
-  js: { kinds: ['tsgo'], id: 'javascript' },
-  mjs: { kinds: ['tsgo'], id: 'javascript' },
-  cjs: { kinds: ['tsgo'], id: 'javascript' },
-  jsx: { kinds: ['tsgo'], id: 'javascriptreact' },
-  py: { kinds: ['ty', 'basedpyright'], id: 'python' },
-  pyi: { kinds: ['ty', 'basedpyright'], id: 'python' },
-};
-
 export function languageIdFor(path: string): string | null {
-  const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase();
-  return LANG_BY_EXT[ext]?.id ?? null;
+  return lspLanguageFor(path)?.id ?? null;
 }
 
 const conns = new Map<string, Conn>();
@@ -357,7 +342,11 @@ export function refreshServers(): Promise<void> {
     let list: ServerEntry[] = [];
     try {
       const r = await fetch('/api/lsp');
-      if (r.ok) list = ((await r.json()) as { servers?: ServerEntry[] }).servers ?? [];
+      if (r.ok) {
+        const d = (await r.json()) as { servers?: ServerEntry[]; kinds?: unknown };
+        list = d.servers ?? [];
+        setLspKinds(d.kinds);
+      }
     } catch { /* no bridge on this server: behave as if none run */ }
     const live = list.filter((s) => s.state !== 'exited');
     let changed = false;
@@ -390,8 +379,7 @@ export function refreshServers(): Promise<void> {
 
 /** The connection whose folder holds `path` and whose language matches; deepest folder wins. */
 export function connFor(path: string): Conn | null {
-  const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase();
-  const lang = LANG_BY_EXT[ext];
+  const lang = lspLanguageFor(path);
   if (!lang) return null;
   let best: Conn | null = null;
   for (const c of conns.values()) {
@@ -408,7 +396,13 @@ export async function lspFor(path: string): Promise<{ conn: Conn; uri: string; e
   if (!path) return null;
   const conn = connFor(path);
   const id = languageIdFor(path);
-  if (!conn || !id) return null;
+  if (!id) return null;
+  // Nothing serves it yet: start what this workspace remembered for it. The
+  // `gmd:lsp-changed` that follows makes the editor ask again.
+  if (!conn) {
+    void autostartFor(path);
+    return null;
+  }
   if (await isIgnored(path)) return null;
   const uri = uriFor(conn, path);
   return { conn, uri, extension: conn.client.plugin(uri, id) };

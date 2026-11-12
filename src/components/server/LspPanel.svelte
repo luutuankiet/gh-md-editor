@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { LSP_KINDS, startLanguageServer, type LspKind } from '../../lib/lsp-control';
+  import { LSP_KINDS, lspLabel, startLanguageServer, stopLanguageServer, type LspKind } from '../../lib/lsp-control.svelte';
 
   let { visible, folder }: { visible: boolean; folder: string } = $props();
 
@@ -58,17 +58,16 @@
     }
   }
 
+  // Stopping here also forgets it for this workspace, so it stays off until
+  // started again.
   async function stop(id: string) {
     busy = id;
     error = '';
     try {
-      const r = await fetch(`/api/lsp?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
-      if (!r.ok && r.status !== 404) error = `stop failed: HTTP ${r.status}`;
-    } catch (e) {
-      error = String((e as Error)?.message ?? e);
+      const e = await stopLanguageServer(id, true);
+      if (e) error = e;
     } finally {
       busy = '';
-      window.dispatchEvent(new CustomEvent('gmd:lsp-changed'));
     }
   }
 </script>
@@ -100,7 +99,7 @@
         <div class="row" title={s.command}>
           <span class="c-folder">{s.folder || '(root)'}</span>
           <span class="c-lang">{s.language}</span>
-          <span class="c-kind">{s.kind}</span>
+          <span class="c-kind">{lspLabel(s.kind)}</span>
           <span class="c-via">{s.resolvedVia}</span>
           <span class="c-mem">{s.rssMB != null ? `${s.rssMB} MB` : '-'}</span>
           <span class="c-state st-{s.state}">{s.state}{s.state === 'exited' && s.exitCode != null ? ` (${s.exitCode})` : ''}</span>

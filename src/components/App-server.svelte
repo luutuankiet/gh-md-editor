@@ -252,14 +252,18 @@
     // The palette has no sub-list, so the bare command narrows the palette to
     // the per-kind entries below; each of those then asks for the folder.
     { label: 'Start Language Server…', hint: 'TypeScript or Python', run: () => qoShow('>Start Language Server: ') },
+  ];
+  // One entry per kind the server knows, so a kind added there shows up here.
+  let allCommands = $derived([
+    ...COMMANDS,
     ...LSP_KINDS.map((k) => ({
       label: `Start Language Server: ${k.label}`,
       hint: 'pick a folder',
       run: () => { browse = { mode: 'lsp' as const, action: 'same' as const, kind: k.kind }; },
     })),
-  ];
+  ]);
   let qoCommands = $derived(
-    qoTerm ? COMMANDS.filter((c) => c.label.toLowerCase().includes(qoTerm.toLowerCase())) : COMMANDS
+    qoTerm ? allCommands.filter((c) => c.label.toLowerCase().includes(qoTerm.toLowerCase())) : allCommands
   );
 
   async function qoSearch() {
@@ -842,7 +846,7 @@
   import SearchPanel from './server/SearchPanel.svelte';
   import PortsPanel from './server/PortsPanel.svelte';
   import LspPanel from './server/LspPanel.svelte';
-  import { LSP_KINDS, startLanguageServer, type LspKind } from '../lib/lsp-control';
+  import { LSP_KINDS, lspLabel, startLanguageServer, type LspKind } from '../lib/lsp-control.svelte';
   import { fileIconUrl, folderIconUrl } from '../lib/file-icons';
   import { TAB_DND_MIME, PATH_DND_MIME } from '../lib/dnd';
   import { tabDirLabels, dropSlot } from '../lib/tab-strip';
@@ -2458,6 +2462,7 @@
     bind:blocked={gitBlocked}
     tokens={activeTokens}
     tokenLabel={activeTab?.name ?? ''}
+    lspPath={activeTab?.kind === 'code' ? activeTab.path : ''}
     onPickRef={(repo) => void openRefPicker(repo)}
   />
 </div>
@@ -2475,7 +2480,7 @@
   <WorkspaceBrowser
     mode={browse.mode === 'workspace' || browse.mode === 'lsp' ? 'workspace' : 'file'}
     title={browse.mode === 'compare' ? 'Compare With File'
-      : browse.mode === 'lsp' ? `Start ${LSP_KINDS.find((k) => k.kind === browse?.kind)?.label ?? 'Language Server'} in Folder`
+      : browse.mode === 'lsp' ? `Start ${browse.kind ? lspLabel(browse.kind) : 'Language Server'} in Folder`
       : browse.mode === 'file' ? 'Open File'
       : browse.action === 'tab' ? 'Open Workspace in New Tab'
       : browse.action === 'window' ? 'Open Workspace in New Window'

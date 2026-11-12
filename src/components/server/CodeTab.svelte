@@ -43,13 +43,11 @@
     pinnedLangFor, autoLangFor, setAutoLangFor, pinLangFor, unpinLangFor,
   } from '../../lib/tab-view-state.svelte';
   import { readScrollAnchor, applyScrollAnchor } from '../../lib/cm-scroll-anchor';
-  import { highlightToLines, scopeForFilename } from '../../lib/diff-highlight';
-  import type { Tok } from '../../lib/diff-highlight';
   import { setDiagnostics, setDiagnosticsEffect } from '@codemirror/lint';
   import { lspFor, onLspChange, type Conn } from '../../lib/lsp/client';
   import { lspDefinition, lspReferences, type LspLoc } from '../../lib/lsp/actions';
   import { lineHasDiagnostic } from '../../lib/lsp/error-lens';
-  import { defPeek, showDefPeek } from '../../lib/lsp/peek-def';
+  import { peekInline, showPeek, type PeekHit } from '../../lib/lsp/peek';
 
 
   // --- inline change gutter ---------------------------------------------------
@@ -577,14 +575,18 @@
   });
 
   const refLensClicks = EditorView.domEventHandlers({
-    mousedown(e) {
+    mousedown(e, vw) {
       const link = (e.target as HTMLElement | null)?.closest('.cm-refLensLink') as HTMLElement | null;
       const name = link?.dataset.name;
       if (!name) return false;
       // Without this the click also places the caret, which scrolls the buffer
-      // out from under the panel about to open over it.
+      // away from the declaration the peek is about to open under.
       e.preventDefault();
-      void openPeek(name);
+      // The lens sits above its declaration, so its own position is the start
+      // of that line; the peek hangs under it, as VS Code's does.
+      let pos: number;
+      try { pos = vw.posAtDOM(link!); } catch { pos = vw.state.selection.main.head; }
+      void openPeek(name, pos);
       return true;
     },
   });
@@ -667,192 +669,37 @@
 
   // --- peek references -------------------------------------------------------
   // Every mention of a symbol, at a glance, without leaving the file being
-  // read: a preview of the surrounding lines on the left, the locations grouped
-  // by file on the right. Escape closes it.
-  interface PeekHit { path: string; line: number; text: string; cols?: [number, number][] }
-  interface PeekLine { n: number; toks: Tok[]; hit: boolean }
-
-  const PEEK_CTX = 4;
-
-  let peek = $state<{
-    name: string;
-    loading: boolean;
-    hits: PeekHit[];
-    truncated: boolean;
-    sel: number;
-    preview: { path: string; lines: PeekLine[] } | null;
-  } | null>(null);
-
-  // Grouped by file with the parent folder beside the name, because two files
-  // of the same name in different directories is the normal case in a tree
-  // carrying worktrees or a vendored copy. Hits arrive sorted by path, so the
-  // running index here matches the flat array the keyboard walks.
-  const peekGroups = $derived.by(() => {
-    const p = peek;
-    if (!p) return [];
-    const by = new Map<string, PeekHit[]>();
-    for (const h of p.hits) {
-      const arr = by.get(h.path);
-      if (arr) arr.push(h);
-      else by.set(h.path, [h]);
-    }
-    let i = 0;
-    return [...by].map(([path, hits]) => {
-      const cut = path.lastIndexOf('/');
-      return {
-        path,
-        base: cut < 0 ? path : path.slice(cut + 1),
-        dir: cut < 0 ? '' : path.slice(0, cut),
-        hits: hits.map((h) => {
-          // Leading indentation is dropped so the matched word sits as far left
-          // as the list can put it; the column range rides in from the server
-          // rather than being re-found here.
-          const lead = h.text.length - h.text.trimStart().length;
-          const c = h.cols?.[0];
-          const from = c ? Math.max(lead, c[0]) : lead;
-          const to = c ? Math.max(from, c[1]) : from;
-          return {
-            i: i++,
-            line: h.line,
-            pre: h.text.slice(lead, from),
-            mid: h.text.slice(from, to),
-            post: h.text.slice(to),
-          };
-        }),
-      };
-    });
-  });
-
-  // Which file groups are folded shut. A peek over a busy symbol opens with a
-  // dozen files in it, and the first question is usually "which files", not
-  // "which lines" — folding is how that view is reached without scrolling past
-  // the hits to find out.
-  let peekFolded = $state<string[]>([]);
-
-  const peekAllFolded = $derived(peekGroups.length > 0 && peekFolded.length >= peekGroups.length);
-
-  function toggleGroup(p: string) {
-    peekFolded = peekFolded.includes(p) ? peekFolded.filter((x) => x !== p) : [...peekFolded, p];
-  }
-
-  function toggleAllGroups() {
-    peekFolded = peekAllFolded ? [] : peekGroups.map((g) => g.path);
-  }
-
-  // Arrow keys walk what is on screen. A hit inside a folded group is not on
-  // screen, so stepping into it would move the preview to a location the list
-  // is no longer showing.
-  function visibleHits(): number[] {
-    return peekGroups.filter((g) => !peekFolded.includes(g.path)).flatMap((g) => g.hits.map((h) => h.i));
-  }
-
-  function closePeek() {
-    peek = null;
-    view?.focus();
-  }
-
-  function autofocus(node: HTMLElement) {
-    node.focus();
-  }
+  // read: the inline peek under the line asked about (lib/lsp/peek.ts), with
+  // the locations grouped by file on its right. Escape closes it.
+  let peekSeq = 0;
 
   // `load` replaces the ripgrep lookup with another source of hits — the
-  // language server, when one covers this file.
+  // language server, when one covers this file. `pos` is where the peek hangs.
   async function openPeek(
     name: string,
+    pos: number,
     load?: () => Promise<{ hits?: PeekHit[]; truncated?: boolean; error?: string }>,
   ) {
-    if (!gitPath) return;
-    peekFolded = [];
-    peek = { name, loading: true, hits: [], truncated: false, sel: 0, preview: null };
+    const vw = view;
+    if (!gitPath || !vw) return;
+    const seq = ++peekSeq;
     try {
       const j = load
         ? await load()
         : ((await (await fetch(
           `/api/refs?name=${encodeURIComponent(name)}&path=${encodeURIComponent(searchScope())}`,
         )).json()) as { hits?: PeekHit[]; truncated?: boolean; error?: string });
-      if (peek?.name !== name) return;
-      if (j.error) { peek = null; showNotice(`References: ${j.error}`); return; }
+      if (seq !== peekSeq || view !== vw) return;
+      if (j.error) { showNotice(`References: ${j.error}`); return; }
       const hits = (j.hits ?? []).sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
-      if (!hits.length) { peek = null; showNotice(`No references to “${name}”`); return; }
-      peek = { name, loading: false, hits, truncated: !!j.truncated, sel: 0, preview: null };
-      void loadPreview(0);
+      if (!hits.length) { showNotice(`No references to “${name}”`); return; }
+      showPeek(vw, pos, {
+        kind: 'refs', name, hits, truncated: !!j.truncated, here: gitPath,
+        theme: isDark ? darkBundle : lightBundle,
+      });
     } catch {
-      peek = null;
       showNotice('Reference lookup failed');
     }
-  }
-
-  async function loadPreview(i: number) {
-    const p = peek;
-    const hit = p?.hits[i];
-    if (!p || !hit) return;
-    peek = { ...p, sel: i, preview: null };
-    try {
-      const r = await fetch(`/api/file?path=${encodeURIComponent(hit.path)}`);
-      const j = (await r.json()) as { content?: string };
-      if (peek?.name !== p.name || peek.sel !== i) return;
-      const all = (j.content ?? '').split('\n');
-      const from = Math.max(1, hit.line - PEEK_CTX);
-      const to = Math.min(all.length, hit.line + PEEK_CTX);
-      // Only the window is highlighted, not the whole file: a grammar run over
-      // a 10k-line module to colour nine lines is the wrong trade, and the
-      // window is self-contained enough to colour convincingly.
-      const scope = await scopeForFilename(hit.path);
-      const toks = scope ? await highlightToLines(all.slice(from - 1, to).join('\n'), scope) : [];
-      if (peek?.name !== p.name || peek.sel !== i) return;
-      const lines: PeekLine[] = [];
-      for (let n = from; n <= to; n++) {
-        lines.push({
-          n,
-          toks: toks[n - from] ?? [{ cls: null, text: all[n - 1] ?? '' }],
-          hit: n === hit.line,
-        });
-      }
-      peek = { ...peek, preview: { path: hit.path, lines } };
-    } catch { /* the preview is a nicety; the locations list is the answer */ }
-  }
-
-  function peekOpen(i: number) {
-    const hit = peek?.hits[i];
-    const word = peek?.name;
-    if (!hit) return;
-    closePeek();
-    window.dispatchEvent(new CustomEvent('gmd:open-request', {
-      detail: { kind: 'file', path: hit.path, line: hit.line, word },
-    }));
-  }
-
-  function peekKey(e: KeyboardEvent) {
-    const p = peek;
-    if (!p) return;
-    if (e.key === 'Escape') {
-      // Stopped here so the same keystroke does not also close the search panel
-      // or clear the selection in the editor underneath.
-      e.preventDefault();
-      e.stopPropagation();
-      closePeek();
-      return;
-    }
-    if (e.key === 'Enter') { e.preventDefault(); peekOpen(p.sel); return; }
-    // Left folds the group holding the selection, right unfolds it — the same
-    // pair every tree in this app answers to.
-    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
-      const g = peekGroups.find((x) => x.hits.some((h) => h.i === p.sel));
-      if (!g) return;
-      e.preventDefault();
-      const folded = peekFolded.includes(g.path);
-      if (e.key === 'ArrowLeft' ? !folded : folded) toggleGroup(g.path);
-      return;
-    }
-    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
-    e.preventDefault();
-    const vis = visibleHits();
-    if (!vis.length) return;
-    const at = vis.indexOf(p.sel);
-    // A selection hidden by a fold has no neighbour to step from, so the walk
-    // restarts at the top of what is visible.
-    const next = at < 0 ? 0 : (at + (e.key === 'ArrowDown' ? 1 : vis.length - 1)) % vis.length;
-    void loadPreview(vis[next]);
   }
 
   // --- symbol breadcrumb -----------------------------------------------------
@@ -1198,11 +1045,18 @@
   async function peekDefinition(vw: EditorView, pos: number) {
     const t = await definitionTarget(vw, pos);
     if (!t) { showNotice('No definition found'); return; }
-    if (!(await showDefPeek(vw, gitPath, t.path, t.line))) showNotice('Could not load the definition');
+    const w = vw.state.wordAt(pos);
+    showPeek(vw, pos, {
+      kind: 'def',
+      name: w ? vw.state.sliceDoc(w.from, w.to) : '',
+      hits: [{ path: t.path, line: t.line, text: '' }],
+      here: gitPath,
+      theme: isDark ? darkBundle : lightBundle,
+    });
   }
 
   // Server hits become the same rows ripgrep produces, so the existing
-  // references overlay renders them unchanged. Each file is fetched once.
+  // references peek renders them unchanged. Each file is fetched once.
   async function lspRefHits(ls: { conn: Conn; uri: string }, vw: EditorView, pos: number) {
     const locs: LspLoc[] = await lspReferences(ls.conn, ls.uri, vw, pos);
     const texts = new Map<string, string[]>();
@@ -1226,9 +1080,9 @@
     if (!w) return;
     const name = vw.state.sliceDoc(w.from, w.to);
     const ls = lsp;
-    if (!ls) { void openPeek(name); return; }
+    if (!ls) { void openPeek(name, pos); return; }
     // An empty or failed server answer still deserves the ripgrep result.
-    void openPeek(name, async () => {
+    void openPeek(name, pos, async () => {
       try {
         const r = await lspRefHits(ls, vw, pos);
         if (r.hits.length) return r;
@@ -1673,7 +1527,7 @@
         languageCompartment.of([]),
         // Empty until a running language server covers this file.
         lspCompartment.of([]),
-        defPeek,
+        peekInline,
         themeCompartment.of(untrack(() => isDark) ? darkBundle : lightBundle),
         // After the theme compartment on purpose: the syntax bundles ship their
         // own faint .cm-matchingBracket rule, and later extensions win. Click a
@@ -2354,76 +2208,6 @@
         <button role="menuitem" onclick={() => ctxRun('refs')}>Find All References <kbd>Shift+Alt+F12</kbd></button>
       </div>
     {/if}
-    {#if peek}
-      <!-- Over the editor rather than beside it: the point of a peek is that
-           the file being read stays where it was, so closing the panel returns
-           to exactly the same view. -->
-      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-      <div class="peek pl-dark" role="dialog" aria-label="References" tabindex="-1" use:autofocus onkeydown={peekKey}>
-        <div class="peek-head">
-          <span class="peek-title">{peek.name}</span>
-          <span class="peek-count">
-            {peek.loading ? 'searching…' : `${peek.hits.length}${peek.truncated ? '+' : ''} references`}
-          </span>
-          {#if peekGroups.length > 1}
-            <button
-              type="button"
-              class="peek-fold"
-              title={peekAllFolded ? 'Show every hit again' : 'Fold every file shut — file names and counts only'}
-              onclick={toggleAllGroups}
-            >{peekAllFolded ? 'expand all' : 'collapse all'}</button>
-          {/if}
-          <button type="button" class="peek-close" title="Close (Esc)" onclick={closePeek}>✕</button>
-        </div>
-        <div class="peek-body">
-          <div class="peek-preview">
-            {#if peek.preview}
-              <div class="peek-path">{peek.preview.path}</div>
-              {#each peek.preview.lines as l (l.n)}
-                <div class="peek-line" class:hit={l.hit}>
-                  <span class="peek-ln">{l.n}</span><span class="peek-code">{#each l.toks as t, i (i)}<span class={t.cls ?? ''}>{t.text}</span>{/each}</span>
-                </div>
-              {/each}
-            {:else}
-              <div class="peek-empty">{peek.loading ? 'Searching…' : 'Loading preview…'}</div>
-            {/if}
-          </div>
-          <div class="peek-locs">
-            {#each peekGroups as g (g.path)}
-              {@const folded = peekFolded.includes(g.path)}
-              <div class="peek-group">
-                <button
-                  type="button"
-                  class="peek-file"
-                  aria-expanded={!folded}
-                  title={folded ? 'Show these hits' : 'Fold this file shut'}
-                  onclick={() => toggleGroup(g.path)}
-                >
-                  <span class="peek-chev" class:folded>⌄</span>
-                  <span class="peek-base">{g.base}</span>
-                  <span class="peek-dir" title={g.dir}>{g.dir}</span>
-                  <span class="peek-n">{g.hits.length}</span>
-                </button>
-                {#if !folded}
-                  {#each g.hits as h (h.i)}
-                    <button
-                      type="button"
-                      class="peek-hit"
-                      class:sel={peek?.sel === h.i}
-                      title="Enter or double-click to open"
-                      onclick={() => void loadPreview(h.i)}
-                      ondblclick={() => peekOpen(h.i)}
-                    >
-                      <span class="peek-hln">{h.line}</span><span class="peek-htext">{h.pre}<mark>{h.mid}</mark>{h.post}</span>
-                    </button>
-                  {/each}
-                {/if}
-              </div>
-            {/each}
-          </div>
-        </div>
-      </div>
-    {/if}
   </div>
 </div>
 {#if notice}
@@ -2473,216 +2257,6 @@
     position: relative;
     flex: 1;
     min-height: 0;
-  }
-  /* Anchored to the bottom of the editor box, the way VS Code's peek grows up
-     from the line you invoked it on — close enough to that, and it costs no
-     per-line widget bookkeeping. */
-  .peek {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    height: 45%;
-    min-height: 160px;
-    display: flex;
-    flex-direction: column;
-    background: #1e1e1e;
-    border-top: 1px solid #007acc;
-    box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.4);
-    z-index: 8;
-    outline: none;
-  }
-  .peek-head {
-    flex: 0 0 auto;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    height: 24px;
-    padding: 0 4px 0 10px;
-    background: #252526;
-    border-bottom: 1px solid #333;
-    font-size: 12px;
-  }
-  .peek-title {
-    color: #d4d4d4;
-    font-weight: 600;
-  }
-  .peek-count {
-    flex: 1 1 auto;
-    color: #8a8a8a;
-    font-size: 11px;
-  }
-  .peek-close {
-    flex: 0 0 auto;
-    width: 20px;
-    height: 20px;
-    border: none;
-    border-radius: 3px;
-    background: none;
-    color: #949494;
-    cursor: pointer;
-    line-height: 1;
-  }
-  .peek-close:hover {
-    background: #3a3a3a;
-    color: #e6e6e6;
-  }
-  .peek-body {
-    flex: 1 1 auto;
-    min-height: 0;
-    display: flex;
-  }
-  .peek-preview {
-    flex: 1 1 0;
-    min-width: 0;
-    overflow: auto;
-    padding: 4px 0 6px;
-    font-family: var(--gmd-code-font, ui-monospace, SFMono-Regular, Menlo, monospace);
-    font-size: 12px;
-    line-height: 1.45;
-  }
-  .peek-path {
-    padding: 0 10px 4px;
-    color: #7a7a7a;
-    font-size: 11px;
-  }
-  .peek-line {
-    display: flex;
-    white-space: pre;
-  }
-  /* The line the match is on. Everything else in the window is context, and
-     without this the reader has to count rows to find it. */
-  .peek-line.hit {
-    background: rgba(0, 122, 204, 0.18);
-  }
-  .peek-ln {
-    flex: 0 0 auto;
-    width: 46px;
-    padding-right: 10px;
-    text-align: right;
-    color: #5a5a5a;
-    user-select: none;
-  }
-  .peek-code {
-    flex: 1 1 auto;
-    padding-right: 10px;
-  }
-  .peek-empty {
-    padding: 10px;
-    color: #7a7a7a;
-    font-size: 12px;
-  }
-  .peek-locs {
-    flex: 0 0 38%;
-    min-width: 220px;
-    overflow: auto;
-    border-left: 1px solid #333;
-    background: #1b1b1b;
-    padding: 2px 0 6px;
-  }
-  .peek-fold {
-    flex: 0 0 auto;
-    border: none;
-    background: none;
-    padding: 0 4px;
-    color: #8a8a8a;
-    font: inherit;
-    font-size: 11px;
-    cursor: pointer;
-  }
-  .peek-fold:hover {
-    color: #d4d4d4;
-    text-decoration: underline;
-  }
-  .peek-file {
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
-    width: 100%;
-    padding: 3px 8px 2px;
-    border: none;
-    background: none;
-    text-align: left;
-    font: inherit;
-    font-size: 11px;
-    cursor: pointer;
-  }
-  .peek-file:hover {
-    background: #232323;
-  }
-  /* Points down at an open group, right at a folded one — the direction the
-     hits would travel, which is the convention every tree here already uses. */
-  .peek-chev {
-    flex: 0 0 auto;
-    display: inline-block;
-    width: 9px;
-    color: #8a8a8a;
-    font-size: 10px;
-    line-height: 1;
-    transform-origin: 50% 40%;
-    transition: transform 90ms linear;
-  }
-  .peek-chev.folded {
-    transform: rotate(-90deg);
-  }
-  .peek-base {
-    color: #d4d4d4;
-  }
-  /* The parent folder, faint and truncated from the left where it matters —
-     two files named the same are told apart by the tail of their directory,
-     not the head. */
-  .peek-dir {
-    flex: 1 1 auto;
-    min-width: 0;
-    color: #6e6e6e;
-    direction: rtl;
-    text-align: left;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .peek-n {
-    flex: 0 0 auto;
-    color: #8a8a8a;
-  }
-  .peek-hit {
-    display: flex;
-    width: 100%;
-    gap: 8px;
-    padding: 1px 8px 1px 16px;
-    border: none;
-    background: none;
-    color: #b0b0b0;
-    font-family: var(--gmd-code-font, ui-monospace, SFMono-Regular, Menlo, monospace);
-    font-size: 11px;
-    text-align: left;
-    cursor: pointer;
-    white-space: pre;
-    overflow: hidden;
-  }
-  .peek-hit:hover {
-    background: #2a2d2e;
-  }
-  .peek-hit.sel {
-    background: #04395e;
-    color: #e6e6e6;
-  }
-  .peek-hln {
-    flex: 0 0 auto;
-    width: 34px;
-    text-align: right;
-    color: #5a5a5a;
-  }
-  .peek-htext {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .peek-htext mark {
-    background: rgba(229, 192, 32, 0.32);
-    color: inherit;
-    border-radius: 2px;
   }
   /* One row above the editor holding the symbol path and the language picker.
      The picker used to float over the top-right of the text, which put it on

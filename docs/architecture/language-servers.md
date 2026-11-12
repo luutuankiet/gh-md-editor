@@ -27,7 +27,7 @@ done by a bridge in `server/index.mjs`.
 | `src/lib/lsp/client.ts` | `refreshServers`, `lspFor`, `attach` | one `LSPClient` per running server, for the whole page |
 | `src/lib/lsp/actions.ts` | `lspDefinition`, `lspReferences` | requests the editor makes itself, 4 s timeout |
 | `src/lib/lsp/error-lens.ts` | `errorLens`, `lineHasDiagnostic` | inline diagnostics after the line end |
-| `src/lib/lsp/peek-def.ts` | `showDefPeek` | Peek Definition block under the line |
+| `src/lib/lsp/peek.ts` | `peekInline`, `showPeek` | the inline peek under the line, shared by Peek Definition, Find All References and the codelens: a nested read-only editor with the main editor's theme and the file's language on the left, hits grouped by file on the right; picking a row swaps the left pane, Enter or double-click opens it, Escape closes |
 | `src/components/server/CodeTab.svelte` | `lspCompartment` ~1131 | per-tab attach |
 
 ## The bridge (server)

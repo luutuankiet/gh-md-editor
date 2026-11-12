@@ -39,10 +39,11 @@ function load(): boolean {
   } catch {
     // Private mode, or no DOM at all: fall through to the default.
   }
-  // On by default. This started as a markdown editor and prose running off the
-  // right edge is the worse failure; the code surfaces that want columns are
-  // one click from getting them back.
-  return true;
+  // Off by default: most tabs are code, diffs and merges, where wrapped lines
+  // break column alignment and hide indentation. A stored `ghmd.wrap` still
+  // wins, so anyone who already chose keeps their choice; the palette command
+  // "Toggle Word Wrap Default" flips this app-wide value.
+  return false;
 }
 
 let on = $state(load());

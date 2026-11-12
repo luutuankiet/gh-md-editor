@@ -3574,7 +3574,8 @@ function lspFilterLocations(s, method, result) {
   if (!result || !s.ignored.length) return result;
   const uriOf = (x) => x?.targetUri ?? x?.uri ?? x?.location?.uri;
   if (!Array.isArray(result)) {
-    // A lone Location: dropping it would leave nothing, so it stays.
+    // A lone Location or LocationLink, even inside an ignored dir, stays as is:
+    // dropping it would empty the result, and a definition is never emptied.
     return result;
   }
   const kept = result.filter((x) => !lspUriIgnored(s, uriOf(x)));
@@ -3687,7 +3688,10 @@ function lspFromServer(s, msg) {
     s.browserPending.delete(msg.id);
     if (method === 'initialize' && msg.result) {
       s.initResult = msg.result;
-      s.pullDiagnostics = !!msg.result.capabilities?.diagnosticProvider;
+      // Only TypeScript 7 needs pulling. ty and basedpyright advertise
+      // diagnosticProvider too but also push; pulling for them doubles every
+      // diagnostic in the editor.
+      s.pullDiagnostics = s.kind === 'tsgo' && !!msg.result.capabilities?.diagnosticProvider;
       s.state = 'running';
     }
     if (method && LSP_LOCATION_METHODS.has(method) && msg.result) {
@@ -3780,7 +3784,9 @@ async function lspStart(kind, folderAbs, allowDownload) {
     child,
     pid: child.pid,
     via: resolved.via,
-    command: lspCommandLine(resolved.cmd, resolved.args),
+    // Basename only: the entry goes to the browser, and a resolved binary's
+    // full path would expose the host's home directory layout.
+    command: lspCommandLine(path.basename(resolved.cmd), resolved.args),
     startedAt: new Date().toISOString(),
     state: 'starting',
     ignored,

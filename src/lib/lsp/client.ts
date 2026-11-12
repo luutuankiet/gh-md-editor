@@ -41,6 +41,10 @@ export interface Conn {
   rootBase: string;
   ws: WebSocket | null;
   dead: boolean;
+  // Another window attached to this server and the bridge closed our socket
+  // with 4000. Stay off until this window is used again (focus, or a
+  // start/stop in the panel), so the window in use owns the server.
+  evicted: boolean;
 }
 
 // Which extensions each kind of server can answer for, with the LSP language
@@ -247,11 +251,13 @@ function attach(conn: Conn) {
     conn.client.connect(wsTransport(ws));
     conn.client.initializing.then(() => emit(), () => {});
   });
-  ws.addEventListener('close', () => {
+  ws.addEventListener('close', (e) => {
     if (conn.ws !== ws) return;
     conn.ws = null;
     if (conn.client.connected) conn.client.disconnect();
-    // 4000 = a newer attach (another tab) took the server over; do not fight it.
+    // 4000 = a newer attach (another window) took the server over. Retrying on
+    // a timer would evict that window in turn, every few seconds, forever.
+    if (e.code === 4000) { conn.evicted = true; return; }
     if (!conn.dead) setTimeout(() => void refreshServers(), 3000);
   });
 }
@@ -270,7 +276,7 @@ function makeConn(entry: ServerEntry): Conn {
       errorLens,
     ],
   });
-  return { entry, client, rootBase: rootBaseOf(entry), ws: null, dead: false };
+  return { entry, client, rootBase: rootBaseOf(entry), ws: null, dead: false, evicted: false };
 }
 
 let inflight: Promise<void> | null = null;
@@ -297,7 +303,7 @@ export function refreshServers(): Promise<void> {
       const have = conns.get(s.id);
       if (have) {
         have.entry = s;
-        if (!have.ws && s.state === 'running') attach(have);
+        if (!have.ws && !have.evicted && s.state === 'running') attach(have);
         continue;
       }
       const c = makeConn(s);
@@ -339,6 +345,15 @@ export async function lspFor(path: string): Promise<{ conn: Conn; uri: string; e
 }
 
 if (typeof window !== 'undefined') {
-  window.addEventListener('gmd:lsp-changed', () => void refreshServers());
+  // Using this window (focusing it, or starting/stopping a server from it)
+  // takes back any server another window had taken over.
+  const reclaim = () => {
+    for (const c of conns.values()) c.evicted = false;
+    void refreshServers();
+  };
+  window.addEventListener('gmd:lsp-changed', reclaim);
+  window.addEventListener('focus', () => {
+    if ([...conns.values()].some((c) => c.evicted)) reclaim();
+  });
   void refreshServers();
 }

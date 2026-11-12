@@ -45,10 +45,28 @@ function normalize(raw: unknown): LspLoc[] {
   return out;
 }
 
+// A slow or wedged server must not hold up Cmd+Click or Peek: past this the
+// caller falls back to the ripgrep / in-file lookup.
+const ASK_TIMEOUT_MS = 4000;
+
 async function ask(conn: Conn, uri: string, view: EditorView, pos: number, method: string, extra: object = {}) {
-  await conn.client.initializing;
+  // Never wait on `initializing` here: after a disconnect the client swaps in
+  // a fresh promise that only resolves on the next connect, which may never
+  // come. Not connected now means no answer now.
+  if (!conn.client.connected) throw new Error('language server not connected');
   conn.client.sync();
-  return conn.client.request(method, { textDocument: { uri }, position: position(view, pos), ...extra });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${method} timed out`)), ASK_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([
+      conn.client.request(method, { textDocument: { uri }, position: position(view, pos), ...extra }),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function lspDefinition(conn: Conn, uri: string, view: EditorView, pos: number): Promise<LspLoc[]> {

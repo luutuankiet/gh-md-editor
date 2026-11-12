@@ -45,7 +45,7 @@
   import { readScrollAnchor, applyScrollAnchor } from '../../lib/cm-scroll-anchor';
   import { highlightToLines, scopeForFilename } from '../../lib/diff-highlight';
   import type { Tok } from '../../lib/diff-highlight';
-  import { setDiagnosticsEffect } from '@codemirror/lint';
+  import { setDiagnostics, setDiagnosticsEffect } from '@codemirror/lint';
   import { lspFor, onLspChange, type Conn } from '../../lib/lsp/client';
   import { lspDefinition, lspReferences, type LspLoc } from '../../lib/lsp/actions';
   import { lineHasDiagnostic } from '../../lib/lsp/error-lens';
@@ -1146,8 +1146,12 @@
     const key = got ? `${got.conn.entry.id}\u0000${got.uri}` : '';
     if (key === lspKey) return;
     lspKey = key;
+    const dropped = lsp !== null;
     lsp = got ? { conn: got.conn, uri: got.uri } : null;
     vw.dispatch({ effects: lspCompartment.reconfigure(got ? got.extension : []) });
+    // The lint state lives outside the compartment, so emptying it leaves the
+    // last squiggles behind, and inline blame keeps hiding on their lines.
+    if (dropped) vw.dispatch(setDiagnostics(vw.state, []));
   }
 
   $effect(() => {
@@ -1183,6 +1187,12 @@
     } catch {
       return null;
     }
+  }
+
+  // True when `pos` sits on, or right after, a run of identifier characters.
+  function identifierAt(vw: EditorView, pos: number): boolean {
+    const isId = (c: string) => /[\w$]/.test(c);
+    return isId(vw.state.sliceDoc(pos, pos + 1)) || (pos > 0 && isId(vw.state.sliceDoc(pos - 1, pos)));
   }
 
   async function peekDefinition(vw: EditorView, pos: number) {
@@ -1732,7 +1742,10 @@
             }
             // Alt/Opt+X peeks the definition inline. Matched on event.code for
             // the same reason as KeyZ: macOS Option turns event.key into `≈`.
-            if (event.altKey && !event.metaKey && !event.ctrlKey && !event.shiftKey && event.code === 'KeyX') {
+            // Only taken when the caret is on or just after an identifier, so
+            // Opt+X still types `≈` in prose, strings and blank space.
+            if (event.altKey && !event.metaKey && !event.ctrlKey && !event.shiftKey && event.code === 'KeyX'
+              && identifierAt(vw, vw.state.selection.main.head)) {
               event.preventDefault();
               void peekDefinition(vw, vw.state.selection.main.head);
               return true;
@@ -1740,6 +1753,9 @@
             return false;
           },
           contextmenu: (event, vw) => {
+            // Without a language server on this file the browser's own menu
+            // (copy, paste, spellcheck) is the more useful one.
+            if (!lsp) return false;
             const pos = vw.posAtCoords({ x: event.clientX, y: event.clientY });
             if (pos == null) return false;
             event.preventDefault();

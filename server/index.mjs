@@ -3396,6 +3396,9 @@ process.on('uncaughtException', (e) => {
 // pty — closing it (tab switch, reload) never kills the shell; only an
 // explicit DELETE or the shell exiting does.
 wss.on('connection', (ws, req) => {
+  // A malformed frame or a reset connection emits 'error'; unhandled, it
+  // would take the whole process down. 'close' follows and cleans up.
+  ws.on('error', () => {});
   const url = new URL(req.url, `http://${req.headers.host}`);
   const s = sessions.get(url.searchParams.get('id') ?? '');
   if (!s) {
@@ -3922,6 +3925,8 @@ async function apiLspList(res) {
   return sendJson(res, 200, { servers: all.map(lspEntry) });
 }
 
+const lspStarting = new Map(); // `${kind}\0${folderAbs}` -> lspStart promise
+
 async function apiLspStart(req, res) {
   let body;
   try {
@@ -3930,7 +3935,7 @@ async function apiLspStart(req, res) {
     return sendJson(res, 400, { error: 'invalid JSON body' });
   }
   const kind = String(body.kind ?? '');
-  if (!LSP_KINDS[kind]) return sendJson(res, 400, { error: `unknown kind: ${kind}; expected one of ${Object.keys(LSP_KINDS).join(', ')}` });
+  if (!Object.hasOwn(LSP_KINDS, kind)) return sendJson(res, 400, { error: `unknown kind: ${kind}; expected one of ${Object.keys(LSP_KINDS).join(', ')}` });
   const rel = typeof body.folder === 'string' && body.folder ? body.folder : '.';
   const folderAbs = resolveSafe(rel);
   if (!folderAbs) return sendJson(res, 400, { error: `path is outside the served root: ${rel}` });
@@ -3944,9 +3949,19 @@ async function apiLspStart(req, res) {
     if (s.state !== 'exited') return sendJson(res, 200, lspEntry(s));
     lspServers.delete(s.id);
   }
+  // Claim kind+folder in the same tick as the check above: lspStart awaits
+  // before it registers the server, and a second POST landing in that gap
+  // would otherwise spawn a duplicate. It shares the first start instead.
+  const key = `${kind}\0${folderAbs}`;
+  let pending = lspStarting.get(key);
+  if (!pending) {
+    pending = lspStart(kind, folderAbs, !!body.allowDownload);
+    lspStarting.set(key, pending);
+    pending.finally(() => lspStarting.delete(key)).catch(() => {});
+  }
   let r;
   try {
-    r = await lspStart(kind, folderAbs, !!body.allowDownload);
+    r = await pending;
   } catch (e) {
     return sendJson(res, 500, { error: `failed to start ${kind}: ${String(e?.message ?? e)}` });
   }
@@ -3965,6 +3980,8 @@ async function apiLspStop(res, id) {
 
 // A newer attach replaces the older socket; the server itself never notices.
 lspWss.on('connection', (ws, req) => {
+  // As on /api/pty: an 'error' with no listener crashes the process.
+  ws.on('error', () => {});
   const url = new URL(req.url, `http://${req.headers.host}`);
   const s = lspServers.get(url.searchParams.get('id') ?? '');
   if (!s || s.state === 'exited') {

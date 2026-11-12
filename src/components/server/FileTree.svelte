@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack, tick } from 'svelte';
   import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
+  import { problems } from '../../lib/lsp/diag-store.svelte';
   import { toClipboard } from '../../lib/clipboard';
   import { estimateTokens, formatTokens } from '../../lib/token-estimate';
 
@@ -894,6 +895,34 @@
   let clip = $state<{ mode: 'cut' | 'copy'; paths: string[] } | null>(null);
   const cutSet = $derived(new Set(clip?.mode === 'cut' ? clip.paths : []));
 
+  // Worst problem severity (1 error, 2 warning) per folder holding a file a
+  // language server reported on, built once per change instead of per row.
+  const dirSev = $derived.by(() => {
+    const m = new Map<string, 1 | 2>();
+    for (const [p, f] of Object.entries(problems.byPath)) {
+      const sev = f.errors ? 1 : f.warnings ? 2 : 0;
+      if (!sev) continue;
+      for (let i = p.lastIndexOf('/'); i > 0; i = p.lastIndexOf('/', i - 1)) {
+        const dir = p.slice(0, i);
+        if ((m.get(dir) ?? 3) <= sev) break;
+        m.set(dir, sev);
+      }
+    }
+    return m;
+  });
+  function rowSev(node: TreeNode): 0 | 1 | 2 {
+    if (node.ignored) return 0;
+    return node.type === 'dir' ? (dirSev.get(node.path) ?? 0) : fileSev(node.path);
+  }
+  function fileSev(path: string): 0 | 1 | 2 {
+    const f = problems.byPath[path];
+    return f?.errors ? 1 : f?.warnings ? 2 : 0;
+  }
+  function fileCount(path: string): number {
+    const f = problems.byPath[path];
+    return f ? f.errors + f.warnings : 0;
+  }
+
   function setClip(paths: string[], mode: 'cut' | 'copy') {
     menu = null;
     if (!paths.length) return;
@@ -1090,8 +1119,17 @@
         aria-hidden="true"
         src={node.type === 'dir' ? folderIconUrl(node.name, node.expanded) : fileIconUrl(node.name)}
       />
-      <span class="name" class:dir={node.type === 'dir'}>{node.name}</span>
+      <span class="name" class:dir={node.type === 'dir'} class:sev-err={rowSev(node) === 1} class:sev-warn={rowSev(node) === 2}>{node.name}</span>
       {#if node.loading}<span class="loading">…</span>{/if}
+      {#if rowSev(node)}
+        {@const sev = rowSev(node)}
+        {#if node.type === 'dir'}
+          <span class="diag-dot" class:sev-err={sev === 1} class:sev-warn={sev === 2} title={sev === 1 ? 'Contains errors' : 'Contains warnings'}></span>
+        {:else}
+          {@const n = fileCount(node.path)}
+          <span class="diag-count" class:sev-err={sev === 1} class:sev-warn={sev === 2}>{n > 9 ? '9+' : n}</span>
+        {/if}
+      {/if}
     </button>
     {/if}
     {#if node.type === 'dir' && node.expanded && node.children}
@@ -1395,6 +1433,16 @@
   .name.dir { font-weight: 600; }
   /* Same signal VS Code gives a gitignored path: dimmed, never hidden. The
      row stays fully interactive — build output is still worth opening. */
+  /* Problems from language servers: worst severity colours the name; files
+     get a count, folders a dot. A gitignored row is never coloured. */
+  .name.sev-err { color: #f14c4c; }
+  .name.sev-warn { color: #cca700; }
+  .diag-count { font-size: 11px; padding: 0 6px 0 4px; }
+  .diag-count.sev-err { color: #f14c4c; }
+  .diag-count.sev-warn { color: #cca700; }
+  .diag-dot { width: 6px; height: 6px; border-radius: 50%; margin: 0 8px 0 4px; flex: 0 0 6px; }
+  .diag-dot.sev-err { background: #f14c4c; }
+  .diag-dot.sev-warn { background: #cca700; }
   .row.ignored .name { color: #6e7681; }
   .row.ignored .icon { opacity: 0.5; }
   /* A pending cut. Deliberately a different kind of dim from the gitignore one

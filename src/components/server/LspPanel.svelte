@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { LSP_KINDS, lspLabel, startLanguageServer, stopLanguageServer, type LspKind } from '../../lib/lsp-control.svelte';
+  import { LSP_KINDS, lspLabel, missingInstall, setLspKinds, startLanguageServer, stopLanguageServer, type LspKind } from '../../lib/lsp-control.svelte';
 
   let { visible, folder }: { visible: boolean; folder: string } = $props();
 
@@ -20,6 +20,7 @@
   let error = $state('');
   let busy = $state('');
   let kind = $state<LspKind>('tsgo');
+  let install = $derived(missingInstall(LSP_KINDS.find((k) => k.kind === kind)));
 
   async function refresh() {
     try {
@@ -27,6 +28,7 @@
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       servers = d.servers ?? [];
+      setLspKinds(d.kinds);
     } catch { /* keep the last list */ }
   }
 
@@ -82,6 +84,9 @@
     <button type="button" class="ghost" onclick={() => void refresh()}>Refresh</button>
     {#if error}<span class="err">{error}</span>{/if}
   </div>
+  {#if install}
+    <div class="hint">{lspLabel(kind)} is not on PATH and is never downloaded. Install it with <code>{install}</code>, then Refresh.</div>
+  {/if}
   {#if !servers.length}
     <div class="empty">No language servers running. Start one here or with the palette command "Start Language Server…". Nothing starts on its own.</div>
   {:else}
@@ -151,6 +156,8 @@
   .bar button:hover { background: #404040; }
   .bar button.ghost { background: transparent; }
   .err { color: #f28b82; }
+  .hint { padding: 4px 8px; color: #e5c07b; font-size: 12px; }
+  .hint code { user-select: all; }
   .list {
     flex: 1 1 0;
     min-height: 0;

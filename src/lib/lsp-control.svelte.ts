@@ -14,6 +14,19 @@ export interface LspKindSpec {
   filenames: Record<string, string>;
   // base-name glob with `*` -> language id
   globs: Record<string, string>;
+  // Absent until the server answers. `install` is set for servers that are
+  // never downloaded; `onPath` says whether their binary was found.
+  install?: string | null;
+  onPath?: boolean;
+  hasDownload?: boolean;
+  explicitOnly?: boolean;
+  // Helpers the server runs from PATH, such as shellcheck for bash.
+  tools?: { bin: string; gives: string; install: string; found: boolean }[];
+}
+
+/** How to install `k` when it cannot start from here, else null. */
+export function missingInstall(k: LspKindSpec | undefined): string | null {
+  return k && k.install && !k.hasDownload && k.onPath === false ? k.install : null;
 }
 
 const FALLBACK: LspKindSpec[] = [
@@ -48,7 +61,8 @@ export const LSP_KINDS: LspKindSpec[] = $state(FALLBACK);
 export function setLspKinds(kinds: unknown) {
   if (!kinds || typeof kinds !== 'object') return;
   const next: LspKindSpec[] = [];
-  for (const [kind, k] of Object.entries(kinds as Record<string, Partial<LspKindSpec>>)) {
+  type Wire = Partial<LspKindSpec> & { download?: unknown };
+  for (const [kind, k] of Object.entries(kinds as Record<string, Wire>)) {
     if (!k || typeof k !== 'object') continue;
     next.push({
       kind,
@@ -56,6 +70,11 @@ export function setLspKinds(kinds: unknown) {
       extensions: k.extensions ?? {},
       filenames: k.filenames ?? {},
       globs: k.globs ?? {},
+      install: k.install ?? null,
+      onPath: k.onPath,
+      hasDownload: !!k.download,
+      explicitOnly: !!k.explicitOnly,
+      tools: Array.isArray(k.tools) ? k.tools : [],
     });
   }
   if (!next.length) return;
@@ -195,5 +214,25 @@ export async function autostartFor(path: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+export interface LspOffer {
+  kind: LspKind;
+  label: string;
+  // where to start it, relative to the served root
+  folder: string;
+  available: boolean;
+  install: string | null;
+}
+
+/** The servers the server suggests for `path` (none running is assumed). */
+export async function fetchLspOffers(path: string): Promise<LspOffer[]> {
+  try {
+    const r = await fetch(`/api/lsp/offer?path=${encodeURIComponent(path)}`, { cache: 'no-store' });
+    if (!r.ok) return [];
+    return ((await r.json()) as { offers?: LspOffer[] }).offers ?? [];
+  } catch {
+    return [];
   }
 }

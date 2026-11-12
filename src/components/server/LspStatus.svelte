@@ -1,9 +1,14 @@
 <script lang="ts">
   import {
+    LSP_KINDS,
     fetchLspLog,
+    fetchLspOffers,
     lspLanguageFor,
     restartLanguageServer,
+    setLspKinds,
+    startLanguageServer,
     stopLanguageServer,
+    type LspOffer,
   } from '../../lib/lsp-control.svelte';
 
   // Root-relative path of the active code editor; '' when none.
@@ -29,7 +34,12 @@
   async function refresh() {
     try {
       const r = await fetch('/api/lsp', { cache: 'no-store' });
-      if (r.ok) servers = ((await r.json()) as { servers?: Entry[] }).servers ?? [];
+      if (r.ok) {
+        const d = (await r.json()) as { servers?: Entry[]; kinds?: unknown };
+        servers = d.servers ?? [];
+        // Keeps the PATH checks (shellcheck, gopls) current.
+        setLspKinds(d.kinds);
+      }
     } catch { /* keep the last list */ }
   }
 
@@ -48,6 +58,28 @@
       if (!best || rank(s) > rank(best) || (rank(s) === rank(best) && f.length > best.folder.length)) best = s;
     }
     return best;
+  });
+
+  // Helpers the running server would use but cannot find.
+  let missingTools = $derived.by(() => {
+    const kind = current?.kind;
+    if (!kind) return [];
+    return (LSP_KINDS.find((k) => k.kind === kind)?.tools ?? []).filter((t) => !t.found);
+  });
+
+  // Nothing serves this file: what could. Asked once per file, and again
+  // when a server stops.
+  let offers = $state<LspOffer[]>([]);
+  let hasCurrent = $derived(!!current);
+  $effect(() => {
+    const p = path;
+    if (!p || hasCurrent || !lspLanguageFor(p)) {
+      offers = [];
+      return;
+    }
+    let live = true;
+    void fetchLspOffers(p).then((o) => { if (live) offers = o; });
+    return () => { live = false; };
   });
 
   let status = $derived(current?.status ?? (current?.state === 'exited' ? 'stopped' : current?.state ?? ''));
@@ -102,8 +134,35 @@
   >
     <span class="dot" aria-hidden="true"></span>
     <span>{current.label ?? current.kind}: {status}{progressText ? ` · ${progressText}` : ''}</span>
+    {#if missingTools.length}<span class="warn">no {missingTools.map((t) => t.bin).join(', ')}</span>{/if}
     {#if error}<span class="err">!</span>{/if}
   </button>
+{:else if offers.length}
+  <button
+    type="button"
+    class="seg lsp st-off"
+    title={error || 'No language server for this file'}
+    onclick={() => (menuOpen = !menuOpen)}
+  >
+    <span class="dot" aria-hidden="true"></span>
+    <span>{offers.length === 1 ? offers[0].label : 'Language server'}: off</span>
+    {#if error}<span class="err">!</span>{/if}
+  </button>
+{/if}
+
+{#if menuOpen && !current && offers.length}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="sb-scrim" onmousedown={() => (menuOpen = false)}></div>
+  <div class="lsp-menu" role="menu" aria-label="Language server">
+    <div class="lm-head">No language server for this file</div>
+    {#each offers as o (o.kind)}
+      {#if o.available}
+        <button type="button" role="menuitem" title="Start in {o.folder || '(root)'}" onclick={() => void act(() => startLanguageServer(o.kind, o.folder))}>Start {o.label}</button>
+      {:else}
+        <div class="lm-note">{o.label} is not installed. Install it with:<code>{o.install}</code></div>
+      {/if}
+    {/each}
+  </div>
 {/if}
 
 {#if menuOpen && current}
@@ -117,6 +176,9 @@
       <button type="button" role="menuitem" title="Stop it and do not start it again for this workspace" onclick={() => void act(() => stopLanguageServer(c.id, true))}>Stop</button>
     {/if}
     <button type="button" role="menuitem" onclick={() => void openLog(c)}>Show Log</button>
+    {#each missingTools as t (t.bin)}
+      <div class="lm-note">{t.bin} is not on PATH: no {t.gives}. Install it ({t.install}) and restart.</div>
+    {/each}
   </div>
 {/if}
 
@@ -158,6 +220,20 @@
   .st-crashed .dot { background: #e5534b; }
   .st-crashed { color: #e58520; }
   .err { color: #e5534b; font-weight: 600; }
+  .warn { color: #e5c07b; }
+  .lm-note {
+    padding: 5px 10px;
+    max-width: 340px;
+    color: #c5c8c6;
+    font-size: 11px;
+    border-top: 1px solid #404040;
+  }
+  .lm-note code {
+    display: block;
+    margin-top: 3px;
+    color: #e5c07b;
+    user-select: all;
+  }
   .sb-scrim, .log-scrim {
     position: fixed;
     inset: 0;

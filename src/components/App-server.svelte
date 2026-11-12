@@ -256,11 +256,22 @@
   // One entry per kind the server knows, so a kind added there shows up here.
   let allCommands = $derived([
     ...COMMANDS,
-    ...LSP_KINDS.map((k) => ({
-      label: `Start Language Server: ${k.label}`,
-      hint: 'pick a folder',
-      run: () => { browse = { mode: 'lsp' as const, action: 'same' as const, kind: k.kind }; },
-    })),
+    ...LSP_KINDS.map((k) => {
+      // A never-downloaded server missing from PATH: say how to install it
+      // instead of asking for a folder it cannot start in.
+      const install = missingInstall(k);
+      return install
+        ? {
+            label: `Start Language Server: ${k.label} (not installed)`,
+            hint: install,
+            run: () => alert(`${k.label} is not on PATH and is never downloaded.\n\nInstall it with:\n${install}`),
+          }
+        : {
+            label: `Start Language Server: ${k.label}`,
+            hint: 'pick a folder',
+            run: () => { browse = { mode: 'lsp' as const, action: 'same' as const, kind: k.kind }; },
+          };
+    }),
   ]);
   let qoCommands = $derived(
     qoTerm ? allCommands.filter((c) => c.label.toLowerCase().includes(qoTerm.toLowerCase())) : allCommands
@@ -854,7 +865,7 @@
   import PortsPanel from './server/PortsPanel.svelte';
   import LspPanel from './server/LspPanel.svelte';
   import ProblemsPanel from './server/ProblemsPanel.svelte';
-  import { LSP_KINDS, lspLabel, startLanguageServer, type LspKind } from '../lib/lsp-control.svelte';
+  import { LSP_KINDS, lspLabel, missingInstall, startLanguageServer, type LspKind } from '../lib/lsp-control.svelte';
   import { setShareHost } from '../lib/lsp/doc-share';
   import { fileIconUrl, folderIconUrl } from '../lib/file-icons';
   import { TAB_DND_MIME, PATH_DND_MIME } from '../lib/dnd';

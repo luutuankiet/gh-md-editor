@@ -94,7 +94,7 @@
   let revealSeq = 0;
 
   // Which view the bottom panel shows; the terminal keeps running when hidden.
-  let bottomView = $state<'terminal' | 'ports' | 'lsp'>('terminal');
+  let bottomView = $state<'terminal' | 'problems' | 'ports' | 'lsp'>('terminal');
 
   // ---- Quick open: centred modal, Ctrl/Cmd+Shift+F files, Ctrl/Cmd+Shift+X commands ----
   let qoQuery = $state('');
@@ -669,6 +669,13 @@
     return () => window.removeEventListener('gmd:open-language-picker', on);
   });
 
+  // The status bar's problem counts open the Problems tab of the bottom panel.
+  $effect(() => {
+    const on = () => { bottomView = 'problems'; layout.showBottom = true; };
+    window.addEventListener('gmd:show-problems', on);
+    return () => window.removeEventListener('gmd:show-problems', on);
+  });
+
   function qoPickItem(item: QoItem) {
     qoClose();
     item.run();
@@ -846,6 +853,7 @@
   import SearchPanel from './server/SearchPanel.svelte';
   import PortsPanel from './server/PortsPanel.svelte';
   import LspPanel from './server/LspPanel.svelte';
+  import ProblemsPanel from './server/ProblemsPanel.svelte';
   import { LSP_KINDS, lspLabel, startLanguageServer, type LspKind } from '../lib/lsp-control.svelte';
   import { setShareHost } from '../lib/lsp/doc-share';
   import { fileIconUrl, folderIconUrl } from '../lib/file-icons';
@@ -1111,7 +1119,7 @@
       activeGroupId = restored.some((g) => g.id === snap.activeGroupId) ? snap.activeGroupId : restored[0].id;
     }
     if (snap.sideView === 'explorer' || snap.sideView === 'search' || snap.sideView === 'compare') sideView = snap.sideView;
-    if (snap.bottomView === 'terminal' || snap.bottomView === 'ports' || snap.bottomView === 'lsp') bottomView = snap.bottomView;
+    if (snap.bottomView === 'terminal' || snap.bottomView === 'problems' || snap.bottomView === 'ports' || snap.bottomView === 'lsp') bottomView = snap.bottomView;
     sessionRestored = true;
   }
   void restoreSession();
@@ -2451,12 +2459,16 @@
       <section class="bottompanel" class:hidden={!layout.showBottom} style="flex-basis: {layout.bottomH}px">
         <div class="panel-tabs">
           <button type="button" class:on={bottomView === 'terminal'} onclick={() => { bottomView = 'terminal'; }}>Terminal</button>
+          <button type="button" class:on={bottomView === 'problems'} onclick={() => { bottomView = 'problems'; }}>Problems</button>
           <button type="button" class:on={bottomView === 'ports'} onclick={() => { bottomView = 'ports'; }}>Ports</button>
           <button type="button" class:on={bottomView === 'lsp'} onclick={() => { bottomView = 'lsp'; }}>Language Servers</button>
         </div>
         <!-- Both stay mounted: hiding the terminal must not kill the shell. -->
         <div class="panel-view" class:hidden={bottomView !== 'terminal'}>
           <TerminalPanel visible={layout.showBottom && bottomView === 'terminal'} />
+        </div>
+        <div class="panel-view" class:hidden={bottomView !== 'problems'}>
+          <ProblemsPanel visible={layout.showBottom && bottomView === 'problems'} />
         </div>
         <div class="panel-view" class:hidden={bottomView !== 'ports'}>
           <PortsPanel visible={layout.showBottom && bottomView === 'ports'} />

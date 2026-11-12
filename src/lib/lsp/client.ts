@@ -10,9 +10,7 @@ import {
   LSPClient,
   LSPPlugin,
   Workspace,
-  hoverTooltips,
   serverCompletion,
-  serverDiagnostics,
   signatureHelp,
   type Transport,
   type WorkspaceFile,
@@ -20,6 +18,8 @@ import {
 import type { Extension, Text } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { errorLens } from './error-lens';
+import { answerServerRequest, lspFeatures } from './features';
+import { dropServer } from './diag-store.svelte';
 import { autostartFor, lspLanguageFor, setLspKinds } from '../lsp-control.svelte';
 
 // Not exported by the package; recovered from the method that returns it.
@@ -279,10 +279,22 @@ const hoverCard = EditorView.baseTheme({
 
 // --- connections -------------------------------------------------------------
 
-function wsTransport(ws: WebSocket): Transport {
+function wsTransport(ws: WebSocket, conn: Conn): Transport {
   const handlers = new Set<(v: string) => void>();
   ws.addEventListener('message', (e) => {
     if (typeof e.data !== 'string') return;
+    // The package refuses every server request; workspace/applyEdit (which the
+    // bridge forwards) is answered here instead.
+    if (e.data.includes('"method"') && e.data.includes('"id"')) {
+      const msg = JSON.parse(e.data) as { id?: number | string; method?: string; params?: unknown };
+      const answer = msg.id != null && msg.method ? answerServerRequest(conn, msg as { id: number; method: string }) : null;
+      if (answer) {
+        void answer.then((result) => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
+        });
+        return;
+      }
+    }
     for (const h of handlers) h(e.data);
   });
   return {
@@ -305,7 +317,7 @@ function attach(conn: Conn) {
     // The bridge answers a repeat initialize from its cache, so the same
     // client object survives a dropped socket and every editor plugin built
     // from it stays valid.
-    conn.client.connect(wsTransport(ws));
+    conn.client.connect(wsTransport(ws, conn));
     conn.client.initializing.then(() => emit(), () => {});
   });
   ws.addEventListener('close', (e) => {
@@ -327,13 +339,13 @@ function makeConn(entry: ServerEntry): Conn {
     sanitizeHTML,
     extensions: [
       serverCompletion({ override: true }),
-      hoverTooltips(),
       // In an array on purpose: LSPClient keeps a config entry only when it is
       // an array or has `.extension`, and the bare Prec wrapper baseTheme
       // returns is neither, so it would be dropped without a warning.
       [hoverCard],
       signatureHelp({ keymap: false }),
-      serverDiagnostics(),
+      // Diagnostics in full, the hover card, quick fixes, rename, format.
+      lspFeatures(entry.id),
       errorLens,
     ],
   });
@@ -362,6 +374,7 @@ export function refreshServers(): Promise<void> {
       c.ws?.close();
       if (c.client.connected) c.client.disconnect();
       conns.delete(id);
+      dropServer(id);
       changed = true;
     }
     for (const s of live) {

@@ -4407,6 +4407,7 @@ async function apiLspAutostart(req, res) {
   const started = [];
   const errors = [];
   for (const a of settings.autoStart) {
+    if (!Object.hasOwn(LSP_KINDS, a.kind)) continue;
     const spec = LSP_KINDS[a.kind];
     if (!lspLanguageIdFor(spec, fileAbs)) continue;
     if (fileAbs !== a.folder && !fileAbs.startsWith(a.folder + path.sep)) continue;

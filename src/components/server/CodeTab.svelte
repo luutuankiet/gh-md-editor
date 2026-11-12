@@ -1521,10 +1521,10 @@
           '.cm-refLensLink': { cursor: 'pointer' },
           '.cm-refLensLink:hover': { color: '#4daafc', textDecoration: 'underline' },
           '.cm-refLens.empty .cm-refLensLink': { cursor: 'default', opacity: '0.65' },
-          '.cm-conflictBlock': { backgroundColor: 'rgba(229, 133, 32, 0.09)' },
+          '.cm-conflictBlock': { backgroundColor: 'rgba(229, 133, 32, 0.07)' },
           '.cm-conflictBlockActive': {
-            backgroundColor: 'rgba(229, 133, 32, 0.2)',
-            outline: '1px solid rgba(229, 133, 32, 0.5)',
+            backgroundColor: 'rgba(229, 133, 32, 0.13)',
+            boxShadow: 'inset 2px 0 0 rgba(229, 133, 32, 0.7)',
           },
         }),
         // Alt/Opt+Z toggles wrap. Firefox on macOS delivers `Ω` as event.key
@@ -2020,7 +2020,12 @@
       const from = Math.min(Math.max(0, m.from), doc.length);
       const to = Math.min(Math.max(from, m.to), doc.length);
       if (to <= from) continue;
-      ranges.push(Decoration.mark({ class: m.cls }).range(from, to));
+      // Line decorations, not a mark: a mark paints each token as its own
+      // box, which is what made conflict text hard to read.
+      const deco = Decoration.line({ class: m.cls });
+      for (let n = doc.lineAt(from).number, end = doc.lineAt(to - 1).number; n <= end; n++) {
+        ranges.push(deco.range(doc.line(n).from));
+      }
     }
     v.dispatch({ effects: markCompartment.reconfigure(EditorView.decorations.of(RangeSet.of(ranges, true))) });
   });

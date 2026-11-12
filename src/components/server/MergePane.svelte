@@ -124,8 +124,7 @@
           EditorView.theme({
             '&': { height: '100%' },
             '.cm-scroller': { fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace", fontSize: '12px', lineHeight: '1.5' },
-            '.cm-conflictLine': { backgroundColor: 'rgba(229, 133, 32, 0.13)' },
-            '.cm-conflictHit': { backgroundColor: 'rgba(229, 133, 32, 0.22)', outline: '1px solid rgba(229, 133, 32, 0.55)' },
+            '.cm-conflictLine': { backgroundColor: 'rgba(229, 133, 32, 0.10)' },
             '.cm-mergeActions': {
               display: 'flex',
               gap: '10px',

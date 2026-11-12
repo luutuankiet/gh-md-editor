@@ -42,6 +42,7 @@
   import { EditorState } from '@codemirror/state';
   import type { Extension } from '@codemirror/state';
   import { MergeView, unifiedMergeView } from '@codemirror/merge';
+  import { wholeChangedLines } from '../../lib/cm-merge-whole-lines';
   import { isCollapsedAt, revealSearchMatch, revealAllMatches } from '../../lib/cm-merge-reveal';
   import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands';
   import { bracketMatching, indentOnInput } from '@codemirror/language';
@@ -696,13 +697,14 @@
     const r = rightText ?? '';
     if (mode === 'split') {
       mv = new MergeView({
-        a: { doc: l, extensions: [...baseExtensions(), EditorState.readOnly.of(true)] },
+        a: { doc: l, extensions: [...baseExtensions(), EditorState.readOnly.of(true), wholeChangedLines] },
         b: {
           doc: r,
           extensions: [
             ...baseExtensions(),
             EditorState.readOnly.of(!writable),
             ...(writable ? [highlightActiveLine(), onEdit()] : []),
+            wholeChangedLines,
           ],
         },
         parent: h,
@@ -726,6 +728,7 @@
           EditorState.readOnly.of(!writable),
           ...(writable ? [highlightActiveLine(), onEdit()] : []),
           unifiedExt(l),
+          wholeChangedLines,
         ],
       });
     }
@@ -1232,15 +1235,25 @@
        scroll — with nothing to scroll once the pane got short. */
     overflow-y: hidden;
   }
+  /* Dark-theme diff tints. @codemirror/merge paints three layers on a changed
+     line: a line class, an <ins>/<del> mark over the whole chunk, and a
+     changed-text mark per changed word. Painting the middle one too drew a box
+     around every token, so only the line and the changed words carry colour,
+     and lines added or removed whole (cm-wholeChangedLine, see
+     cm-merge-whole-lines.ts) show the line tint alone. */
+  .difftab :global(.cm-changedLine),
+  .difftab :global(.cm-inlineChangedLine) { background: rgba(46, 160, 67, 0.10); }
   .difftab :global(.cm-merge-a .cm-changedLine),
-  .difftab :global(.cm-deletedChunk) { background: rgba(248, 81, 73, 0.13); }
-  .difftab :global(.cm-merge-a .cm-changedText),
-  .difftab :global(.cm-deletedChunk .cm-deletedText) { background: rgba(248, 81, 73, 0.32); }
-  .difftab :global(.cm-merge-b .cm-changedLine),
+  .difftab :global(.cm-deletedChunk) { background: rgba(248, 81, 73, 0.10); }
   .difftab :global(.cm-insertedLine),
-  .difftab :global(.cm-inlineChangedLine) { background: rgba(46, 160, 67, 0.13); }
-  .difftab :global(.cm-merge-b .cm-changedText),
-  .difftab :global(.cm-insertedLine .cm-changedText) { background: rgba(46, 160, 67, 0.32); }
+  .difftab :global(.cm-deletedLine) { background: none; text-decoration: none; }
+  .difftab :global(.cm-changedText) { background: rgba(46, 160, 67, 0.22); }
+  .difftab :global(.cm-merge-a .cm-changedText),
+  .difftab :global(.cm-deletedText) { background: rgba(248, 81, 73, 0.20); }
+  .difftab :global(.cm-wholeChangedLine .cm-changedText),
+  .difftab :global(.cm-deletedChunk .cm-deletedLine:not(:has(> del > span:not(.cm-deletedText))) .cm-deletedText) {
+    background: none;
+  }
   .difftab :global(.cm-changeGutter) { background: transparent; }
   .difftab :global(.cm-changedLineGutter) { background: #e58520; }
   .difftab :global(.cm-deletedLineGutter) { background: #f28b82; }
@@ -1524,8 +1537,8 @@
     min-width: 100%;
   }
   .dline.changed { cursor: pointer; }
-  .dline.add { background: rgba(46, 160, 67, 0.15); }
-  .dline.del { background: rgba(248, 81, 73, 0.15); }
+  .dline.add { background: rgba(46, 160, 67, 0.10); }
+  .dline.del { background: rgba(248, 81, 73, 0.10); }
   .dline.add .mark { color: #81c995; }
   .dline.del .mark { color: #f28b82; }
   .dline.selected { outline: 1px solid #e58520; outline-offset: -1px; }
@@ -1644,8 +1657,8 @@
     min-height: 1.5em;
   }
   .scell.changed { cursor: pointer; }
-  .scell.add { background: rgba(46, 160, 67, 0.15); }
-  .scell.del { background: rgba(248, 81, 73, 0.15); }
+  .scell.add { background: rgba(46, 160, 67, 0.10); }
+  .scell.del { background: rgba(248, 81, 73, 0.10); }
   .scell.add .mark { color: #81c995; }
   .scell.del .mark { color: #f28b82; }
   .scell.selected { outline: 1px solid #e58520; outline-offset: -1px; }

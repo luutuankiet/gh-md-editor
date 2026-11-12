@@ -4455,6 +4455,10 @@ async function apiLspSettingsGet(res, params) {
 async function apiLspSettingsPatch(req, res) {
   const body = await lspReadJson(req, res);
   if (!body) return;
+  if (!isPlainObj(body)) return sendJson(res, 400, { error: 'body must be a JSON object' });
+  // A typo such as `server` for `servers` would otherwise save nothing and still answer 200.
+  const unknown = Object.keys(body).filter((k) => !['workspace', 'shared', 'servers', 'autoStart'].includes(k));
+  if (unknown.length) return sendJson(res, 400, { error: `unknown field: ${unknown.join(', ')}` });
   const workspaceAbs = lspWorkspaceAbs(body.workspace);
   if (!workspaceAbs) return sendJson(res, 400, { error: 'workspace is outside the served root' });
   if (body.servers !== undefined && body.servers !== null) {

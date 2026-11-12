@@ -307,7 +307,24 @@ const formatViaServer: Command = (view) => {
   return lspFormat(view);
 };
 
-const viewProblem: Command = (view) => openLintPanel(view);
+// Opens the problems list on the problem under the cursor (the next one when
+// the cursor is on none). The lint panel keeps its own selection and only
+// moves it on a click, so the matching row is clicked for it.
+const viewProblem: Command = (view) => {
+  const head = view.state.selection.main.head;
+  let at = -1, after = -1, i = 0;
+  forEachDiagnostic(view.state, (_d, from, to) => {
+    if (at < 0 && from <= head && head <= to) at = i;
+    if (after < 0 && from >= head) after = i;
+    i++;
+  });
+  if (!i) return false;
+  openLintPanel(view);
+  const pick = at >= 0 ? at : after >= 0 ? after : 0;
+  view.dom.querySelectorAll<HTMLElement>('.cm-panel-lint ul > li')[pick]?.click();
+  view.dom.querySelector<HTMLElement>('.cm-panel-lint ul')?.focus();
+  return true;
+};
 
 // --- hover card --------------------------------------------------------------
 
@@ -380,7 +397,7 @@ const hoverCard = hoverTooltip(async (view, pos) => {
         const bar = document.createElement('div');
         bar.className = 'gmd-hover-actions';
         bar.append(
-          btn('View Problem', 'Alt+F8', () => { view.dispatch({ selection: { anchor: diags[0].from } }); openLintPanel(view); }),
+          btn('View Problem', 'Alt+F8', () => { view.dispatch({ selection: { anchor: diags[0].from } }); viewProblem(view); }),
           btn('Quick Fix...', 'Ctrl+.', () => { view.dispatch({ selection: { anchor: diags[0].from } }); view.focus(); quickFix(view); }),
         );
         const best = (fixes as CodeAction[]).find((f) => f.isPreferred) ?? (fixes as CodeAction[])[0];

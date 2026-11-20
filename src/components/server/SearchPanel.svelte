@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { fileIconUrl } from '../../lib/file-icons';
+  import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
   // Workspace search, VS Code layout, backed by the streamed /api/search
   // ripgrep endpoint. Results are rendered as they arrive rather than after
   // the scan completes — the reason the endpoint streams at all.
@@ -179,14 +179,14 @@
   }
   let foldedDirs = $state<Record<string, boolean>>({});
 
-  interface DirNode { name: string; dir: string; items: FileHits[]; kids: DirNode[]; hits: number }
+  interface DirNode { parts: string[]; dir: string; items: FileHits[]; kids: DirNode[]; hits: number }
 
   // A real hierarchy, one node per path segment, with single-child chains
   // squashed into one "src / lib" row. Grouping by whole folder string instead
   // put every folder at the same level, which in a large workspace is a flat
   // list of long paths wearing a chevron.
   function buildDirTree(list: FileHits[]): DirNode {
-    const root: DirNode = { name: '', dir: '', items: [], kids: [], hits: 0 };
+    const root: DirNode = { parts: [], dir: '', items: [], kids: [], hits: 0 };
     for (const f of list) {
       const d = dirOf(f.path);
       const segs = d ? d.split('/') : [];
@@ -195,7 +195,7 @@
         const dir = segs.slice(0, i + 1).join('/');
         let kid = node.kids.find((k) => k.dir === dir);
         if (!kid) {
-          kid = { name: segs[i], dir, items: [], kids: [], hits: 0 };
+          kid = { parts: [segs[i]], dir, items: [], kids: [], hits: 0 };
           node.kids.push(kid);
         }
         node = kid;
@@ -210,7 +210,7 @@
   function squashDirs(n: DirNode) {
     while (n.dir && !n.items.length && n.kids.length === 1) {
       const only = n.kids[0];
-      n.name = `${n.name} / ${only.name}`;
+      n.parts = [...n.parts, ...only.parts];
       n.dir = only.dir;
       n.items = only.items;
       n.kids = only.kids;
@@ -235,22 +235,41 @@
     return out;
   }
 
-  // "Everything shut" is the only state worth detecting: it decides whether
-  // the header button offers to collapse or to restore.
-  const allShut = $derived(files.length > 0 && files.every((f) => collapsed[f.path]));
+  // The header button cycles like VS Code's: everything open → files folded
+  // (folders stay open, so the file list shows) → top-level folders folded →
+  // everything open again. The step is read off the current state rather than
+  // counted, so manual folding in between never desyncs it.
+  type FoldStep = 'files' | 'roots' | 'open';
+  const allFilesShut = $derived(files.length > 0 && files.every((f) => collapsed[f.path]));
+  const rootsShut = $derived(
+    asTree && tree.kids.length > 0 && tree.kids.every((k) => foldedDirs[k.dir]),
+  );
+  const nextFold = $derived<FoldStep>(
+    rootsShut || (allFilesShut && !(asTree && tree.kids.length)) ? 'open' : allFilesShut ? 'roots' : 'files',
+  );
+  const foldLabel = $derived(
+    nextFold === 'open' ? 'Expand all' : nextFold === 'roots' ? 'Collapse folders' : 'Collapse files',
+  );
 
   function toggleAll() {
-    if (allShut) {
+    // Read the step once: nextFold is derived from collapsed, so after the
+    // assignment below it already names the following step.
+    const step = nextFold;
+    if (step === 'open') {
       foldedDirs = {};
       collapsed = {};
       return;
     }
-    const fd: Record<string, boolean> = {};
-    for (const d of eachDir(tree)) fd[d] = true;
-    foldedDirs = fd;
     const c: Record<string, boolean> = {};
     for (const f of files) c[f.path] = true;
     collapsed = c;
+    if (step === 'files') {
+      foldedDirs = {};
+      return;
+    }
+    const fd: Record<string, boolean> = {};
+    for (const k of tree.kids) fd[k.dir] = true;
+    foldedDirs = fd;
   }
 
   function clearSearch() {
@@ -305,11 +324,11 @@
       <button
         type="button"
         class="sv-icon"
-        title={allShut ? 'Expand all' : 'Collapse all'}
-        aria-label={allShut ? 'Expand all' : 'Collapse all'}
+        title={foldLabel}
+        aria-label={foldLabel}
         onclick={toggleAll}
       >
-        {#if allShut}
+        {#if nextFold === 'open'}
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 7 8 3.4 12 7" /><path d="M4 9 8 12.6 12 9" /></svg>
         {:else}
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3.4 8 7l4-3.6" /><path d="M4 12.6 8 9l4 3.6" /></svg>
@@ -364,7 +383,8 @@
             onclick={() => (foldedDirs[k.dir] = !foldedDirs[k.dir])}
           >
             <svg class="chev" class:open={!foldedDirs[k.dir]} viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5z" /></svg>
-            <span class="sfile-name">{k.name}</span>
+            <img class="sicon" alt="" aria-hidden="true" src={folderIconUrl(k.parts[k.parts.length - 1], !foldedDirs[k.dir])} />
+            <span class="sfile-name scrumbs">{#each k.parts as part, pi (pi)}{#if pi}<span class="scrumb-sep">/</span>{/if}{part}{/each}</span>
             <span class="sfile-count">{k.hits}</span>
           </button>
           {#if !foldedDirs[k.dir]}
@@ -600,7 +620,8 @@
     color: #c5c8c6;
     border-color: #e58520;
   }
-  .sdir-head { color: #8a8a8a; }
+  .sdir-head { color: #c5c8c6; }
+  .scrumb-sep { margin: 0 3px; color: #6a6a6a; }
   .sdir-body { padding-left: 12px; }
   /* Rows size to their own content and are only FLOORED at the panel width,
      so a long match extends the scroll region instead of being cut with an

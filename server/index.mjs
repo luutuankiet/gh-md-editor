@@ -1415,6 +1415,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/exists' && req.method === 'GET') return await apiExists(res, url.searchParams);
     if (url.pathname === '/api/upload' && req.method === 'POST') return await apiUpload(req, res);
     if (url.pathname === '/api/search' && req.method === 'GET') return apiSearch(req, res, url.searchParams);
+    if (url.pathname === '/api/replace' && req.method === 'POST') return await apiReplace(req, res);
     if (url.pathname === '/api/defs' && req.method === 'GET') return apiDefs(req, res, url.searchParams);
     if (url.pathname === '/api/resolveimport' && req.method === 'GET') return await apiResolveImport(res, url.searchParams);
     if (url.pathname === '/api/context' && req.method === 'GET') return await apiContext(res, url.searchParams);
@@ -1832,6 +1833,149 @@ function apiSearch(req, res, params) {
   // orphaned rg keeps scanning the disk for a result nobody will read — the
   // same stray-process failure mode the terminal sessions had.
   req.on('close', () => { try { rg.kill('SIGKILL'); } catch {} });
+}
+
+// --- search: replace -------------------------------------------------------
+//
+//   POST /api/replace  {q, case, word, regex, replace, preserveCase,
+//                       files: [{path, hits: [{line, cols: [[s,e],...]}]}]}
+//   → {replaced, files: [{path, replaced, skipped, error?}]}
+//
+// Only the matches the client is showing are replaced, addressed by line and
+// UTF-16 column, never by re-running the search: the result list is what the
+// user reviewed. Each target is re-checked against the file as it is now, so
+// a line edited since the search ran is skipped rather than rewritten blind.
+// ripgrep speaks Rust regex and this re-check speaks JS regex; the two agree
+// on everyday patterns, and where they part the column check fails and the
+// match is skipped, never misplaced.
+
+function replaceRegex(q, { matchCase, word, regex }) {
+  let src = regex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (word) src = `\\b(?:${src})\\b`;
+  return new RegExp(src, matchCase ? 'g' : 'gi');
+}
+
+// $& $1 $<name> $$ as in JS, plus \n \t \\ in regex mode, the way VS Code
+// reads its replace box. Literal mode inserts the text exactly as typed.
+function expandReplacement(repl, m, regex) {
+  if (!regex) return repl;
+  let out = '';
+  for (let i = 0; i < repl.length; i++) {
+    const c = repl[i];
+    const n = repl[i + 1];
+    if (c === '\\' && n !== undefined) {
+      out += n === 'n' ? '\n' : n === 't' ? '\t' : n === '\\' ? '\\' : c + n;
+      i++;
+    } else if (c === '$' && n === '$') { out += '$'; i++; }
+    else if (c === '$' && n === '&') { out += m[0]; i++; }
+    else if (c === '$' && n === '<') {
+      const close = repl.indexOf('>', i);
+      const name = close === -1 ? null : repl.slice(i + 2, close);
+      if (name && m.groups && name in m.groups) { out += m.groups[name] ?? ''; i = close; }
+      else out += c;
+    } else if (c === '$' && /[0-9]/.test(n ?? '')) {
+      let k = n;
+      if (/[0-9]/.test(repl[i + 2] ?? '') && Number(n + repl[i + 2]) < m.length) k = n + repl[i + 2];
+      if (Number(k) > 0 && Number(k) < m.length) { out += m[Number(k)] ?? ''; i += k.length; }
+      else out += c;
+    } else out += c;
+  }
+  return out;
+}
+
+// AB in VS Code: FOO → BAR, foo → bar, Foo → Bar.
+function preserveCase(matched, repl) {
+  if (!/[a-z]/i.test(matched)) return repl;
+  if (matched === matched.toUpperCase()) return repl.toUpperCase();
+  if (matched === matched.toLowerCase()) return repl.toLowerCase();
+  if (matched[0] === matched[0].toUpperCase() && matched.slice(1) === matched.slice(1).toLowerCase()) {
+    return repl.charAt(0).toUpperCase() + repl.slice(1).toLowerCase();
+  }
+  return repl;
+}
+
+async function replaceInFile(rel, hits, re, opts) {
+  const abs = resolveSafe(rel);
+  if (!abs) return { path: rel, replaced: 0, skipped: 0, error: 'path escapes root' };
+  const buf = await fs.readFile(abs);
+  const text = buf.toString('utf8');
+  const want = hits.reduce((n, h) => n + (h.cols?.length ?? 0), 0);
+  // A lossy decode would be written back as replacement characters.
+  if (looksBinary(buf) || !Buffer.from(text, 'utf8').equals(buf)) {
+    return { path: rel, replaced: 0, skipped: want, error: 'not a UTF-8 text file' };
+  }
+  // Split keeping each line's own ending, so CRLF and a missing final newline
+  // survive untouched.
+  const parts = text.split(/(\r\n|\n|\r)/);
+  let replaced = 0;
+  let skipped = 0;
+  for (const h of hits) {
+    const idx = (h.line - 1) * 2;
+    const line = parts[idx];
+    if (typeof line !== 'string') { skipped += h.cols.length; continue; }
+    const targets = new Set(h.cols.map(([a, b]) => `${a}:${b}`));
+    let hit = 0;
+    re.lastIndex = 0;
+    const next = line.replace(re, (...args) => {
+      const groups = typeof args[args.length - 1] === 'object' ? args[args.length - 1] : undefined;
+      const off = args[args.length - (groups ? 3 : 2)];
+      const m = args.slice(0, args.length - (groups ? 3 : 2));
+      m.groups = groups;
+      if (!targets.has(`${off}:${off + m[0].length}`)) return m[0];
+      hit++;
+      const r = expandReplacement(opts.replace, m, opts.regex);
+      return opts.preserveCase ? preserveCase(m[0], r) : r;
+    });
+    replaced += hit;
+    skipped += h.cols.length - hit;
+    parts[idx] = next;
+  }
+  if (replaced) {
+    const tmp = path.join(path.dirname(abs), `.${path.basename(abs)}.gmd-tmp-${process.pid}`);
+    try {
+      await fs.writeFile(tmp, parts.join(''), 'utf8');
+      await commitTemp(tmp, abs);
+    } catch (e) {
+      await fs.rm(tmp, { force: true }).catch(() => {});
+      throw e;
+    }
+  }
+  return { path: rel, replaced, skipped };
+}
+
+async function apiReplace(req, res) {
+  let body;
+  try {
+    body = JSON.parse((await readBody(req)).toString('utf8'));
+  } catch {
+    return sendJson(res, 400, { error: 'invalid JSON body' });
+  }
+  const { q, replace, files } = body ?? {};
+  if (typeof q !== 'string' || !q || typeof replace !== 'string' || !Array.isArray(files)) {
+    return sendJson(res, 400, { error: 'q, replace and files required' });
+  }
+  const opts = { matchCase: !!body.case, word: !!body.word, regex: !!body.regex, replace, preserveCase: !!body.preserveCase };
+  let re;
+  try {
+    re = replaceRegex(q, opts);
+  } catch (e) {
+    return sendJson(res, 400, { error: `pattern: ${e.message}` });
+  }
+  const out = [];
+  let total = 0;
+  // One file at a time: a replace-all over hundreds of files should not open
+  // hundreds of descriptors at once on a shared host.
+  for (const f of files) {
+    if (typeof f?.path !== 'string' || !Array.isArray(f.hits)) continue;
+    try {
+      const r = await replaceInFile(f.path, f.hits, re, opts);
+      total += r.replaced;
+      out.push(r);
+    } catch (e) {
+      out.push({ path: f.path, replaced: 0, skipped: f.hits.length, error: String(e.message ?? e) });
+    }
+  }
+  sendJson(res, 200, { replaced: total, files: out });
 }
 
 // --- git (source control) ---------------------------------------------------

@@ -1,7 +1,7 @@
 ---
 title: The server HTTP surface
 covers: where an API handler lives in server/index.mjs, how paths are made safe, and how symlinks are classified
-verified: 2026-08-20
+verified: 2026-11-21
 ---
 
 # The server HTTP surface
@@ -73,6 +73,10 @@ excludes `node_modules` (unless the include glob names it), caps rg at 4
 threads and kills it after 30 s, reporting `truncated`. The exclude glob is
 pushed **after** the user's globs because rg lets the last matching glob win.
 Quick open and `/api/defs` still respect `.gitignore`.
+
+## Replace addresses the results on screen
+
+`POST /api/replace` (`apiReplace` in `server/index.mjs`) never re-runs the search. The client sends the exact matches it is showing, by line and UTF-16 column, and the server re-finds each one with a JS regex built from the same query and options. A match whose span no longer lines up (the line was edited since the search, or Rust and JS regex disagree on the pattern) is counted as skipped, never written. Files are written one at a time through `commitTemp`, so symlinks and CRLF line endings survive, and a file that is not valid UTF-8 is refused. The client's preview uses a twin of the replacement rules in `src/lib/search-replace.ts`; change both together. After a replace the panel fires `gmd:git-refresh`, because no focus event follows a write the window made itself: clean open tabs reload, dirty ones get the "changed on disk" banner.
 
 ## Scope is a parameter, never a re-derivation
 

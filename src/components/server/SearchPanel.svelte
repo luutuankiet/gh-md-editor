@@ -1,5 +1,6 @@
 <script lang="ts">
   import { fileIconUrl, folderIconUrl } from '../../lib/file-icons';
+  import { replaceRegex, replacementAt } from '../../lib/search-replace';
   // Workspace search, VS Code layout, backed by the streamed /api/search
   // ripgrep endpoint. Results are rendered as they arrive rather than after
   // the scan completes — the reason the endpoint streams at all.
@@ -22,6 +23,23 @@
     try { localStorage.setItem(IGNORED_KEY, on ? '1' : '0'); } catch { /* private mode */ }
   }
 
+  // Replace row and the filter fields fold away like VS Code's chevron and
+  // "..." toggles; both remember their state so a reload keeps the layout.
+  const REPLACE_KEY = 'ghmd.searchReplaceOpen';
+  const FILTERS_KEY = 'ghmd.searchFiltersOpen';
+  const readFlag = (k: string, dflt: boolean) => {
+    const v = typeof localStorage !== 'undefined' ? localStorage.getItem(k) : null;
+    return v === null ? dflt : v === '1';
+  };
+  const saveFlag = (k: string, on: boolean) => { try { localStorage.setItem(k, on ? '1' : '0'); } catch { /* private mode */ } };
+  let replaceOpen = $state(readFlag(REPLACE_KEY, false));
+  let filtersOpen = $state(readFlag(FILTERS_KEY, true));
+  let replaceText = $state('');
+  let keepCase = $state(false);
+  let exclude = $state('');
+  let replacing = $state(false);
+  let notice = $state<string | null>(null);
+
   let files = $state<FileHits[]>([]);
   let total = $state(0);
   let truncated = $state(false);
@@ -38,6 +56,7 @@
   $effect(() => {
     query;
     include;
+    exclude;
     matchCase;
     wholeWord;
     useRegex;
@@ -59,7 +78,8 @@
     timer = setTimeout(run, 220);
   }
 
-  async function run() {
+  async function run(keepNotice = false) {
+    if (!keepNotice) notice = null;
     // Abort first: the server kills its rg on request close, so a fast typist
     // never leaves a pile of scans running behind the current one.
     ctrl?.abort();
@@ -69,6 +89,7 @@
     truncated = false;
     error = null;
     if (!q) {
+      ranWith = null;
       running = false;
       return;
     }
@@ -76,6 +97,7 @@
     const c = new AbortController();
     ctrl = c;
     running = true;
+    ranWith = { q, matchCase, word: wholeWord, regex: useRegex };
 
     const params = new URLSearchParams({ q });
     // Scope the scan to the anchored workspace. The endpoint already accepts
@@ -85,7 +107,13 @@
     if (matchCase) params.set('case', '1');
     if (wholeWord) params.set('word', '1');
     if (useRegex) params.set('regex', '1');
-    if (include.trim()) params.set('glob', include.trim());
+    // Excludes ride the same --glob list as '!' entries, after the includes:
+    // rg lets the last matching glob win, so an exclude always beats an include.
+    const globs = [
+      ...include.split(',').map((g) => g.trim()).filter(Boolean),
+      ...exclude.split(',').map((g) => g.trim()).filter(Boolean).map((g) => (g.startsWith('!') ? g : `!${g}`)),
+    ];
+    if (globs.length) params.set('glob', globs.join(','));
     if (includeIgnored) params.set('ignored', '1');
 
     // Accumulated outside $state and copied on flush: mutating an object the
@@ -146,19 +174,65 @@
     }
   }
 
+  // The query the results on screen came from. Replace has to address those
+  // results, not whatever the box says now while a re-scan is still pending.
+  let ranWith = $state<{ q: string; matchCase: boolean; word: boolean; regex: boolean } | null>(null);
+
+  const previewRe = $derived(
+    replaceOpen && ranWith ? replaceRegex(ranWith.q, { matchCase: ranWith.matchCase, word: ranWith.word, regex: ranWith.regex }) : null,
+  );
+
+  async function doReplace(list: FileHits[], ask: boolean) {
+    if (!ranWith || replacing || running) return;
+    const n = list.reduce((a, f) => a + f.hits.reduce((b, h) => b + h.cols.length, 0), 0);
+    if (!n) return;
+    if (ask && !window.confirm(`Replace ${n} occurrence${n === 1 ? '' : 's'} across ${list.length} file${list.length === 1 ? '' : 's'} with "${replaceText}"?`)) return;
+    replacing = true;
+    notice = null;
+    try {
+      const res = await fetch('/api/replace', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          q: ranWith.q, case: ranWith.matchCase, word: ranWith.word, regex: ranWith.regex,
+          replace: replaceText, preserveCase: keepCase,
+          files: list.map((f) => ({ path: f.path, hits: f.hits.map((h) => ({ line: h.line, cols: h.cols })) })),
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) { error = body?.error ?? `HTTP ${res.status}`; return; }
+      const skipped = (body.files ?? []).reduce((a: number, f: any) => a + (f.skipped ?? 0), 0);
+      notice = `Replaced ${body.replaced} occurrence${body.replaced === 1 ? '' : 's'}` + (skipped ? `; ${skipped} skipped because the file changed since the search` : '');
+      // No focus event follows a write this window made, so open tabs are
+      // told to re-check the disk: clean ones reload, dirty ones get the
+      // "changed on disk" banner instead of being overwritten.
+      window.dispatchEvent(new CustomEvent('gmd:git-refresh'));
+    } catch (e) {
+      error = String((e as Error)?.message ?? e);
+    } finally {
+      replacing = false;
+    }
+    run(true);
+  }
+
   // Leading indentation is dead width in a 200px sidebar, so it is trimmed —
   // and the match offsets shift with it or every highlight lands wrong.
   function segs(h: Hit) {
     const lead = h.text.length - h.text.trimStart().length;
     const text = h.text.slice(lead);
-    const out: { t: string; hit: boolean }[] = [];
+    const out: { t: string; hit: boolean; rep?: string | null }[] = [];
+    const opts = { matchCase: !!ranWith?.matchCase, word: !!ranWith?.word, regex: !!ranWith?.regex, preserveCase: keepCase };
     let i = 0;
     for (const [s0, e0] of h.cols) {
       const s = Math.max(0, s0 - lead);
       const e = Math.max(0, e0 - lead);
       if (e <= i) continue;
       if (s > i) out.push({ t: text.slice(i, s), hit: false });
-      out.push({ t: text.slice(s, e), hit: true });
+      out.push({
+        t: text.slice(s, e),
+        hit: true,
+        rep: previewRe ? replacementAt(h.text, s0, e0, previewRe, replaceText, opts) : undefined,
+      });
       i = e;
     }
     if (i < text.length) out.push({ t: text.slice(i), hit: false });
@@ -294,6 +368,18 @@
   </div>
 
   <div class="sfields">
+    <div class="srow">
+    <button
+      type="button"
+      class="srep-toggle"
+      title={replaceOpen ? 'Hide replace' : 'Toggle replace'}
+      aria-label="Toggle replace"
+      aria-expanded={replaceOpen}
+      onclick={() => { replaceOpen = !replaceOpen; saveFlag(REPLACE_KEY, replaceOpen); }}
+    >
+      <svg class="chev" class:open={replaceOpen} viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5z" /></svg>
+    </button>
+    <div class="scol">
     <div class="sinput">
       <input
         bind:this={input}
@@ -309,12 +395,59 @@
         <button type="button" class:on={useRegex} title="Use regular expression" onclick={() => (useRegex = !useRegex)}>.*</button>
       </span>
     </div>
-    <input class="sglob" bind:value={include} placeholder="files to include" spellcheck="false" autocomplete="off" />
+    {#if replaceOpen}
+      <div class="sreplace">
+        <div class="sinput">
+          <input
+            bind:value={replaceText}
+            placeholder="Replace"
+            spellcheck="false"
+            autocomplete="off"
+            onkeydown={(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doReplace(files, true); } }}
+          />
+          <span class="sopts">
+            <button type="button" class:on={keepCase} title="Preserve case" onclick={() => (keepCase = !keepCase)}>AB</button>
+          </span>
+        </div>
+        <button
+          type="button"
+          class="sv-icon srep-all"
+          title="Replace all (Ctrl+Enter)"
+          aria-label="Replace all"
+          disabled={!files.length || running || replacing}
+          onclick={() => doReplace(files, true)}
+        >
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h5v4h-5z" /><path d="M8.5 9.5h5v4h-5z" /><path d="M10 3.5h3.5V7" /><path d="M12 5.5l1.5 1.5L15 5.5" /></svg>
+        </button>
+      </div>
+    {/if}
+    </div>
+    </div>
+    <div class="sfilter-bar">
+      <button
+        type="button"
+        class="sv-icon"
+        class:on={filtersOpen}
+        title="Toggle search details"
+        aria-label="Toggle search details"
+        aria-expanded={filtersOpen}
+        onclick={() => { filtersOpen = !filtersOpen; saveFlag(FILTERS_KEY, filtersOpen); }}
+      >
+        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="3.5" cy="8" r="1" /><circle cx="8" cy="8" r="1" /><circle cx="12.5" cy="8" r="1" /></svg>
+      </button>
+    </div>
+    {#if filtersOpen}
+    <label class="sflabel" for="sglob-inc">files to include</label>
+    <input id="sglob-inc" class="sglob" bind:value={include} placeholder="e.g. *.ts, src/**/include" spellcheck="false" autocomplete="off" />
+    <label class="sflabel" for="sglob-exc">files to exclude</label>
+    <input id="sglob-exc" class="sglob" bind:value={exclude} placeholder="e.g. *.ts, src/**/exclude" spellcheck="false" autocomplete="off" />
     <label class="signored" title="Also search files that .gitignore hides, including inside nested repositories (node_modules stays excluded unless named in files to include)">
       <input type="checkbox" checked={includeIgnored} onchange={(e) => setIgnored(e.currentTarget.checked)} />
       Include git-ignored files
     </label>
+    {/if}
   </div>
+  {#if notice}<div class="smsg snotice">{notice}</div>{/if}
 
   {#if files.length}
     <div class="sviewbar">
@@ -357,14 +490,24 @@
           {#if showDir}<span class="sfile-dir">{dirOf(f.path)}</span>{/if}
           <span class="sfile-count">{f.hits.length}</span>
         </button>
+        {#if replaceOpen && ranWith}
+          <button type="button" class="srep-one" title="Replace all in this file" aria-label="Replace all in this file" disabled={replacing || running} onclick={() => doReplace([f], false)}>
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h5v4h-5z" /><path d="M8.5 9.5h5v4h-5z" /><path d="M10 3.5h3.5V7" /><path d="M12 5.5l1.5 1.5L15 5.5" /></svg>
+          </button>
+        {/if}
         {#if !collapsed[f.path]}
           <ul class="shits" style="padding-left: {10 + depth * 10}px">
             {#each f.hits as h, hi (hi)}
               <li>
                 <button type="button" class="shit" onclick={() => onOpen(f.path, h.line)}>
                   <span class="shit-ln">{h.line}</span>
-                  <span class="shit-text">{#each segs(h) as s}{#if s.hit}<mark>{s.t}</mark>{:else}{s.t}{/if}{/each}</span>
+                  <span class="shit-text">{#each segs(h) as s}{#if s.hit && s.rep != null}<del>{s.t}</del><ins>{s.rep}</ins>{:else if s.hit}<mark>{s.t}</mark>{:else}{s.t}{/if}{/each}</span>
                 </button>
+                {#if replaceOpen && ranWith}
+                  <button type="button" class="srep-one" title="Replace" aria-label="Replace" disabled={replacing || running} onclick={() => doReplace([{ path: f.path, hits: [h] }], false)}>
+                    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h5v4h-5z" /><path d="M8.5 9.5h5v4h-5z" /><path d="M10 3.5h3.5V7" /><path d="M12 5.5l1.5 1.5L15 5.5" /></svg>
+                  </button>
+                {/if}
               </li>
             {/each}
           </ul>
@@ -663,4 +806,73 @@
     stroke-linecap: round;
     stroke-linejoin: round;
   }
+
+  /* Replace row, "..." filter toggle and per-row replace buttons. */
+  .srow { display: flex; align-items: flex-start; gap: 2px; margin-left: -8px; }
+  .scol { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+  .srep-toggle {
+    flex: 0 0 auto;
+    align-self: stretch;
+    width: 16px;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    background: transparent;
+    color: #c5c8c6;
+    cursor: pointer;
+    line-height: 0;
+  }
+  .srep-toggle:hover { background: #2a2d2e; }
+  .sreplace { display: flex; align-items: center; gap: 4px; }
+  .sreplace .sinput { flex: 1 1 auto; min-width: 0; }
+  .sfields .sv-icon,
+  .srep-one {
+    border: none;
+    border-radius: 3px;
+    background: transparent;
+    color: #c5c8c6;
+    cursor: pointer;
+    line-height: 0;
+    padding: 3px;
+  }
+  .sfields .sv-icon:hover:not(:disabled),
+  .srep-one:hover:not(:disabled) { background: #2a2d2e; }
+  .sfields .sv-icon.on { background: #3a3d41; }
+  .sfields .sv-icon:disabled,
+  .srep-one:disabled { opacity: 0.4; cursor: default; }
+  .sfilter-bar { display: flex; justify-content: flex-end; margin-top: -2px; }
+  .sflabel { font-size: 11px; opacity: 0.75; margin-bottom: -2px; }
+  .srep-one svg {
+    width: 13px;
+    height: 13px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .sfile,
+  .shits li { position: relative; }
+  .srep-one {
+    position: absolute;
+    top: 2px;
+    right: 28px;
+    display: none;
+    background: #252526;
+  }
+  .shits li > .srep-one { right: 6px; top: 1px; }
+  .sfile:hover > .srep-one,
+  .shits li:hover > .srep-one,
+  .srep-one:focus-visible { display: block; }
+  del {
+    background: #f8514933;
+    color: inherit;
+    text-decoration: line-through;
+  }
+  ins {
+    background: #2ea04333;
+    color: inherit;
+    text-decoration: none;
+  }
+  .snotice { padding-top: 0; }
 </style>

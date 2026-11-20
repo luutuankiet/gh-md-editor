@@ -1493,12 +1493,16 @@ const server = http.createServer(async (req, res) => {
 // large tree the client paints its first hits in tens of milliseconds instead
 // of waiting for the last file to be scanned.
 //
-//   GET /api/search?q=&path=&regex=1&word=1&case=1&glob=a,b
+//   GET /api/search?q=&path=&regex=1&word=1&case=1&glob=a,b&ignored=1
 //   → {t:'f',path}                      a file with hits begins
 //     {t:'m',line,text,cols:[[s,e]]}    one matching line (char offsets)
 //     {t:'done',matches,files,truncated}
 //     {t:'err',error}
 const SEARCH_CAP = 2000;
+// ignored=1 lifts .gitignore everywhere, nested repos included, which opens up
+// trees like node_modules and build output. These bound what that can cost.
+const IGNORED_THREADS = '4';
+const IGNORED_TIMEOUT_MS = 30_000;
 
 // rg reports paths and lines as {text}, or {bytes: base64} for anything that
 // is not valid UTF-8.
@@ -1744,8 +1748,18 @@ function apiSearch(req, res, params) {
   // regex rather than making every stray ( or ? a syntax error.
   if (params.get('regex') !== '1') args.push('--fixed-strings');
   if (params.get('word') === '1') args.push('--word-regexp');
-  for (const g of (params.get('glob') ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
-    args.push('--glob', g);
+  const globs = (params.get('glob') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  for (const g of globs) args.push('--glob', g);
+  const ignored = params.get('ignored') === '1';
+  if (ignored) {
+    // --no-ignore-vcs, not --no-ignore: git rules are lifted (the root's and
+    // every nested repo's), but .ignore / .rgignore still apply, so a folder
+    // can be kept out of search for good. .git itself stays skipped because
+    // hidden paths are never searched. node_modules is excluded unless the
+    // include box names it; the exclude goes last because rg lets the last
+    // matching glob win, so an include like *.js cannot pull it back in.
+    args.push('--no-ignore-vcs', '--threads', IGNORED_THREADS);
+    if (!globs.some((g) => g.includes('node_modules'))) args.push('--glob', '!**/node_modules/**');
   }
   args.push('--', query, dir);
 
@@ -1801,7 +1815,15 @@ function apiSearch(req, res, params) {
     }
   });
 
+  // A wide-open scan that is still running after the timeout is stopped and
+  // reported as truncated, rather than holding disk and CPU indefinitely.
+  const timeout = ignored ? setTimeout(() => {
+    truncated = true;
+    try { rg.kill('SIGKILL'); } catch {}
+  }, IGNORED_TIMEOUT_MS) : null;
+
   rg.on('close', () => {
+    if (timeout) clearTimeout(timeout);
     send({ t: 'done', matches, files: fileCount, truncated });
     res.end();
   });

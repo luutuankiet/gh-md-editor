@@ -61,6 +61,19 @@ arrow keys, paste target, terminal-here, zip. Collapsing the third shape at the
 server fixed all of them at once. That is the pattern to repeat: **normalise the
 shape where it enters, not at each of twenty consumers.**
 
+## Search and ignored files
+
+`/api/search` respects `.gitignore` unless `ignored=1` is sent (the
+"Include git-ignored files" checkbox in `SearchPanel.svelte`, persisted under
+the localStorage key `ghmd.searchIgnored`). Then `apiSearch` adds
+`--no-ignore-vcs`, which lifts git rules in the root and in every nested repo
+but still honours `.ignore` and `.rgignore`, so a folder can be kept out of
+search for good. Because a wide-open scan can be expensive, that mode also
+excludes `node_modules` (unless the include glob names it), caps rg at 4
+threads and kills it after 30 s, reporting `truncated`. The exclude glob is
+pushed **after** the user's globs because rg lets the last matching glob win.
+Quick open and `/api/defs` still respect `.gitignore`.
+
 ## Scope is a parameter, never a re-derivation
 
 `?folder=` is the anchored workspace, root-relative, empty string meaning the whole

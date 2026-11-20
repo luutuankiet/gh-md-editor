@@ -13,6 +13,14 @@
   let matchCase = $state(false);
   let wholeWord = $state(false);
   let useRegex = $state(false);
+  // Persisted: the usual reason to want it (searching a gitignored tmp/ folder)
+  // outlives a reload.
+  const IGNORED_KEY = 'ghmd.searchIgnored';
+  let includeIgnored = $state((typeof localStorage !== 'undefined' ? localStorage.getItem(IGNORED_KEY) : null) === '1');
+  function setIgnored(on: boolean) {
+    includeIgnored = on;
+    try { localStorage.setItem(IGNORED_KEY, on ? '1' : '0'); } catch { /* private mode */ }
+  }
 
   let files = $state<FileHits[]>([]);
   let total = $state(0);
@@ -33,6 +41,7 @@
     matchCase;
     wholeWord;
     useRegex;
+    includeIgnored;
     schedule();
   });
 
@@ -77,6 +86,7 @@
     if (wholeWord) params.set('word', '1');
     if (useRegex) params.set('regex', '1');
     if (include.trim()) params.set('glob', include.trim());
+    if (includeIgnored) params.set('ignored', '1');
 
     // Accumulated outside $state and copied on flush: mutating an object the
     // proxy already wrapped would not signal, and copying every chunk without
@@ -281,6 +291,10 @@
       </span>
     </div>
     <input class="sglob" bind:value={include} placeholder="files to include" spellcheck="false" autocomplete="off" />
+    <label class="signored" title="Also search files that .gitignore hides, including inside nested repositories (node_modules stays excluded unless named in files to include)">
+      <input type="checkbox" checked={includeIgnored} onchange={(e) => setIgnored(e.currentTarget.checked)} />
+      Include git-ignored files
+    </label>
   </div>
 
   {#if files.length}
@@ -457,6 +471,8 @@
     outline: none;
   }
   .sglob:focus { border-color: #e58520; }
+  .signored { display: flex; align-items: center; gap: 6px; font-size: 12px; opacity: 0.85; cursor: pointer; user-select: none; }
+  .signored input { margin: 0; accent-color: #e58520; }
   .sresults {
     flex: 1 1 0;
     min-height: 0;

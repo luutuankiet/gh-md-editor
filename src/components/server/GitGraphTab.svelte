@@ -204,7 +204,9 @@
         by.set(s.lane, (by.get(s.lane) ?? '') + d);
       }
     });
-    return [...by].map(([lane, d]) => ({ d, stroke: color(lane) }));
+    // Keyed by lane, not colour: past eight lanes the palette repeats, and a
+    // duplicate key makes Svelte abort the whole graph render.
+    return [...by].map(([lane, d]) => ({ lane, d, stroke: color(lane) }));
   });
 
   function badge(r: string): { text: string; kind: string } {
@@ -455,7 +457,7 @@
   <div class="body">
     <div class="rows" bind:this={rowsEl}>
       <svg class="lanes" width={graphW} height={graph.rows.length * ROW_H} aria-hidden="true">
-        {#each paths as p (p.stroke)}
+        {#each paths as p (p.lane)}
           <path d={p.d} stroke={p.stroke} fill="none" stroke-width="1.5" />
         {/each}
         {#each graph.rows as r, i (r.c.sha)}
